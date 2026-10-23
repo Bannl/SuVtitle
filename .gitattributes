@@ -1,0 +1,16 @@
+# SuVtitle line endings (RV4-9, 2026-10-23). The repo stores text normalized (LF); the working tree follows
+# core.autocrlf. Windows-only scripts are pinned to CRLF: cmd.exe mis-reads labels / goto in LF batch files.
+# The harness must not depend on the working tree's line endings (it normalizes before hashing / matching).
+* text=auto
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.iss text eol=crlf
+*.rc  text eol=crlf
+# binaries
+*.ico   binary
+*.png   binary
+*.woff2 binary
+*.mkv   binary
+*.mp4   binary
+*.webm  binary
+*.wav   binary

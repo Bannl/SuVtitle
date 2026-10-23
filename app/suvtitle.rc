@@ -1,0 +1,38 @@
+// SuVtitle resources (S-HOST 2026-10-23, modelled on AudioPB's ui/patchbus.rc at 641f1aa). ASCII only: the build
+// has no /utf-8, and rc.exe would read a UTF-8 dash or a copyright sign in the ANSI code page.
+#include "resource.h"
+#include <winres.h>
+
+// A PLACEHOLDER until the user gives SuVtitle its icon (made by scratchpad\s-host\tools\make_icon.py: a dark tile,
+// a play triangle, two subtitle lines; 16 to 256 px).
+IDI_APPICON ICON "suvtitle.ico"
+
+// Explorer's Properties > Details. FILEVERSION wants four numerics.
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    SUV_VERSION_MAJOR,SUV_VERSION_MINOR,SUV_VERSION_PATCH,0
+ PRODUCTVERSION SUV_VERSION_MAJOR,SUV_VERSION_MINOR,SUV_VERSION_PATCH,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS__WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "NEXTALE"
+            VALUE "FileDescription",  "SuVtitle - subtitle player with offline transcription and translation"
+            VALUE "FileVersion",      SUV_VERSION_STR
+            VALUE "InternalName",     "SuVtitle"
+            VALUE "OriginalFilename", "SuVtitle.exe"
+            VALUE "ProductName",      "SuVtitle"
+            VALUE "ProductVersion",   SUV_VERSION_STR
+            VALUE "LegalCopyright",   "(c) 2026 NEXTALE"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

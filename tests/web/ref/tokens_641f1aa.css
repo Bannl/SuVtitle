@@ -1,0 +1,69 @@
+/* tokens_641f1aa.css -- the THREE token blocks of AudioPB's ui/web/style.css at commit 641f1aa (git show
+ 641f1aa:ui/web/style.css), copied verbatim by S-WEB on 2026-10-23: the reference tests/web compares SuVtitle's page
+ against ("NEXTALE's design language, value for value"). Not loaded by anything: a frozen reference.
+ ONE edit since the copy (publication wave, 2026-10-24): --display. AudioPB's value named a purchased display font that
+ does not belong in this repository; SuVtitle's title is set in Bahnschrift, a face that ships with Windows, so the
+ reference carries SuVtitle's value for that one token. Every other token is AudioPB's, untouched. */
+
+:root {
+  /* Shared tokens (theme-independent) */
+  --radius: 12px;
+  --radius-sm: 8px;
+  --radius-pill: 999px;
+  --gap: 16px;
+  --font: -apple-system, "Segoe UI", system-ui, Roboto, sans-serif;
+  --mono: "Cascadia Mono", "SF Mono", ui-monospace, Consolas, monospace;
+  --display: "Bahnschrift", "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;   /* NEXTALE display face (SuVtitle's value, see the header) */
+  --transition: 140ms ease;
+
+  /* Accent = NEXTALE heliconia orange (the "AUDIO" of the banner lockup).
+     Kept identical across themes for brand consistency. --accent-ink is the
+     text colour ON a heliconia fill (white on #f6a06b fails contrast). */
+  --accent: #f6a06b;
+  --accent-strong: #ef8a4d;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-ink: #221108;
+
+  /* Patch-cable colour (green — matches the site's --wire, unchanged) */
+  --wire: #23c483;
+}
+
+:root[data-theme="dark"] {
+  --bg: #0a1710;
+  --bg-elev: #101f17;
+  --card: #12241a;
+  --card-hover: #162b1f;
+  --border: #24392c;
+  --border-soft: #1a2d22;
+  --text: #f2efe4;          /* NEXTALE ivory (the banner wordmark white) */
+  --text-dim: #a9bfae;
+  --text-faint: #6e8377;
+  --pill-active-bg: color-mix(in srgb, #33d17a 18%, transparent);
+  --pill-active-fg: #6ee7a0;
+  --pill-active-dot: #33d17a;
+  --meter-track: #071009;
+  --meter-lo: #33d17a;
+  --meter-hi: #f2b705;
+  --meter-clip: #ff5c5c;
+  --shadow: 0 1px 0 rgba(255,255,255,0.02), 0 8px 24px rgba(0,0,0,0.35);
+}
+
+:root[data-theme="light"] {
+  --bg: #f2efe4;
+  --bg-elev: #faf8f0;
+  --card: #fbf9f2;
+  --card-hover: #ffffff;
+  --border: #d9d3c0;
+  --border-soft: #e5dfd0;
+  --text: #16281d;
+  --text-dim: #51624f;
+  --text-faint: #7d8b7c;
+  --pill-active-bg: color-mix(in srgb, #12a150 14%, transparent);
+  --pill-active-fg: #0f8a45;
+  --pill-active-dot: #17b45c;
+  --meter-track: #e6e1d2;
+  --meter-lo: #17b45c;
+  --meter-hi: #e0a500;
+  --meter-clip: #e64545;
+  --shadow: 0 1px 2px rgba(22,40,29,0.05), 0 8px 24px rgba(22,40,29,0.07);
+}

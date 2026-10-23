@@ -1,0 +1,51 @@
+# ==============================================================================
+# SuVtitle .gitignore
+# ==============================================================================
+# --- CMake build output (tools\buildlock.cmd builds into build\<config>) ---
+build/
+out/
+CMakeCache.txt
+CMakeFiles/
+_deps/
+
+# --- Binaries ---
+*.dll
+*.exe
+*.lib
+*.pdb
+*.obj
+*.exp
+*.ilk
+
+# --- Scratch, test runs, generated media, WebView2 profiles of the test tools ---
+scratchpad/
+tests/**/runs/
+tests/**/udf*/
+tests/**/work/
+tests/**/media_gen/
+tests/e2e/wv2probe/sdk-cache/
+
+# --- Python byte code (the test tools in tests/cpp are run with `python -I`, which writes none, but a plain run does) ---
+__pycache__/
+*.pyc
+
+# --- Installer output / deploy bundle (several GB with the models) ---
+installer/Output/
+deploy/out/
+
+# --- Visual Studio / IDE / OS ---
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- the build lock of tools/buildlock.cmd (a directory while a build runs) ---
+tools/build.lock/
+
+# --- the maintainers' working notes (French design notes, plans, review logs, per-version logs): kept out of the
+#     public repository; README.md and CHANGELOG.md are the public documentation ---
+/SuVtitle.md
+/docs/
+/Version/

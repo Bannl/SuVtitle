@@ -169,8 +169,8 @@ function expect(name, recs, page, ev) {
     c.push(["N1: 420x320, nothing scrolls sideways, the drawer closed, the transport inside the window",
             E("N1").w === 420 && E("N1").overflowX === false && E("N1").panelShown === false
             && ((E("N1").transport || [0, 0, 0, 999])[1] + (E("N1").transport || [0, 0, 0, 999])[3]) <= 320]);
-    c.push(["N2: the more menu holds the rest (speed ... Cancel the analysis) and the default-player + theme items",
-            has(E("N2").more, "Cancel the analysis") && (E("N2").more || []).some((x) => /^Speed/.test(x)) && has(E("N2").more, "Light theme")
+    c.push(["N2: the more menu holds the rest (speed ... Cancel translation) and the default-player + theme items",
+            has(E("N2").more, "Cancel translation") && (E("N2").more || []).some((x) => /^Speed/.test(x)) && has(E("N2").more, "Light theme")
             && has(E("N2").more, "Make SuVtitle the default player…")]);
   } else if (name === "W") {
     c.push(["W1: 1280 wide: the queue docked beside the picture, two ranges on the seek bar",

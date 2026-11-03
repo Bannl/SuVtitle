@@ -2,7 +2,8 @@
 #  SuVtitle - app/CMakeLists.txt   (S-HOST, 2026-10-23)
 #  target suvtitle_app -> SuVtitle.exe: the window (Win32 + WebView2) -- the player, its queue, its subtitles, the
 #  engine's supervisor. Ported from AudioPB's patchbus_ui target (PatchBus build/CMakeLists.txt at 641f1aa) minus
-#  the desk: no fabric, no router, no FX, no VST3, no licence, no update check.
+#  the desk: no fabric, no router, no FX, no VST3, no licence. (2026-11-03: AudioPB's update check came back --
+#  app/NextaleUpdate.cpp, WinHTTP -- in EVERY build: the code is public; its opt-out is app.txt's UPDATECHECK.)
 #
 #  Next to the exe (CMAKE_RUNTIME_OUTPUT_DIRECTORY = the build dir's root, top-level CMakeLists):
 #    SuVtitle.exe, WebView2Loader.dll (portability of loose builds), web\ (a copy of app\web\, S-WEB's page).
@@ -105,6 +106,12 @@ add_executable(suvtitle_app WIN32
     # the Word transcript (Export > .docx): dependency-free, a ZIP of five XML parts
     "${APP_DIR}/DocxWriter.cpp"
     "${APP_DIR}/DocxWriter.h"
+    # the native video engine (1.1.0, docs/NATIVE_CONTRACT.md): libmpv loaded at run time, never a hard import
+    "${APP_DIR}/MpvPlayer.cpp"
+    "${APP_DIR}/MpvPlayer.h"
+    # the update banner (2026-11-03): the site's manifest read once per start (WinHTTP, off the UI thread), the page's URL guard
+    "${APP_DIR}/NextaleUpdate.cpp"
+    "${APP_DIR}/NextaleUpdate.h"
     # header-only, pure where they can be (each one has its smoke in tests/cpp)
     "${APP_DIR}/TrPlayer.h"
     "${APP_DIR}/TrFileStore.h"
@@ -133,6 +140,10 @@ target_include_directories(suvtitle_app PRIVATE
 target_link_libraries(suvtitle_app PRIVATE
     "${WV2_LIB}"
     ole32 oleaut32 uuid user32 gdi32 shell32 shlwapi version advapi32
+    # 1.1.0 (N1): the page's visual over mpv's picture (DirectComposition) and its UI Automation tree (visual hosting)
+    dcomp uiautomationcore
+    # the update banner (2026-11-03): NextaleUpdate.cpp's GET of the site's manifest
+    winhttp
 )
 
 target_compile_definitions(suvtitle_app PRIVATE
@@ -154,6 +165,9 @@ set_target_properties(suvtitle_app PROPERTIES OUTPUT_NAME "SuVtitle")   # -> SuV
 #  page (AudioPB's lesson). One OUTPUT-based copy per file re-runs whenever its source changes, the files are found by
 #  a CONFIGURE_DEPENDS glob (a new file of S-WEB's re-runs the configure by itself), sub-folders keep their layout
 #  (main.cpp serves web\<sub>\<file> too), and the copy is a hard prerequisite of the exe: ANY build refreshes web\.
+#  SUVTITLE LIVE (1.1.0, 2026-10-25): the Live window's page, web\live.html (L3's), rides the same glob -- nothing to add
+#  per page; main.cpp says "web\live.html is not installed" in the Live window if it is missing, and serves it under its
+#  own Content-Security-Policy (no media).
 # -----------------------------------------------------------------------------
 file(GLOB_RECURSE SUVTITLE_WEB_SOURCES CONFIGURE_DEPENDS LIST_DIRECTORIES false "${APP_DIR}/web/*")
 set(_web_copied)
@@ -175,4 +189,40 @@ if(EXISTS "${WV2_DLL}")
     add_custom_command(TARGET suvtitle_app POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${WV2_DLL}" "$<TARGET_FILE_DIR:suvtitle_app>/WebView2Loader.dll"
         COMMENT "Copying WebView2Loader.dll next to SuVtitle.exe")
+endif()
+
+# -----------------------------------------------------------------------------
+#  libmpv, the native video engine (1.1.0, N1 -- docs/NATIVE_CONTRACT.md). SuVtitle.exe loads libmpv-2.dll AT RUN TIME
+#  (app/MpvPlayer.cpp: <exe dir>\mpv\, else next to the exe) and declares the part of mpv's C API it uses itself, so the
+#  build needs no mpv file at all, and an exe without the DLL plays everything with the page's <video>. For a dev build
+#  that plays through mpv, a folder holding libmpv-2.dll is named, in order, by:
+#    (1) -DSUVTITLE_MPV_DIR=<folder>                          (the cache variable)
+#    (2) the environment variable SUVTITLE_MPV_DIR              (handy for a first configure through buildlock.cmd)
+#    (2b) the folder (2) named at an earlier configure of this build dir (CMake re-configures by itself, often from a shell
+#         without the variable: that must not drop the DLL -- the WEBVIEW2_NUGET_DIR rule above)
+#  and the build copies it to <build dir>\mpv\ -- the bundle's layout. One OUTPUT-based copy: refreshed when the DLL changes.
+# -----------------------------------------------------------------------------
+set(SUVTITLE_MPV_DIR "" CACHE PATH "Folder holding libmpv-2.dll for a dev build (copied to <build dir>/mpv); empty = none")
+set(_mpv_dir "${SUVTITLE_MPV_DIR}")
+if(NOT _mpv_dir AND DEFINED ENV{SUVTITLE_MPV_DIR} AND NOT "$ENV{SUVTITLE_MPV_DIR}" STREQUAL "")
+    set(_mpv_dir "$ENV{SUVTITLE_MPV_DIR}")
+    set(SUVTITLE_MPV_ENV_DIR "$ENV{SUVTITLE_MPV_DIR}" CACHE INTERNAL "the SUVTITLE_MPV_DIR an earlier configure got from the environment")
+endif()
+if(NOT _mpv_dir AND SUVTITLE_MPV_ENV_DIR)
+    set(_mpv_dir "${SUVTITLE_MPV_ENV_DIR}")
+endif()
+if(_mpv_dir AND EXISTS "${_mpv_dir}/libmpv-2.dll")
+    message(STATUS "SuVtitle: libmpv-2.dll from ${_mpv_dir} (copied to mpv\\ next to SuVtitle.exe)")
+    set(_mpv_dst "${CMAKE_BINARY_DIR}/mpv/libmpv-2.dll")
+    add_custom_command(OUTPUT "${_mpv_dst}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/mpv"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_mpv_dir}/libmpv-2.dll" "${_mpv_dst}"
+        DEPENDS "${_mpv_dir}/libmpv-2.dll"
+        COMMENT "Copying libmpv-2.dll to mpv\\ next to SuVtitle.exe")
+    add_custom_target(suvtitle_mpv ALL DEPENDS "${_mpv_dst}")
+    add_dependencies(suvtitle_app suvtitle_mpv)
+elseif(_mpv_dir)
+    message(WARNING "SuVtitle: SUVTITLE_MPV_DIR (${_mpv_dir}) holds no libmpv-2.dll: this build plays everything with the page's <video>")
+else()
+    message(STATUS "SuVtitle: no SUVTITLE_MPV_DIR: no libmpv-2.dll copied (the page's <video> plays everything; README, Building)")
 endif()

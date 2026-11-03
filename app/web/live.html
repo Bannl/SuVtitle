@@ -1,0 +1,2686 @@
+<!--
+  SuVtitle -- the LIVE window. live.html is the page of SuVtitle.exe's second window (a WebView2 at
+  https://suvtitle.local/live.html), opened by the player's Live button and by the "SuVtitle Live" shortcut (--live):
+  live subtitles of what is heard -- an input, the sound of an output, one application -- and a transcript to export.
+  PORTED (L3, 2026-10-25) from AudioPB Translator 1.1.0's Live window, ui/web/translator.html at commit 50f79d6, WHOLE:
+  the dialogue (paragraphs by speaker, the live line and its adaptive typewriter, the commit-as-you-go trim, the END,
+  the replay identities, "Jump to latest"), the bar (the pair and its direction, Show, A-/A+, the pin, Clear, Export
+  and its acknowledgement), the idle fade, the theme and the three keys of the profile (patchbus.theme, audiopb.tr.font,
+  audiopb.tr.show -- the last one shared with the player on purpose). In AudioPB the window was a display surface and
+  the switch was elsewhere; here the window IS the switch, so it gains:
+    * the SOURCE plate -- up to four STRIPS (a lamp, the speaker's name, the source, its channel, a trim, a meter),
+      an "Add source" slot opening the PICKER (inputs, the sound of an output, applications), the round LISTEN button
+      and its "On air" lamp;
+    * the TRANSLATE row -- the LIVE pair (not the player's: one pair per mode), its direction, the models' preset;
+    * the state line -- "listening · small → turbo · Qwen3-4B · GPU · 2 inputs · 3 voices".
+
+  The contract with the app is docs/LIVE_PLAN.md section 3.3, written out in "Contract with the app" in the script.
+
+  Deliberately standalone: no stylesheet, no external script, no font file, no network -- the page loads alone under
+  a strict policy (default-src 'none'; its one script and its one style inline). Every text that comes from outside --
+  a device's name, an application's, a speaker's, a transcript line, an engine sentence -- goes in through textContent
+  (tests/web/test_live.js fails on any markup sink), and every NAME is cleaned of control and bidi characters first.
+  SuVtitle's design language: the tokens are index.html's (AudioPB's at 641f1aa, value for value -- the harness pins
+  them), the title is set in Bahnschrift 600, and the layout is REGIONS (a CSS grid: plate / translate / bar) so that
+  rearranging it is a matter of CSS.
+-->
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SuVtitle Live</title>
+  <style>
+    /* ==== DESIGN TOKENS -- SuVtitle's, as index.html carries them (NEXTALE's, AudioPB's ui/web/style.css at 641f1aa,
+       value for value; --display = Bahnschrift, a face that ships with Windows: no file, no @font-face). This page
+       links no stylesheet (it must load alone); tests/web/test_live.js pins every token below and fails on drift. */
+    :root {
+      --radius: 12px;
+      --radius-sm: 8px;
+      --radius-pill: 999px;
+      --gap: 16px;
+      --font: -apple-system, "Segoe UI", system-ui, Roboto, sans-serif;
+      --mono: "Cascadia Mono", "SF Mono", ui-monospace, Consolas, monospace;
+      --display: "Bahnschrift", "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+      --transition: 140ms ease;
+      --accent: #f6a06b;
+      --accent-strong: #ef8a4d;
+      --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+      --accent-ink: #221108;
+      --wire: #23c483;
+
+      /* The speaker palette (AudioPB 1.1.0's six). The APP assigns a speaker its colour (by order of appearance,
+         never reassigned) and ships it on every line as an index; this list resolves the index, it decides nothing. */
+      --spk-1: #c97c64;   /* terracotta  */
+      --spk-2: #81972b;   /* olive brass */
+      --spk-3: #309da9;   /* teal        */
+      --spk-4: #5e5ad3;   /* indigo      */
+      --spk-5: #944baf;   /* amethyst    */
+      --spk-6: #bf367f;   /* raspberry   */
+
+      /* This page's own names, kept so the dialogue rules below read as in 1.1.0 -- ALIASES of the tokens, so the
+         theme reaches every one of them. */
+      --ink: var(--text);
+      --dim: var(--text-dim);
+      --faint: var(--text-faint);
+      --line: var(--border);
+      --danger: var(--meter-clip);
+      --spk: var(--ink);        /* fallback when a line carries no colour */
+      --tr-font: 28px;          /* the whole dialogue scales from this one number (A-/A+) */
+    }
+    /* ---- Dark theme (default): the banner's deep-forest ground ---- */
+    :root[data-theme="dark"] {
+      --bg: #0a1710;
+      --bg-elev: #101f17;
+      --card: #12241a;
+      --card-hover: #162b1f;
+      --border: #24392c;
+      --border-soft: #1a2d22;
+      --text: #f2efe4;
+      --text-dim: #a9bfae;
+      --text-faint: #6e8377;
+      --pill-active-bg: color-mix(in srgb, #33d17a 18%, transparent);
+      --pill-active-fg: #6ee7a0;
+      --pill-active-dot: #33d17a;
+      --meter-track: #071009;
+      --meter-lo: #33d17a;
+      --meter-hi: #f2b705;
+      --meter-clip: #ff5c5c;
+      --shadow: 0 1px 0 rgba(255,255,255,0.02), 0 8px 24px rgba(0,0,0,0.35);
+      color-scheme: dark;
+    }
+    /* ---- Light theme: NEXTALE ivory ground, forest ink ---- */
+    :root[data-theme="light"] {
+      --bg: #f2efe4;
+      --bg-elev: #faf8f0;
+      --card: #fbf9f2;
+      --card-hover: #ffffff;
+      --border: #d9d3c0;
+      --border-soft: #e5dfd0;
+      --text: #16281d;
+      --text-dim: #51624f;
+      --text-faint: #7d8b7c;
+      --pill-active-bg: color-mix(in srgb, #12a150 14%, transparent);
+      --pill-active-fg: #0f8a45;
+      --pill-active-dot: #17b45c;
+      --meter-track: #e6e1d2;
+      --meter-lo: #17b45c;
+      --meter-hi: #e0a500;
+      --meter-clip: #e64545;
+      --shadow: 0 1px 2px rgba(22,40,29,0.05), 0 8px 24px rgba(22,40,29,0.07);
+      color-scheme: light;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--font);
+      font-size: var(--tr-font);
+      line-height: 1.45;
+      overflow: hidden;
+      cursor: default;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* ==== THE DECK: everything that is not the dialogue, in three REGIONS ======================================
+       #plate = the SOURCE plate (the strips, Add source, Listen) | #trRow = the TRANSLATE row | #bar = 1.1.0's bar
+       (Show, Text, Window). They are laid out by CSS alone -- a wrapping row: the plate on its own line, the Translate
+       row and the bar sharing the next one when the window is wide enough -- so moving a region is an edit of its
+       `order` / `flex-basis` here; nothing in the script knows where anything sits (it only measures the deck's
+       height for the dialogue's top gutter).
+       Like 1.1.0's bar it OVERLAYS the dialogue and fades after a few still seconds -- but only WHILE LISTENING (there
+       is nothing to read otherwise, and Listen must stay in sight), never with the picker open or a name being typed.
+       The bottom rule is the app's heliconia->wire hairline. */
+    #deck {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 10;
+      display: flex; flex-wrap: wrap; align-items: stretch;
+      gap: 6px 10px;
+      padding: 8px 12px 10px;
+      font-size: 13px;
+      background: var(--bg);
+      opacity: 1; transition: opacity 420ms ease;
+    }
+    #deck::after {
+      content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 1px;
+      background: linear-gradient(90deg,
+          color-mix(in srgb, var(--accent) 70%, transparent) 0,
+          color-mix(in srgb, var(--wire) 45%, transparent) 34%,
+          var(--border-soft) 62%, var(--border-soft) 100%);
+    }
+    #deck.is-idle { opacity: 0; pointer-events: none; }
+    #plate { order: 1; flex: 1 1 100%; }
+    #trRow { order: 2; flex: 0 1 auto; }
+    #bar   { order: 3; flex: 1 1 auto; }
+    /* The mode's three words when there is room for them; below, the ⇄ → ← glyph between the languages says it alone. */
+    @media (max-width: 1179px) { .ctl .seg-mode { display: none; } }
+    /* Controls are not text to select (a stray drag painted the labels blue); the DIALOGUE stays selectable -- someone
+       may want to copy a line -- and so do the speaker names being typed. */
+    #deck, #state, #tally { user-select: none; }
+    #deck input[type="text"] { user-select: text; }
+
+    /* ---- the group plates (style.css .hgroup): a quiet panel with a tiny uppercase label on top ---- */
+    #deck .grp {
+      display: flex; flex-direction: column; flex-wrap: wrap; justify-content: space-between; gap: 5px;
+      min-width: 0;
+      padding: 6px 10px 8px;
+      background: color-mix(in srgb, var(--bg-elev) 72%, transparent);
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+    }
+    #deck .grp-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+    #deck .lbl {
+      font-size: 9.5px; font-weight: 700; letter-spacing: .15em; text-transform: uppercase;
+      color: var(--text-faint);
+    }
+    .trrow, .bar { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px 10px; min-width: 0; max-width: 100%; }
+    .bar { justify-content: flex-end; }
+    /* The lockup: SuVtitle in Bahnschrift 600, its V in NEXTALE's heliconia (index.html's), "Live" as its sub-line. */
+    .brand { display: flex; flex-direction: column; justify-content: center; gap: 3px; padding-right: 6px; }
+    .brand-name { font-family: var(--display); font-size: 24px; font-weight: 600; font-stretch: normal; letter-spacing: .05em; line-height: 1; }
+    .brand-txt { color: var(--text); }
+    .brand-accent {
+      background: linear-gradient(180deg, #f8b585, #ee854a);
+      -webkit-background-clip: text; background-clip: text;
+      color: var(--accent); -webkit-text-fill-color: transparent;
+    }
+    .brand-sub {
+      font-size: 10px; font-weight: 700; letter-spacing: .15em; text-transform: uppercase;
+      color: var(--text-faint);
+    }
+    /* U1 (the user, 02/11): what SuVtitle does, to the RIGHT of its name (after "Live" here) -- a console's engraved legend
+       after a hairline -- and its maker, small and discreet UNDER it (index.html's lockup, the same rules). The legend needs
+       room: a narrow deck (the default 760 px window) keeps the name, "Live" and the maker; the whole is the tooltip. */
+    .brand-line { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+    .brand-tag {
+      font-family: var(--display); font-size: 12px; font-weight: 400; letter-spacing: .03em; line-height: 1;
+      color: var(--text-dim); white-space: nowrap; padding-left: 10px; border-left: 1px solid var(--border);
+    }
+    .brand-by { font-size: 9.5px; font-weight: 600; letter-spacing: .06em; line-height: 1; color: var(--text-faint); white-space: nowrap; }
+    /* Buttons and selects of the Translate row and the bar: style.css .btn / .select */
+    .ctl button, .ctl select {
+      font: inherit; font-size: 12.5px; font-weight: 550; color: var(--text-dim);
+      background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      padding: 5px 11px; cursor: pointer;
+      transition: color var(--transition), border-color var(--transition), background var(--transition);
+    }
+    .ctl button:hover:not(:disabled), .ctl select:hover { color: var(--text); border-color: var(--accent); }
+    #deck select:focus, #deck button:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .ctl button.is-on { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
+    .ctl .mono { font-family: var(--mono); min-width: 34px; }
+    /* The selects carry native names (简体中文, 한국어, العربية): a fixed width would clip one of them, an unbounded
+       one would push the rest of the row off a narrow window. The chevron is the app's own (style.css .select). */
+    #deck select {
+      /* (U1: 12.5em -- "日本語 (Japanese)" whole; a longer name is cut, the select's tooltip has it all) */
+      appearance: none; max-width: 12.5em; min-width: 0; color: var(--text); text-overflow: ellipsis;
+      background-color: var(--bg-elev); padding-right: 28px;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b96a5' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+      background-repeat: no-repeat; background-position: right 9px center;
+    }
+    #deck select option { background: var(--bg-elev); color: var(--text); }
+    #deck select option:disabled { color: var(--text-faint); }
+    /* The direction button is a GLYPH the size of the text around it: ⇄ → ←. */
+    .ctl .dir { font-size: 15px; line-height: 1; min-width: 34px; text-align: center; padding: 5px 8px; }
+    /* The segmented controls (style.css .tr-show-btn): one control with several states, not adjacent buttons --
+       hence the shared seams and only the ends rounded; the chosen one sits on top of its neighbours' borders. */
+    .ctl .seg { display: inline-flex; min-width: 0; }
+    .ctl .seg button {
+      border-radius: 0; margin-left: -1px;
+      max-width: 8em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .ctl .seg button:first-child { border-radius: var(--radius-sm) 0 0 var(--radius-sm); margin-left: 0; }
+    .ctl .seg button:last-child  { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+    .ctl .seg button.is-on { position: relative; z-index: 1; }
+    /* Round-cornered icon button (style.css .icon-btn); ON = the app's green "active" pill. */
+    .ctl .icon {
+      display: inline-grid; place-items: center; width: 32px; height: 30px; padding: 0;
+      color: var(--text-dim); background: var(--bg-elev);
+    }
+    .ctl .icon.is-on {
+      color: var(--pill-active-fg); background: var(--pill-active-bg);
+      border-color: color-mix(in srgb, var(--pill-active-dot) 55%, var(--border));
+    }
+    #deck button:disabled { opacity: 0.45; cursor: default; }
+
+    /* ==== THE SOURCE PLATE: the console's input section ==========================================================
+       Strips side by side, like a desk's channels: a LAMP (is this input open?), the SCRIBBLE STRIP (the speaker's
+       name, typed on the strip itself), the source it is patched to, its channel and its TRIM, and a peak METER --
+       then an empty slot to patch another, and the round LISTEN button with its ON AIR lamp at the end of the row. */
+    .plate {
+      position: relative; display: flex; flex-direction: column; gap: 5px; min-width: 0;
+      padding: 6px 10px 8px;
+      background: color-mix(in srgb, var(--bg-elev) 72%, transparent);
+      border: 1px solid var(--border-soft); border-radius: var(--radius);
+    }
+    .plate-row { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; min-width: 0; }
+    #strips { display: contents; }
+    .strip {
+      position: relative; flex: 0 1 188px; min-width: 156px; max-width: 224px;
+      display: flex; flex-direction: column; gap: 4px;
+      padding: 6px 7px 7px;
+      background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      font-size: 12px;
+    }
+    /* each line of a strip is its own row: the head (lamp, name, remove), the source, the reason, the controls
+       (channel, trim, its value), the meter */
+    .strip-head, .strip-ctl { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .strip-lamp {
+      flex: 0 0 auto; width: 10px; height: 10px; border-radius: 50%;
+      background: var(--meter-track); border: 1px solid var(--border);
+    }
+    .strip-lamp.is-open {
+      background: var(--pill-active-dot); border-color: var(--pill-active-dot);
+      box-shadow: 0 0 7px color-mix(in srgb, var(--pill-active-dot) 70%, transparent);
+    }
+    .strip-lamp.is-warn { background: var(--meter-hi); border-color: var(--meter-hi); }
+    .strip-lamp.is-bad  { background: var(--meter-clip); border-color: var(--meter-clip); }
+    .strip-lamp.is-absent { background: transparent; border: 1px dashed var(--text-faint); }
+    /* the scribble strip: the speaker's name, edited in place (Enter keeps it, Esc gives it back) */
+    .strip-name {
+      flex: 1 1 auto; width: 0; min-width: 0;
+      font: inherit; font-size: 13px; font-weight: 650; color: var(--text);
+      background: transparent; border: 1px solid transparent; border-radius: 5px;
+      padding: 2px 5px; text-overflow: ellipsis;
+    }
+    .strip-name::placeholder { color: var(--text-faint); font-weight: 500; }
+    .strip-name:hover { border-color: var(--border); }
+    .strip-name:focus { outline: none; border-color: var(--accent); background: var(--bg-elev); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .strip-x {
+      flex: 0 0 auto; display: inline-grid; place-items: center; width: 22px; height: 22px; padding: 0;
+      font: inherit; font-size: 15px; line-height: 1; color: var(--text-faint);
+      background: none; border: 1px solid transparent; border-radius: 5px; cursor: pointer;
+    }
+    .strip-x:hover { color: var(--danger); border-color: var(--border); }
+    .strip-src { display: flex; align-items: center; gap: 5px; min-width: 0; color: var(--text-faint); font-size: 11px; white-space: nowrap; }
+    .strip-kind {
+      flex: 0 0 auto; font-size: 8.5px; font-weight: 750; letter-spacing: .1em; text-transform: uppercase;
+      border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; line-height: 1.5;
+    }
+    .strip-src-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    .strip-why { font-size: 11px; line-height: 1.25; color: var(--text-dim); }
+    .strip-why.is-bad { color: var(--danger); }
+    .strip-why[hidden] { display: none; }
+    #deck .strip-ch {
+      flex: 0 0 auto; max-width: 6.5em; font: inherit; font-size: 11.5px; font-weight: 550;
+      border: 1px solid var(--border); border-radius: 5px; padding: 2px 22px 2px 6px; cursor: pointer;
+      background-position: right 6px center;
+    }
+    .strip-trim { flex: 1 1 auto; width: 0; min-width: 36px; height: 16px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+    .strip-db { flex: 0 0 auto; font-family: var(--mono); font-size: 11px; color: var(--text-dim); min-width: 5.6em; text-align: right; white-space: nowrap; }
+    /* The METER: -60..0 dBFS, the zones of a digital peak meter (green to -18, amber to -6, red above) laid on the
+       track FAINTLY even when nothing is lit, so the scale reads at rest. The lit part is CLIPPED out of a full-width
+       gradient (the colours stay where they belong as the bar grows), the peak hold is a tick, and the whole meter
+       flashes its clip edge at -1 dBFS. Fed by liveLevels (~5 Hz) while listening, and only then. */
+    .meter {
+      position: relative; height: 7px; margin-top: 1px; border-radius: 2px; overflow: hidden;
+      background: linear-gradient(90deg, var(--meter-track) 0 70%,
+                  color-mix(in srgb, var(--meter-hi) 14%, var(--meter-track)) 70% 90%,
+                  color-mix(in srgb, var(--meter-clip) 16%, var(--meter-track)) 90% 100%);
+      box-shadow: inset 0 0 0 1px var(--border-soft);
+    }
+    .meter-fill {
+      position: absolute; inset: 0;
+      background: linear-gradient(90deg, var(--meter-lo) 0 70%, var(--meter-hi) 70% 90%, var(--meter-clip) 90% 100%);
+      clip-path: inset(0 calc(100% - var(--lvl, 0) * 100%) 0 0);
+      transition: clip-path 140ms linear;
+    }
+    .meter-peak {
+      position: absolute; top: 0; bottom: 0; width: 2px;
+      left: calc(var(--pk, 0) * 100% - 2px);
+      background: var(--text); opacity: 0.7;
+    }
+    .meter.is-clip { box-shadow: inset 0 0 0 1px var(--meter-clip); }
+    .meter:not(.is-lit) .meter-peak { display: none; }
+    /* the empty slot: a strip waiting to be patched */
+    .add-slot {
+      flex: 0 0 auto; width: 112px; min-height: 66px;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+      font: inherit; font-size: 12px; font-weight: 600; color: var(--text-dim);
+      background: transparent; border: 1px dashed var(--border); border-radius: var(--radius-sm); cursor: pointer;
+      transition: color var(--transition), border-color var(--transition);
+    }
+    .add-slot:hover:not(:disabled), .add-slot[aria-expanded="true"] { color: var(--text); border-color: var(--accent); }
+    .add-plus { font-size: 20px; line-height: 1; color: var(--accent); }
+    .add-slot.is-beckon { animation: beckon 0.9s ease-in-out 2; }
+    @keyframes beckon { 0%, 100% { box-shadow: none; } 50% { box-shadow: 0 0 0 4px var(--accent-soft); border-color: var(--accent); } }
+    /* LISTEN: a round latching button, lit red while the engine listens -- with an ON AIR lamp under it that only
+       the engine's ECHO lights (the page never claims a microphone is open on its own say-so). */
+    .listen {
+      flex: 0 0 auto; margin-left: auto;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+      padding: 0 2px 0 6px;
+    }
+    .listen-btn {
+      width: 60px; height: 60px; border-radius: 50%; padding: 0;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+      font: inherit; font-size: 10px; font-weight: 750; letter-spacing: .1em; text-transform: uppercase;
+      color: var(--text); background: radial-gradient(circle at 50% 38%, var(--card-hover), var(--card));
+      border: 2px solid var(--border); box-shadow: var(--shadow); cursor: pointer;
+      transition: border-color var(--transition), box-shadow var(--transition);
+    }
+    .listen-btn:hover { border-color: var(--accent); }
+    .listen-btn:focus-visible { outline: none; box-shadow: 0 0 0 4px var(--accent-soft); }
+    .listen-dot {
+      width: 14px; height: 14px; border-radius: 50%;
+      border: 2px solid var(--meter-clip); background: color-mix(in srgb, var(--meter-clip) 18%, transparent);
+    }
+    .listen-btn[aria-pressed="true"] {
+      color: #fff; border-color: color-mix(in srgb, var(--meter-clip) 70%, #000);
+      background: radial-gradient(circle at 50% 38%, color-mix(in srgb, var(--meter-clip) 78%, #fff), var(--meter-clip));
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--meter-clip) 22%, transparent),
+                  0 0 18px color-mix(in srgb, var(--meter-clip) 45%, transparent);
+    }
+    .listen-btn[aria-pressed="true"] .listen-dot { background: #fff; border-color: #fff; }
+    .listen-btn.is-pending .listen-dot { animation: pulse 0.9s ease-in-out infinite; }
+    .on-air {
+      font-size: 9px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; white-space: nowrap;
+      padding: 2px 7px; border-radius: 3px; color: var(--text-faint); border: 1px solid var(--border);
+    }
+    .on-air.is-lit {
+      color: #fff; background: var(--meter-clip); border-color: var(--meter-clip);
+      box-shadow: 0 0 10px color-mix(in srgb, var(--meter-clip) 55%, transparent);
+    }
+    /* THE DRAIN (fix round): Listen is off, the last sentences are still being finished -- the lamp BLINKS on its way
+       off, the way a console's light says "released, not yet clear" (steady and dimmed without motion) */
+    .on-air.is-finishing {
+      color: #fff; background: var(--meter-clip); border-color: var(--meter-clip);
+      animation: pulse 0.9s ease-in-out infinite;
+    }
+
+    /* ==== THE PICKER: what can be patched to a new strip ==========================================================
+       Three sections -- Inputs, Sound of an output, Applications -- one row each: its name, its badges (Windows'
+       default device, the default for communications), and, when it cannot be added, WHY, greyed. A device with
+       several channels also offers each channel ON ITS OWN (a patchbay's points): one interface, two people --
+       "channel 1 = me, channel 2 = the guest" -- is two strips on one device. Opening it asks the engine for the list;
+       it never opens a device. */
+    .picker {
+      position: absolute; z-index: 30; top: calc(100% + 6px); left: 0;
+      width: min(560px, calc(100vw - 24px)); max-height: max(180px, calc(100vh - 150px)); overflow-y: auto;
+      padding: 8px 10px 10px;
+      font-size: 13px; color: var(--text);
+      background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
+    }
+    .picker[hidden] { display: none; }
+    .pk-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+    .pk-title { font-weight: 650; flex: 1 1 auto; }
+    .pk-close {
+      display: inline-grid; place-items: center; width: 26px; height: 26px; padding: 0;
+      font: inherit; font-size: 16px; color: var(--text-faint); background: none;
+      border: 1px solid transparent; border-radius: 6px; cursor: pointer;
+    }
+    .pk-close:hover { color: var(--text); border-color: var(--border); }
+    .pk-note { font-size: 12px; color: var(--text-dim); margin: 2px 0 6px; }
+    .pk-note[hidden] { display: none; }
+    .pk-sec { margin-top: 8px; }
+    .pk-sec-title {
+      font-size: 9.5px; font-weight: 700; letter-spacing: .15em; text-transform: uppercase;
+      color: var(--text-faint); margin: 0 0 3px 2px;
+    }
+    .pk-none { font-size: 12px; color: var(--text-faint); padding: 3px 6px; }
+    .pk-row { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 8px; padding: 2px 0; }
+    .pk-add {
+      flex: 1 1 260px; min-width: 0; display: flex; align-items: center; gap: 8px; text-align: left;
+      font: inherit; color: var(--text); background: none; border: 1px solid transparent; border-radius: 6px;
+      padding: 5px 6px; cursor: pointer;
+    }
+    .pk-add:hover:not(:disabled), .pk-add:focus-visible { outline: none; background: var(--card); border-color: var(--border); }
+    .pk-add:disabled { cursor: default; }
+    .pk-row.is-off .pk-add { opacity: 0.55; }
+    .pk-dot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: var(--pill-active-dot); }
+    .pk-dot.is-off { background: var(--text-faint); }
+    .pk-dot.is-bad { background: var(--meter-clip); }
+    .pk-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pk-badge {
+      flex: 0 0 auto; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+      color: var(--text-faint); border: 1px solid var(--border); border-radius: var(--radius-pill); padding: 1px 6px;
+    }
+    .pk-why { flex: 1 0 100%; font-size: 11.5px; color: var(--text-faint); padding: 0 6px 3px 22px; }
+    .pk-chips { display: inline-flex; flex-wrap: wrap; gap: 3px; padding-left: 16px; }
+    .pk-ch {
+      font-family: var(--mono); font-size: 11px; min-width: 28px; padding: 2px 6px;
+      color: var(--text-dim); background: var(--card); border: 1px solid var(--border); border-radius: 5px; cursor: pointer;
+    }
+    .pk-ch:hover:not(:disabled), .pk-ch:focus-visible { outline: none; color: var(--text); border-color: var(--accent); }
+    .pk-ch:disabled { opacity: 0.4; cursor: default; }
+
+    /* A NARROW or SHORT window: the plates fold back into plain rows of controls -- their labels and chrome go, the
+       lockup shrinks (and below 560 px it goes), the strips tighten and lose their source line (it is the name's
+       tooltip) -- or the deck alone would fill a window floating over a video call. The mode's three words go too:
+       the ⇄ → ← button between the two languages says the same thing in one glyph. */
+    @media (max-width: 900px), (max-height: 560px) {
+      #deck { padding: 6px 9px 8px; gap: 5px 8px; }
+      .trrow, .bar { align-items: center; gap: 6px 8px; }
+      .brand { gap: 2px; padding-right: 0; }
+      .brand-line { gap: 6px; }
+      .brand-name { font-size: 18px; }
+      .brand-tag { display: none; }
+      #deck .grp { flex-direction: row; align-items: center; padding: 0; background: none; border: none; border-radius: 0; }
+      #deck .lbl { display: none; }
+      .ctl button, .ctl select { padding: 4px 9px; }
+      #deck select { padding-right: 26px; }
+      .ctl .icon { width: 30px; height: 28px; padding: 0; }
+      .ctl .seg-mode { display: none; }
+      .plate { padding: 5px 7px 6px; }
+      .strip { flex-basis: 164px; min-width: 140px; padding: 5px 6px 6px; gap: 3px; }
+      .strip-src { display: none; }
+      .add-slot { width: 92px; min-height: 54px; }
+      .listen-btn { width: 50px; height: 50px; }
+    }
+    @media (max-width: 560px) { .brand { display: none; } }
+
+    /* ---- the state line, bottom-left: the app's status PILL (style.css .pill). Green = listening, accent =
+       transcribing, amber = loading, red = an error (which also pins it through the idle fade). ---- */
+    #state {
+      position: fixed; left: 12px; bottom: 12px; z-index: 10;
+      display: inline-flex; align-items: center; gap: 8px; max-width: calc(100% - 24px);
+      padding: 6px 13px 6px 10px; border-radius: var(--radius-pill);
+      font-size: 12.5px; font-weight: 550; color: var(--text-dim);
+      background: color-mix(in srgb, var(--text-faint) 16%, var(--bg));
+      border: 1px solid var(--border-soft);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      opacity: 1; transition: opacity 420ms ease;
+    }
+    #state.is-idle { opacity: 0; }
+    #state::before {
+      content: ""; flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%;
+      background: var(--text-faint);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-faint) 22%, transparent);
+    }
+    #state.is-loading { color: var(--text); }
+    #state.is-loading::before { background: var(--meter-hi); animation: pulse 1.1s ease-in-out infinite; }
+    #state.is-listening { color: var(--pill-active-fg); background: color-mix(in srgb, var(--pill-active-dot) 16%, var(--bg)); }
+    #state.is-listening::before { background: var(--pill-active-dot); box-shadow: 0 0 0 3px color-mix(in srgb, var(--pill-active-dot) 22%, transparent); }
+    #state.is-transcribing { color: var(--text); }
+    #state.is-transcribing::before { background: var(--accent); }
+    #state.is-error::before { background: var(--danger); }
+    #state.is-error { color: var(--danger); opacity: 1; }
+    /* ON AIR, when the deck has faded: the one thing that must stay in sight while a microphone is open. */
+    #tally {
+      position: fixed; top: 8px; right: 10px; z-index: 11; pointer-events: none;
+      font-size: 9px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase;
+      padding: 2px 7px; border-radius: 3px; color: #fff; background: var(--meter-clip);
+      opacity: 0; transition: opacity 420ms ease;
+    }
+    body.is-on-air #deck.is-idle ~ #tally { opacity: 0.85; }
+    @keyframes pulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+      #state.is-loading::before, .listen-btn.is-pending .listen-dot, .add-slot.is-beckon { animation: none; }
+      .on-air.is-finishing { animation: none; opacity: 0.55; }
+      #deck, #state, #tally, .meter-fill { transition: none; }
+    }
+
+    /* ==== THE DIALOGUE (1.1.0) ==== */
+    #log {
+      height: 100%; overflow-y: auto;
+      /* The top gutter clears the deck, which OVERLAYS this column rather than pushing it. How tall the deck is
+         depends on the window's width, the strips and two language names, so it is MEASURED (--deck-h, fitDeck)
+         rather than guessed; the fallback is a one-row plate. */
+      padding: calc(var(--deck-h, 150px) + 14px) clamp(20px, 5vw, 90px) 64px;
+      scroll-behavior: smooth;
+    }
+    #log:empty::after {
+      display: block; margin-top: 18vh; text-align: center;
+      font-size: 0.62em; color: var(--faint);
+      content: "Press Listen to start.";
+    }
+    body.no-strips #log:empty::after { content: "Add a source, then press Listen."; }
+    body.is-on-air #log:empty::after { content: "Waiting for someone to speak…"; }
+    /* the scrollbar is furniture, not information */
+    #log::-webkit-scrollbar { width: 10px; }
+    #log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
+    #log::-webkit-scrollbar-track { background: transparent; }
+
+    .tr-para {
+      margin: 0 0 0.85em;
+      /* The assigned colour brought 20% toward this page's ink, which keeps the darkest of the six legible on the
+         forest ground and the ivory one alike: this surface is read across a room, contrast is the whole job. */
+      --spk-ink: color-mix(in srgb, var(--spk) 80%, var(--ink));
+    }
+    .tr-para:last-child { margin-bottom: 0.2em; }
+    .tr-line { display: block; margin-bottom: 0.28em; }
+    .tr-line:last-child { margin-bottom: 0; }
+    .tr-who { margin-right: 0.35em; white-space: nowrap; }
+    .tr-dash { color: var(--spk-ink); font-weight: 600; margin-right: 0.28em; }
+    .tr-who-name {
+      font-size: 0.5em; font-weight: 700;
+      letter-spacing: 0.1em; text-transform: uppercase;
+      color: color-mix(in srgb, var(--spk-ink) 70%, var(--faint));
+      vertical-align: 0.18em;
+    }
+    .tr-dst { color: var(--spk-ink); }
+    .tr-meta { margin-left: 0.4em; white-space: nowrap; vertical-align: 0.28em; }
+    .tr-lang {
+      font-size: 0.34em; font-weight: 700; letter-spacing: 0.08em;
+      color: var(--faint); border: 1px solid var(--border); border-radius: var(--radius-pill);
+      padding: 2px 7px; margin-right: 5px;
+    }
+    .tr-ms {
+      font-family: var(--mono); font-size: 0.32em;
+      color: var(--faint); background: color-mix(in srgb, var(--text) 6%, transparent);
+      border-radius: 3px; padding: 2px 5px;
+    }
+    .tr-src {
+      display: block; margin-top: 0.1em;
+      font-size: 0.52em; color: var(--dim);
+    }
+
+    /* ---- the live line (1.1.0 spec §7): the segment being spoken right now, at the foot of the log. Colourless on
+       purpose -- attribution only exists at finalisation, so a guessed speaker tint here would be re-painted under
+       the reader. Italic + lowered opacity + an accent rule + a blinking ellipsis say "not final yet". ---- */
+    .tr-live {
+      display: block;
+      margin: 0.2em 0 0.35em;
+      padding-left: 0.3em;
+      opacity: 0.88;
+      border-left: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
+      transition: opacity 620ms ease;
+    }
+    .tr-live.is-fading { opacity: 0; }
+    .tr-live-dst { color: var(--dim); font-style: italic; }
+    .tr-live-meta { margin-left: 0.4em; white-space: nowrap; vertical-align: 0.28em; }
+    .tr-live-src {
+      display: block; margin-top: 0.1em;
+      font-size: 0.52em; font-style: italic; color: var(--faint);
+    }
+    /* §7b, the stable prefix: what two partials in a row agreed on is settled text -- upright and at full strength --
+       while only the still-moving remainder keeps the italic, faded "not final yet" look. */
+    .tr-live-stable    { font-style: normal; opacity: 1; }
+    .tr-live-tentative { font-style: italic; opacity: 0.72; }
+    /* Spelled out: these three are hidden until there IS a draft / a detected language / a second text to show at
+       all, and a `display` of our own would otherwise beat the UA's [hidden] rule. */
+    .tr-live-dst[hidden], .tr-live-lang[hidden], .tr-live-src[hidden] { display: none; }
+    .tr-live-dots {
+      margin-left: 0.2em; color: var(--accent);
+      animation: tr-live-blink 1.15s ease-in-out infinite;
+    }
+    @keyframes tr-live-blink { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+      .tr-live-dots { animation: none; opacity: 0.75; }
+      .tr-live { transition: none; }
+    }
+
+    /* ---- the resume pill: the log stopped following because YOU scrolled up (style.css .tr-resume) ---- */
+    #resume {
+      position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 12;
+      font: inherit; font-size: 14px; font-weight: 550; color: var(--accent-ink);
+      background: var(--accent); border: none; border-radius: var(--radius-pill);
+      padding: 8px 18px; cursor: pointer;
+      box-shadow: var(--shadow);
+    }
+    #resume[hidden] { display: none; }
+  </style>
+</head>
+<body class="no-strips">
+  <!-- THE DECK, three regions (CSS grid areas, see #deck): the SOURCE plate, the TRANSLATE row, the bar. The strips,
+       the picker's rows and the two language <select>s are built by the script (from the app's state, the engine's
+       source list and the thirteen-language table), so the markup carries no device and no language name at all. -->
+  <div id="deck">
+    <section id="plate" class="plate" aria-label="Sources">
+      <span class="lbl">Source</span>
+      <div class="plate-row">
+        <div id="strips"></div>
+        <button id="addSource" class="add-slot" type="button" aria-haspopup="dialog" aria-expanded="false" title="Add an input, the sound of an output or an application"><span class="add-plus" aria-hidden="true">+</span><span>Add source</span></button>
+        <div class="listen">
+          <button id="listenBtn" class="listen-btn" type="button" aria-pressed="false" title="Add a source first, then listen"><span class="listen-dot" aria-hidden="true"></span><span>Listen</span></button>
+          <span id="onAir" class="on-air" aria-hidden="true">On air</span>
+        </div>
+      </div>
+      <div id="picker" class="picker" role="dialog" aria-label="Add a source" hidden>
+        <div class="pk-head">
+          <span class="pk-title">Add a source</span>
+          <button id="pickerClose" class="pk-close" type="button" aria-label="Close" title="Close (Esc)">×</button>
+        </div>
+        <div id="pickerNote" class="pk-note" hidden></div>
+        <div id="pickerList"></div>
+      </div>
+    </section>
+    <div id="trRow" class="trrow ctl">
+      <div class="brand" title="SuVtitle Live — Transcription, Translation &amp; Subtitles, by NEXTALE Audio">
+        <span class="brand-line">
+          <span class="brand-name"><span class="brand-txt">Su</span><span class="brand-accent">V</span><span class="brand-txt">title</span></span>
+          <span class="brand-sub">Live</span>
+          <span class="brand-tag">Transcription, Translation &amp; Subtitles</span>
+        </span>
+        <span class="brand-by">by NEXTALE Audio</span>
+      </div>
+      <span class="grp grp-tr">
+        <span class="lbl">Translate</span>
+        <span class="grp-row">
+          <select id="langA" aria-label="Language A"></select>
+          <button id="dirBtn" type="button" class="dir" aria-label="Direction of translation">⇄</button>
+          <select id="langB" aria-label="Language B"></select>
+          <span class="seg seg-mode" role="group" aria-label="Direction">
+            <button id="modeAuto" type="button" class="is-on" aria-pressed="true">Both ways</button>
+            <button id="modeA2B" type="button" aria-pressed="false">A → B</button>
+            <button id="modeB2A" type="button" aria-pressed="false">B → A</button>
+          </span>
+          <select id="presetSel" aria-label="Models">
+            <option value="auto">Auto</option>
+            <option value="quality">Quality</option>
+            <option value="balanced">Balanced</option>
+            <option value="light">Light</option>
+          </select>
+        </span>
+      </span>
+    </div>
+    <div id="bar" class="bar ctl">
+      <span class="grp grp-show">
+        <span class="lbl">Show</span>
+        <span class="grp-row">
+          <span class="seg" role="group" aria-label="Which language to show in this window">
+            <button id="showBoth" type="button" class="is-on" aria-pressed="true">Both</button>
+            <button id="showA" type="button" aria-pressed="false">A</button>
+            <button id="showB" type="button" aria-pressed="false">B</button>
+          </span>
+        </span>
+      </span>
+      <span class="grp grp-text">
+        <span class="lbl">Text</span>
+        <span class="grp-row">
+          <button id="fontDown" type="button" class="mono" title="Smaller text (Ctrl+wheel)" aria-label="Smaller text">A−</button>
+          <button id="fontUp" type="button" class="mono" title="Bigger text (Ctrl+wheel)" aria-label="Bigger text">A+</button>
+        </span>
+      </span>
+      <span class="grp">
+        <span class="lbl">Window</span>
+        <span class="grp-row">
+          <button id="pinToggle" type="button" class="icon" title="Keep this window above the others" aria-label="Always on top" aria-pressed="false"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6l-1 6 3.5 3.5V15h-11v-2.5L10 9z" /><path d="M12 15v6" /></svg></button>
+          <button id="themeBtn" type="button" class="icon" title="Light theme" aria-label="Light theme"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8" /><path d="M12 4a8 8 0 0 0 0 16z" fill="currentColor" /></svg></button>
+          <button id="clearBtn" type="button" title="Clear the log (a new session begins)">Clear</button>
+          <!-- LAST, and after Clear on purpose (1.1.0 W5): the two are neighbours in intent ("I am done with this
+               conversation"), and a reader who wants to keep it should meet Export before the button that throws it away. -->
+          <button id="exportBtn" type="button" title="Save the whole session as a Word document (.docx)">Export</button>
+        </span>
+      </span>
+    </div>
+  </div>
+  <div id="tally" aria-hidden="true">On air</div>
+
+  <div id="log" tabindex="0"></div>
+  <button id="resume" type="button" hidden>Jump to latest ↓</button>
+
+  <div id="state">not running</div>
+
+<script>
+(() => {
+  "use strict";
+
+  /* ---- THE THEME: the key SuVtitle's pages share (AudioPB's, "patchbus.theme", on <html data-theme>), dark when
+     nothing was ever chosen. Both pages are one origin in one WebView2 profile, so a toggle in either reaches the
+     other LIVE through the storage event; this window has its own toggle too (#themeBtn), because `--live` opens it
+     alone. First thing the page does, so it never paints in the wrong theme. */
+  const THEME_KEY = "patchbus.theme";
+  const applyTheme = (t) => {
+    if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+  };
+  try { applyTheme(localStorage.getItem(THEME_KEY)); } catch { /* private mode: the default stands */ }
+  const themeNow = () => (document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark");
+  window.addEventListener("storage", (e) => {
+    if (!e) return;
+    if (e.key === THEME_KEY) { applyTheme(e.newValue); paintThemeBtn(); }
+    // Show is SHARED with the player on purpose (D-L18): a choice made there is this window's too, at once
+    else if (e.key === KEY_SHOW) applyShow(e.newValue, /*persist=*/false);
+  });
+
+  const el = {
+    deck:       document.getElementById("deck"),
+    plate:      document.getElementById("plate"),
+    strips:     document.getElementById("strips"),
+    addSource:  document.getElementById("addSource"),
+    listenBtn:  document.getElementById("listenBtn"),
+    onAir:      document.getElementById("onAir"),
+    picker:     document.getElementById("picker"),
+    pickerClose: document.getElementById("pickerClose"),
+    pickerNote: document.getElementById("pickerNote"),
+    pickerList: document.getElementById("pickerList"),
+    trRow:      document.getElementById("trRow"),
+    langA:      document.getElementById("langA"),
+    langB:      document.getElementById("langB"),
+    dirBtn:     document.getElementById("dirBtn"),
+    modeAuto:   document.getElementById("modeAuto"),
+    modeA2B:    document.getElementById("modeA2B"),
+    modeB2A:    document.getElementById("modeB2A"),
+    presetSel:  document.getElementById("presetSel"),
+    bar:        document.getElementById("bar"),
+    showBoth:   document.getElementById("showBoth"),
+    showA:      document.getElementById("showA"),
+    showB:      document.getElementById("showB"),
+    fontDown:   document.getElementById("fontDown"),
+    fontUp:     document.getElementById("fontUp"),
+    pinToggle:  document.getElementById("pinToggle"),
+    themeBtn:   document.getElementById("themeBtn"),
+    clearBtn:   document.getElementById("clearBtn"),
+    exportBtn:  document.getElementById("exportBtn"),
+    tally:      document.getElementById("tally"),
+    log:        document.getElementById("log"),
+    resume:     document.getElementById("resume"),
+    state:      document.getElementById("state"),
+  };
+
+  /* ---- the bridge transport: WebView2's postMessage (a plain browser: the design mock at the end plays the app) ---- */
+  const hasWebView = !!(window.chrome && window.chrome.webview);
+  const send = (msg) => { if (hasWebView) window.chrome.webview.postMessage(msg); else mock.handle(msg); };
+
+  /* =========================================================================================================
+     Contract with the app -- SuVtitle.exe (docs/LIVE_PLAN.md 3.3). 1.1.0's own messages keep 1.1.0's shapes; the
+     routing (the Live view's translatorCtl acts on the LIVE pair) is the app's.
+       UI  -> ready{}                       the app answers: translatorState (full), the replay of the last <= 200
+                                            session lines, liveSources (if it knows a list), translatorWindow{topmost}
+              translatorCtl{mode? | preset? | langA+langB | clear? | alwaysOnTop?}   ONLY the field that changed
+                                            travels (the pair: both halves -- one fact); the app adds scope=live
+              translatorExport{format:"docx"}
+              liveSources{}                 "send me the list": the picker is opening (never otherwise)
+              liveSources{open:false}       (fix round, RVB-7) the picker closed: the app stops asking the engine
+              liveConfig{inputs:[{key, label, chan, gainDb}]}   the strips AS EDITED (0..4), on EVERY committed edit
+              liveListen{on}                the Listen button
+       ->UI   translatorState{running, status, err?, preset, presetReq?, mode, langA, langB (= the LIVE pair), gpu,
+                     models{asr, mt}, spk{on, model, speakers}, sessionLines,
+                     live{on, wanted, inputs:[{key, lane, label, chan, gainDb, state, why?}]}}   -- the engine's echo
+                     WINS; on = the engine listens, wanted = the app wants it to (they differ: starting / stopping)
+                     -- fix round: on && !wanted = the DRAIN (LIVE 0 = stop listening, then FINISH: the microphones are
+                     closed, the queued sentences still come; "Finishing the last sentences…", the lamp blinks off)
+              translatorState{cleared:true} (a Clear, from either side: a new session)
+              translatorLine{t, lang, src, dst, dstLang, ms, waitMs, segId, seq, closes, pass, spk{key, slot (the
+                     lane), label, color}}   translatorPartial{segId, t, lang, src, dst?, dstLang?}   translatorEnd{segId}
+              translatorExported{ok, path, lines | err}   ("cancelled" = the dialog was closed: silence)
+              liveSources{gen, list:[{kind, key, label, state, rate, ch, flags}]}   (again on every change)
+              liveLevels{levels:{<lane>: <dBFS>}}   ~5 Hz while listening, the newest wins
+              translatorWindow{topmost}     the window's REAL always-on-top (RV4-7: the pin follows it)
+              warn{text}                    a sentence for the user (the engine stopped responding, a refused edit...)
+     Keys (TrPipe.h): in:<endpoint id> | out:<endpoint id> | app:<exe file name> | wav:<path> (a test engine only).
+     LANES (TrPipe.h, R1): a STRIP is named by its lane -- the key for a mix strip, "<key>|<chan>" for a one-channel
+     strip -- in liveLevels and spk.slot, so two channels of one device never share a meter nor a speaker; an INPUT
+     state is the DEVICE's (every strip on it).
+     Rules (TrPipe.h unpackLive, the app validates the same way): <= 4 inputs; a label <= 64 bytes of UTF-8; chan 0
+     (the mix) or 1..8; gainDb -24..+24; one key twice only on two different channels >= 1, never next to its mix.
+     ========================================================================================================= */
+
+  /* ---- the thirteen languages a pair can be built from (W2, + zh-tw in WA) ----
+     TWIN of index.html (TR_LANGS) -- each page loads alone. Native labels: the list is read by the person whose
+     language it is. The codes are the whole vocabulary (the app refuses anything else), so a fourteenth language is
+     added in BOTH pages or in neither. zh = 简体中文 (Simplified), zh-tw = 繁體中文 (Traditional, Taiwan): the one
+     code that is not two letters, because it is the same Mandarin in the other SCRIPT -- and why zh is
+     no longer labelled "中文", which would now name both.
+     U1 (the user, 02/11: "pour les langues qui ne sont pas en alphabet latin, mettre le nom anglais entre parenthèses
+     après le vrai nom"): a THIRD column, the English name of the six non-Latin scripts -- langName says "日本語
+     (Japanese)" in the selects and the tooltips; the Show buttons keep the bare name (langNative: two segments of a
+     one-row deck -- the whole name is their tooltip). Twin of index.html's, row for row. */
+  const TR_LANGS = [
+    ["en", "English"],   ["zh", "简体中文", "Simplified Chinese"],  ["zh-tw", "繁體中文", "Traditional Chinese"],
+    ["fr", "Français"],  ["de", "Deutsch"],   ["es", "Español"],  ["it", "Italiano"],   ["pt", "Português"],
+    ["ja", "日本語", "Japanese"],     ["ko", "한국어", "Korean"],    ["ru", "Русский", "Russian"],
+    ["nl", "Nederlands"], ["ar", "العربية", "Arabic"],
+  ];
+  /* THE ONE NORMALISER -- an EXACT mirror of the C++ doors (app/bridge.cpp trLangCode, engine/TrEngine.cpp
+     normalizeLangCode), row for row: spacing removed, lower case, then the alias table, then "exactly two ASCII
+     letters" -- and anything else is NOT A CODE: "". A caller handed "" shows the raw code (langName, langBadge) and
+     never sends it (pickPair). Never a prefix rule either: cut to two, "zh-tw" IS "zh", and this window would send a
+     Taiwanese session back as a mainland one. */
+  const LANG_ALIAS = { "eng": "en", "zho": "zh", "chi": "zh", "cmn": "zh", "yue": "yue",
+                       "zh-tw": "zh-tw", "zh_tw": "zh-tw", "zh-hant": "zh-tw", "zh_hant": "zh-tw",
+                       "zh-hk": "zh-tw", "zh-mo": "zh-tw", "cht": "zh-tw" };
+  const normLang = (l) => {
+    const s = String(l == null ? "" : l).replace(/[ \t\r\n]/g, "").toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(LANG_ALIAS, s)) return LANG_ALIAS[s];
+    return /^[a-z]{2}$/.test(s) ? s : "";
+  };
+  // the bare native name ("日本語"): the Show buttons (U1)
+  const langNative = (c) => {
+    const k = normLang(c);
+    const hit = TR_LANGS.find((e) => e[0] === k);
+    if (hit) return hit[1];
+    return (k || String(c == null ? "" : c).trim()).toUpperCase();
+  };
+  // the name on screen: native, + the English one after a non-Latin script ("日本語 (Japanese)", U1)
+  const langName = (c) => {
+    const hit = TR_LANGS.find((e) => e[0] === normLang(c));
+    return hit && hit[2] ? hit[1] + " (" + hit[2] + ")" : langNative(c);
+  };
+  // A code as the mode buttons show it, the short way: EN, ZH-TW.
+  const codeTag = (c) => (normLang(c) || String(c == null ? "" : c).trim()).toUpperCase();
+  /* A line's language as an HTML `lang` value: the page is lang="en", so without it a Traditional sentence is drawn
+     in the DEFAULT CJK face -- the mainland hand. zh-TW picks the Taiwanese face, zh-CN the Simplified one. */
+  const langTag = (code) => {
+    const k = normLang(code);
+    return k === "zh-tw" ? "zh-TW" : k === "zh" ? "zh-CN" : k === "yue" ? "zh-HK" : k;
+  };
+  const setLang = (node, code) => {
+    const t = langTag(code);
+    if (t) node.setAttribute("lang", t); else node.removeAttribute("lang");
+  };
+
+  /* ---- NAMES from outside (RV4-5, as index.html): a device's name, an application's, a speaker's, the app's own
+     sentences. No control or bidi/format character -- an unclosed RIGHT-TO-LEFT OVERRIDE in a device name would
+     reverse the rest of its row (a spoof) -- one line, bounded. Never a transcript's TEXT: RLM / LRM are real there. */
+  const NAME_JUNK = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/g;
+  const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+  function cleanName(raw, max) {
+    let s = String(raw == null ? "" : raw).replace(LONE_SURROGATE, "").replace(NAME_JUNK, " ").replace(/\s+/g, " ").trim();
+    const n = max > 1 ? max : 120, cps = Array.from(s);
+    if (cps.length > n) s = cps.slice(0, n - 1).join("").trim() + "…";
+    return s;
+  }
+  const cleanNotice = (raw) => cleanName(raw, 300);
+
+  /* ---- a STRIP's name on the wire: <= 64 bytes of UTF-8 (TrPipe.h kLiveLabelMax), whole code points only ---- */
+  const LABEL_MAX = 64;
+  const utf8Len = (s) => {
+    let n = 0;
+    for (const ch of String(s)) { const c = ch.codePointAt(0); n += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4; }
+    return n;
+  };
+  function fitBytes(s, max) {
+    let out = "", n = 0;
+    for (const ch of String(s)) {
+      const b = utf8Len(ch);
+      if (n + b > max) break;
+      out += ch; n += b;
+    }
+    return out;
+  }
+  const cleanLabel = (raw) => fitBytes(cleanName(raw, 400), LABEL_MAX).trim();
+  // The default name of a strip: the source's own, + " · ch N" when it takes one channel -- within the 64 bytes,
+  // the source's part cut (on a code point, "…") rather than the channel, which is what tells two strips apart.
+  function defaultLabel(srcLabel, chan) {
+    const base = cleanName(srcLabel, 200) || "Source";
+    const suffix = chan > 0 ? " · ch " + chan : "";
+    if (utf8Len(base + suffix) <= LABEL_MAX) return base + suffix;
+    return fitBytes(base, LABEL_MAX - utf8Len(suffix) - utf8Len("…")).trim() + "…" + suffix;
+  }
+
+  /* ---- persisted view preferences (this profile's; Show and the theme are SHARED with the player) ----
+     `show` is a POSITION (both | a | b), never a language code: "show me their side" has to keep meaning that after
+     the pair is changed. What is translated and what is READ here are two different questions. */
+  const KEY_FONT = "audiopb.tr.font", KEY_SHOW = "audiopb.tr.show";
+  const read = (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch { return d; } };
+  const write = (k, v) => { try { localStorage.setItem(k, String(v)); } catch { /* private mode */ } };
+
+  let font = Math.max(14, Math.min(72, parseInt(read(KEY_FONT, "28"), 10) || 28));
+  let show = (() => { const v = read(KEY_SHOW, "both");
+                      return (v === "a" || v === "b" || v === "both") ? v : "both"; })();
+  let pinned = true;          // auto-scroll, until the reader scrolls up
+  let onTop = false;          // the window's always-on-top, as the app last said it (translatorWindow.topmost)
+
+  function applyFont() { document.documentElement.style.setProperty("--tr-font", font + "px"); }
+  function bumpFont(d) { font = Math.max(14, Math.min(72, font + d)); applyFont(); write(KEY_FONT, font); pin(); }
+  applyFont();
+
+  /* ---- the dialogue renderer (1.1.0) -----------------------------------------------------------------------
+     A speaker change opens a new paragraph on an em-dash; consecutive lines from the same speaker join the paragraph
+     already running. The colour and the name come from the LINE (the app assigns them: the strip's name, a colour by
+     order of appearance), never from a local counter. */
+  const lines = [];
+  const seen = new Set();
+  const MAX = 500;
+  const identity = (l) => String(l.t) + " " + String(l.src || "");
+
+  // Read off the ONE normaliser, Traditional asked FIRST (every Traditional code also starts with "zh"). 繁 is the
+  // character the region itself puts on a Traditional switch.
+  const langBadge = (lang) => {
+    const k = normLang(lang);
+    if (k === "zh-tw") return "繁";
+    const l = String(lang || "").trim().toLowerCase();
+    if (k === "zh" || l === "chinese") return "中";
+    if (k === "en") return "EN";
+    if (k) return k.toUpperCase();
+    return l ? l.slice(0, 3).toUpperCase() : "·";   // not a code: shown as it came, never sent
+  };
+  const fmtMs = (ms) => {
+    const v = Math.max(0, Math.round(Number(ms) || 0));
+    return v < 1000 ? v + " ms" : (v / 1000).toFixed(1) + " s";
+  };
+  /* Two numbers, one chip (1.1.0 §7). `waitMs` = end of segment -> on screen: the wait the reader actually sat
+     through. `ms` = ASR+MT alone, a fraction of it, so it goes in the tooltip. No waitMs = show `ms`, as before. */
+  const waitOf = (l) => (Number(l.waitMs) > 0 ? Number(l.waitMs) : Number(l.ms) || 0);
+  /* The wire's segId is a NUMBER, and 0 means "no segment at all" (TrPipe.h). String(0) is "0", which is TRUTHY --
+     so without this a segment-less final would look like it had an identity and could claim a live line. */
+  const segIdOf = (v) => (v == null || Number(v) === 0 ? "" : String(v));
+  const msTitle = (l) => {
+    const head = "Time from end of speech to this line";
+    const inf = Number(l.ms) || 0;
+    return (Number(l.waitMs) > 0 && inf > 0) ? head + " · ASR+MT " + fmtMs(inf) : head;
+  };
+
+  /* ---- W3: `closes` and THE HEAD TRIM (1.1.0) ----
+     Does this line END its utterance? The wire's own default is TRUE (TrPipe.h), so an ABSENT field is "yes". And
+     when it does NOT close, the sentence it carries has just been taken out of the utterance still being spoken: the
+     paragraph gains it, so the LIVE LINE must lose it. The comparison is LOOSE (the committed sentence was
+     re-transcribed on the FINAL model): whitespace COLLAPSED, case IGNORED, trailing punctuation ignored on both sides
+     of the join. Anything more is REFUSED -- the tail PART replaces the live line wholesale a moment later. */
+  const closesOf = (l) => l.closes !== false;
+  const TRIM_PUNCT = /[.,;:!?…。、，；：！？·"'“”‘’()（）\[\]{}「」『』—–]/;
+  // Lower case, every run of spacing as ONE space, trimmed -- each character REMEMBERING where it came from, so the
+  // cut is made in the ORIGINAL string and the tail keeps its own spacing.
+  function normChars(s) {
+    const out = [];
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (/\s/.test(c)) {
+        if (out.length && out[out.length - 1].c === " ") continue;
+        out.push({ c: " ", at: i });
+      } else out.push({ c: c.toLowerCase(), at: i });
+    }
+    while (out.length && out[out.length - 1].c === " ") out.pop();
+    if (out.length && out[0].c === " ") out.shift();
+    return out;
+  }
+  // Where the TAIL begins in `liveRaw`, or -1 when `head` is not its head at all.
+  function trimIndex(liveRaw, headRaw) {
+    const live = normChars(String(liveRaw || ""));
+    const head = normChars(String(headRaw || ""));
+    while (head.length && (head[head.length - 1].c === " "
+                           || TRIM_PUNCT.test(head[head.length - 1].c))) head.pop();
+    if (!head.length || head.length > live.length) return -1;
+    for (let k = 0; k < head.length; k++) if (live[k].c !== head[k].c) return -1;
+    // ...and the same tolerance on the live side of the join: whatever spacing and punctuation followed the sentence
+    // belonged to the sentence, not to the tail.
+    let k = head.length;
+    while (k < live.length && (live[k].c === " " || TRIM_PUNCT.test(live[k].c))) k++;
+    return k < live.length ? live[k].at : String(liveRaw || "").length;
+  }
+
+  /* ---- THE DISPLAY-LANGUAGE RULE (W2) ----
+     "both"  = the translation as the main line, the original underneath.
+     a CODE  = ONE text and one only: the SOURCE when the line was spoken in that language, the TRANSLATION otherwise
+               (which also covers a THIRD language: the translation is then the only text this reader can read).
+     The BADGE keeps naming the language that was SPOKEN, in every mode. */
+  const pair = () => ({ a: normLang(trState.langA) || "en", b: normLang(trState.langB) || "zh" });
+  const showLang = () => (show === "both" ? "both" : (show === "a" ? pair().a : pair().b));
+  // A line replayed from an older record carries no dstLang: reconstruct it exactly as TrPipe.h does -- a
+  // PASSTHROUGH repeats its source, anything else went to the other half of the pair.
+  const dstLangOf = (l) => {
+    if (l.dstLang) return normLang(l.dstLang);
+    if (l.pass)    return normLang(l.lang);
+    const p = pair();
+    return normLang(l.lang) === p.b ? p.a : p.b;
+  };
+  function texts(o) {
+    const x = showLang();
+    const src = String(o.src || ""), dst = String(o.dst || "");
+    if (x === "both") return { main: dst, sub: src, lang: dstLangOf(o) };
+    if (normLang(o.lang) === x) return { main: src, sub: "", lang: normLang(o.lang) };
+    // A LIVE line may have no draft yet: the source in the tentative style beats an empty row.
+    return dst ? { main: dst, sub: "", lang: dstLangOf(o) }
+               : { main: src, sub: "", lang: normLang(o.lang) };
+  }
+  const langTitle = (shownLang) => {
+    const head = "Detected language of what was said";
+    if (showLang() === "both") return head;
+    const n = langName(shownLang);
+    return n ? head + " · showing " + n : head;
+  };
+
+  function appendLine(line) {
+    const kids = el.log.children;
+    let para = kids.length ? kids[kids.length - 1] : null;
+    if (!para || !para.classList.contains("tr-para") || para.dataset.spk !== line.spk.key) {
+      para = document.createElement("div");
+      para.className = "tr-para";
+      para.dataset.spk = line.spk.key;
+      if (line.spk.color) para.style.setProperty("--spk", line.spk.color);
+      el.log.appendChild(para);
+    }
+    const row = document.createElement("div");
+    row.className = "tr-line";
+    if (para.children.length === 0) {
+      const who = document.createElement("span");
+      who.className = "tr-who";
+      const dash = document.createElement("span");
+      dash.className = "tr-dash";
+      dash.textContent = "—";
+      const nm = document.createElement("span");
+      nm.className = "tr-who-name";
+      nm.textContent = line.spk.label || "Speaker";
+      who.appendChild(dash); who.appendChild(nm);
+      row.appendChild(who);
+    }
+    // the MAIN text always goes in .tr-dst -- the coloured line the eye lands on -- whichever of the two it turns
+    // out to be, so switching display language never moves the reading position on the page.
+    const t = texts(line);
+    const dst = document.createElement("span");
+    dst.className = "tr-dst";
+    dst.textContent = t.main;
+    setLang(dst, t.lang);              // the script's own face
+    const meta = document.createElement("span");
+    meta.className = "tr-meta";
+    const lang = document.createElement("span");
+    lang.className = "tr-lang";
+    lang.textContent = langBadge(line.lang);
+    lang.title = langTitle(t.lang);
+    const ms = document.createElement("span");
+    ms.className = "tr-ms";
+    ms.textContent = fmtMs(waitOf(line));
+    ms.title = msTitle(line);
+    meta.appendChild(lang); meta.appendChild(ms);
+    row.appendChild(dst); row.appendChild(meta);
+    // ...and the original under it ONLY in "both" mode.
+    if (t.sub) {
+      const src = document.createElement("span");
+      src.className = "tr-src";
+      src.textContent = t.sub;
+      setLang(src, line.lang);         // the original is in the language that was SPOKEN
+      row.appendChild(src);
+    }
+    para.appendChild(row);
+    rows++;
+    trimRows();
+  }
+
+  /* THE SCROLLBACK'S BOUND (fix round, RVB-2): the DOM holds the same MAX lines `lines` keeps -- counted in ROWS, not in
+     paragraphs: one speaker's lines all join ONE paragraph (a lecture, a film, a strip with no voiceprint), so a cap on
+     paragraphs never bit there (3000 lines = one paragraph of 3000 rows). The oldest rows go from the top; a paragraph
+     emptied goes with them, and the one that now starts the log gets its speaker's name back. A Show / A / B repaint
+     (renderLog, from `lines`) then shows exactly what was there: no sudden cut. */
+  let rows = 0;
+  function trimRows() {
+    while (rows > MAX) {
+      const first = el.log.firstElementChild;
+      if (!first) { rows = 0; return; }
+      if (!first.classList.contains("tr-para")) { first.remove(); continue; }
+      const row = first.firstElementChild;
+      if (!row) { first.remove(); continue; }
+      const who = row.querySelector(".tr-who");
+      row.remove();
+      rows--;
+      const next = first.firstElementChild;
+      if (!next) first.remove();
+      else if (who && !next.querySelector(".tr-who")) next.insertBefore(who, next.firstElementChild);
+    }
+  }
+
+  /* Re-paint the WHOLE log from the retained line objects (a change of display language; the pair moving under
+     "show A" counts as one). The live line is lifted out first and dropped back after -- exactly as a final does. */
+  function renderLog() {
+    const hadLive = !!(live && liveEl && liveEl.root.parentNode);
+    liveLift();
+    el.log.replaceChildren();
+    rows = 0;
+    lines.forEach(appendLine);
+    // A repaint is NOT a partial: it must not type the sentence out again in the other language, and it must not be
+    // folded into the cadence the engine is measured by.
+    if (hadLive) livePaint(live, /*snap=*/true);
+    if (pinned) pin();
+  }
+
+  /* ---- the live line (1.1.0 §7) ----
+     The segment being spoken RIGHT NOW, one line at the foot of the log: the source growing word by word, a draft
+     translation once there is one, and a blinking ellipsis. Neutral on purpose -- no speaker colour, no em-dash, no
+     name. THE NODES ARE BUILT ONCE and only their text is rewritten: replacing the element on every partial restarts
+     the ellipsis animation and flashes the row. A new segId reuses the very same nodes. */
+  const LIVE_ORPHAN_MS = 20000;   // a partial with no final within 20 s is dropped
+  const LIVE_FADE_MS   = 620;     // ...and it leaves on a fade, matching .tr-live's transition
+  let live = null, liveEl = null, liveTimer = null, liveFade = null;
+  // §7b: the PREVIOUS partial of the segment in flight, as ENGINE TRUTH (never display state).
+  let livePrev = { seg: "", src: "", dst: "", lang: "", dstLang: "" };
+
+  /* ---- §7b: the TYPEWRITER (1.1.0) ----
+     A partial lands every ~0.6 s; swapping the whole line on each of them reads as a block jump, so the line is
+     driven the way a live captioner types -- one unit at a time -- while the ENGINE's text is applied in full the
+     instant it arrives. It is the TARGET; the DOM is a cursor chasing it. UNIT = a word in a Latin script, one
+     CHARACTER in a CJK one. A partial arriving mid-typing RETARGETS the queue; a revision drops the stale tail in ONE
+     repaint; a final never waits. ONE timer for both fields.
+     W1: the window is ADAPTIVE -- an EMA of the gap between two partials of the SAME segment, aimed at 0.8x so the
+     tail lands just before the next one. W2: the EMA is not reset per segment, TW_MAX_MS bounds a unit and not a tail,
+     and the window may reach 1.2 s. */
+  const TW_MIN_MS = 30, TW_MAX_MS = 250;       // a unit may be dwelt on, but the line keeps MOVING
+  const TW_SEED_MS = 500,  TW_AHEAD = 0.8;     // the cadence before any measurement exists
+  const TW_WIN_MIN = 150,  TW_WIN_MAX = 1200;  // no strobe at one end, no dead air at the other
+  const TW_EMA_A = 0.5, TW_DT_MIN = 50, TW_DT_MAX = 3000;   // half-life 1 partial; sane samples only
+  // performance.now, never Date.now: monotonic, and the harness injects its own so the timing checks stay exact. No
+  // clock at all = no measurement = the cadence stays at its seed.
+  const twNow = () => {
+    try {
+      if (typeof performance !== "undefined" && performance && typeof performance.now === "function")
+        return performance.now();
+    } catch { /* an exotic host: fall through */ }
+    return NaN;
+  };
+  const TW_CJK = "\\u2e80-\\u303f\\u3040-\\u30ff\\u3400-\\u4dbf\\u4e00-\\u9fff\\uf900-\\ufaff\\uff00-\\uff9f";
+  // A CJK char (with any spacing after it) | a run of anything else (ditto) | leading spacing. Every character
+  // matches one of the three, so join() gives the string back byte for byte.
+  const TW_TOKEN = new RegExp("[" + TW_CJK + "]\\s*|[^\\s" + TW_CJK + "]+\\s*|\\s+", "g");
+  const twSplit = (text) => String(text == null ? "" : text).match(TW_TOKEN) || [];
+  const twJoin  = (units, k) => units.slice(0, k).join("");
+  // Units compared WITHOUT their spacing: a word is the same word whether or not another one has arrived after it.
+  function twCommon(a, b) {
+    const n = Math.min(a.length, b.length);
+    let i = 0;
+    while (i < n && a[i].trim() === b[i].trim()) i++;
+    return i;
+  }
+  // Asked every time, not once at boot: the setting can be turned on mid-session.
+  function twReduced() {
+    try { return !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches); }
+    catch { return false; }
+  }
+  // ema/at/win = the W1 pacing: measured cadence, when the last partial landed, and the window the current one is
+  // typed over. Both fields of a partial share them (they arrive together).
+  const tw = { timer: null, sleep: 0, src: null, dst: null, fields: [],
+               ema: TW_SEED_MS, at: NaN, win: Math.round(TW_AHEAD * TW_SEED_MS) };
+  const twField = (stable, tent) =>
+    ({ stable, tent, units: [], i: 0, step: TW_MAX_MS, wait: 0, stableLen: 0 });
+  const twShown = (f) => twJoin(f.units, f.i);
+  function twPaint(f) {
+    const text = twJoin(f.units, f.i);
+    const cut  = Math.min(f.stableLen, text.length);
+    const head = text.slice(0, cut), tail = text.slice(cut);
+    if (f.stable.textContent !== head) f.stable.textContent = head;
+    if (f.tent.textContent   !== tail) f.tent.textContent   = tail;
+  }
+  function twSet(f, text, stableLen) {
+    const units = twSplit(text);
+    const keep  = twCommon(twSplit(twShown(f)), units);
+    f.units = units;
+    f.stableLen = Math.max(0, Math.min(Number(stableLen) || 0, String(text || "").length));
+    if (twReduced()) { f.i = units.length; f.wait = 0; }   // reduced motion: the instant swap
+    else {
+      f.i = Math.min(keep, units.length);                  // a revised tail goes in ONE repaint
+      const pend = units.length - f.i;
+      if (pend > 0) {
+        // tw.win, not a constant: the tail is spread over the MEASURED cadence (twCadence).
+        f.step = Math.max(TW_MIN_MS, Math.min(TW_MAX_MS, Math.round(tw.win / pend)));
+        if (f.wait <= 0) f.wait = f.step;                  // idle: start. Typing: keep the phase
+      } else f.wait = 0;
+    }
+    twPaint(f);
+  }
+  function twArm() {
+    let next = Infinity;
+    tw.fields.forEach((f) => {
+      if (f.wait > 0 && f.i < f.units.length) next = Math.min(next, f.wait);
+    });
+    if (next === Infinity) return;
+    // Only ever SHORTEN the pending sleep: restarting the countdown on every partial would let a fast stream of
+    // them starve the animation and never reach a single word.
+    if (tw.timer && tw.sleep <= next) return;
+    if (tw.timer) clearTimeout(tw.timer);
+    tw.sleep = next;
+    tw.timer = setTimeout(twTick, next);
+  }
+  function twTick() {
+    const dt = tw.sleep;
+    tw.timer = null;
+    let next = Infinity, moved = false;
+    tw.fields.forEach((f) => {
+      if (f.i >= f.units.length) { f.wait = 0; return; }
+      f.wait -= dt;
+      while (f.wait <= 0 && f.i < f.units.length) { f.i++; f.wait += f.step; moved = true; }
+      twPaint(f);
+      if (f.i < f.units.length) next = Math.min(next, Math.max(1, f.wait));
+      else f.wait = 0;
+    });
+    if (next < Infinity) { tw.sleep = next; tw.timer = setTimeout(twTick, next); }
+    // Same rule as a partial: growth is not new content, so it never raises the pill -- but while the log IS
+    // pinned it keeps the view at the foot.
+    if (moved && pinned) pin();
+  }
+  // ⚠️ WHAT IS **NOT** RESET HERE: the cadence (ema/win). THE CADENCE IS A PROPERTY OF THE ENGINE, NOT OF THE
+  // SENTENCE -- how fast this machine drafts does not change because a speaker finished a phrase. Only `at` goes:
+  // "nothing to measure this gap against" is the one thing a segment boundary genuinely says.
+  function twStop() {
+    if (tw.timer) { clearTimeout(tw.timer); tw.timer = null; }
+    tw.sleep = 0;
+    tw.at = NaN;
+    tw.fields.forEach((f) => { f.units = []; f.i = 0; f.wait = 0; f.stableLen = 0; twPaint(f); });
+  }
+  // ...and the one place the measurement itself is thrown away: the reader's Clear ("forget this session").
+  function twForget() {
+    tw.ema = TW_SEED_MS; tw.at = NaN; tw.win = Math.round(TW_AHEAD * TW_SEED_MS);
+  }
+  // A repaint that is NOT a partial (a display-language switch): the text lands whole.
+  function twSnap(f, text, stableLen) {
+    f.units = twSplit(text);
+    f.i = f.units.length;
+    f.wait = 0;
+    f.stableLen = Math.max(0, Math.min(Number(stableLen) || 0, String(text || "").length));
+    twPaint(f);
+  }
+  // One partial landed: fold the gap since the previous one of the SAME segment into the EMA and recompute the
+  // window. A NaN `at` means "nothing to measure against" -- the first one.
+  function twCadence() {
+    const now = twNow();
+    if (Number.isFinite(now) && Number.isFinite(tw.at)) {
+      const dt = now - tw.at;
+      if (dt >= TW_DT_MIN && dt <= TW_DT_MAX) tw.ema += TW_EMA_A * (dt - tw.ema);
+    }
+    tw.at  = now;
+    tw.win = Math.max(TW_WIN_MIN, Math.min(TW_WIN_MAX, Math.round(TW_AHEAD * tw.ema)));
+  }
+
+  // `snap` = repaint this live line as it stands (twSnap): no cadence measurement, no typing. Everything else -- the
+  // segment, the badge, the stable prefix -- is computed exactly as for a real partial, because it IS the same line.
+  function livePaint(l, snap) {
+    if (!l) return null;
+    if (!liveEl) {
+      const root = document.createElement("div");
+      root.className = "tr-live";
+      const dst = document.createElement("span");
+      dst.className = "tr-live-dst";
+      const dots = document.createElement("span");
+      dots.className = "tr-live-dots";
+      dots.textContent = "…";
+      const meta = document.createElement("span");
+      meta.className = "tr-live-meta";
+      const lang = document.createElement("span");
+      lang.className = "tr-lang tr-live-lang";
+      meta.appendChild(lang);
+      const src = document.createElement("span");
+      src.className = "tr-live-src";
+      // Each text is TWO spans, built once with everything else: the settled head and the tentative remainder.
+      const mkTw = (parent) => {
+        const stable = document.createElement("span");
+        stable.className = "tr-live-stable";
+        const tent = document.createElement("span");
+        tent.className = "tr-live-tentative";
+        parent.appendChild(stable); parent.appendChild(tent);
+        return twField(stable, tent);
+      };
+      // Reading order matches a finished line: translation first, then the badge, then the original underneath --
+      // so the eye does not have to move when the final replaces it.
+      root.appendChild(dst); root.appendChild(dots); root.appendChild(meta); root.appendChild(src);
+      tw.dst = mkTw(dst);
+      tw.src = mkTw(src);
+      tw.fields = [tw.src, tw.dst];
+      liveEl = { root, dst, dots, meta, lang, src };
+    }
+    const n = liveEl;
+    n.root.classList.remove("is-fading");
+    // Write only what CHANGED: an unchanged text node is left alone, so the browser has no reason to re-layout.
+    if (n.root.dataset.seg !== l.segId) n.root.dataset.seg = l.segId;
+    // §7b stable prefix, on ENGINE TRUTH rather than display state. A new segment agrees with nothing, so its first
+    // partial is tentative from end to end.
+    const same = livePrev.seg === l.segId;
+    // W2: the SAME display rule as a finished line, applied to the draft -- so the live line and the paragraph that
+    // replaces it are laid out identically.
+    const now = texts(l), was = texts(livePrev);
+    const mainU = twSplit(now.main), subU = twSplit(now.sub);
+    const mainStable = same ? twJoin(mainU, twCommon(twSplit(was.main), mainU)).length : 0;
+    const subStable  = same ? twJoin(subU,  twCommon(twSplit(was.sub),  subU)).length  : 0;
+    // A DIFFERENT segment is a different sentence: start from nothing.
+    if (!same) twStop();
+    if (!snap)
+      twCadence();   // W1: AFTER the reset (it clears `at`), BEFORE the retarget (it reads the window just computed)
+    livePrev = { seg: l.segId, src: l.src, dst: l.dst, lang: l.lang, dstLang: l.dstLang };
+    if (snap) { twSnap(tw.dst, now.main, mainStable); twSnap(tw.src, now.sub, subStable); }
+    else {
+      twSet(tw.dst, now.main, mainStable);
+      twSet(tw.src, now.sub, subStable);
+      twArm();
+    }
+    const badge = langBadge(l.lang);
+    if (n.lang.textContent !== badge) n.lang.textContent = badge;
+    n.lang.title = langTitle(now.lang);
+    // The main field is hidden until there IS something to put in it, the second one whenever the reader asked for
+    // a single language. Both read the ENGINE's text, not the typed one: the box must not flicker in for one word.
+    n.dst.hidden = !now.main;
+    n.src.hidden = !now.sub;
+    n.lang.hidden = !l.lang;
+    setLang(n.dst, now.lang);
+    setLang(n.src, l.lang);
+    if (n.root.parentNode !== el.log) el.log.appendChild(n.root);   // always the LAST child
+    return n.root;
+  }
+
+  // The live line must never sit BETWEEN two paragraphs: appendLine decides a speaker merge by looking at the log's
+  // last child. Lift it out, append the paragraph, put it back at the foot.
+  function liveLift() {
+    if (!liveEl || !liveEl.root.parentNode) return null;
+    const host = liveEl.root.parentNode;
+    liveEl.root.remove();
+    return host;
+  }
+  function liveDrop(host) { if (host && liveEl && live) host.appendChild(liveEl.root); }
+
+  /* W3 -- the live line loses what the paragraph just gained (a closes:false line of the segment in flight). NO
+     TYPING: the engine's tail PART is milliseconds behind and carries EXACTLY this text, so snapping here makes that
+     PART a no-op. The draft translation goes WITH the head; an empty tail is NOT a reason to clear the line. */
+  function liveTrimHead(line) {
+    const cut = trimIndex(live.src, line.src);
+    if (cut < 0) return;      // not our text: leave it alone, the tail PART replaces it whole
+    live = { ...live, src: String(live.src || "").slice(cut), dst: "", dstLang: "" };
+    livePaint(live, /*snap=*/true);
+  }
+
+  /* W3 -- translatorEnd: "that utterance produced nothing more". It APPENDS NOTHING, and it touches nothing but the
+     segment it names -- a later utterance may already be streaming. */
+  function applyEnd(msg) {
+    const segId = segIdOf(msg && msg.segId);
+    if (!segId || !live || live.segId !== segId) return;
+    liveClear();
+    // The log just got SHORTER: not new content, so the resume pill stays where it is.
+    if (pinned) pin();
+  }
+
+  function liveClear() {
+    live = null;
+    livePrev = { seg: "", src: "", dst: "", lang: "", dstLang: "" };
+    twStop();                                   // ...and the final never waits for the typewriter
+    if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
+    if (liveFade)  { clearTimeout(liveFade);  liveFade  = null; }
+    if (liveEl) { liveEl.root.classList.remove("is-fading"); liveEl.root.remove(); }
+  }
+
+  // The watchdog, restarted on every partial: a segment the engine abandoned must not leave half a sentence on
+  // screen for the rest of the meeting. It fades rather than vanishing.
+  function liveArm() {
+    if (liveTimer) clearTimeout(liveTimer);
+    if (liveFade)  { clearTimeout(liveFade); liveFade = null; }
+    liveTimer = setTimeout(() => {
+      liveTimer = null;
+      if (!live || !liveEl) return;
+      liveEl.root.classList.add("is-fading");
+      liveFade = setTimeout(() => {
+        liveFade = null;
+        liveClear();
+        if (pinned) pin();
+      }, LIVE_FADE_MS);
+    }, LIVE_ORPHAN_MS);
+  }
+
+  /* A partial: replace-in-place by segId, never appended, never remembered (the app never replays one). SILENT for
+     the resume pill: it is the same sentence being refined -- only a FINAL counts as something new to have missed. */
+  function applyPartial(msg) {
+    const segId = segIdOf(msg && msg.segId);
+    if (!segId) return;            // no identity, no replace-in-place: refuse rather than append
+    live = { segId, t: msg.t, lang: String(msg.lang || ""),
+             src: String(msg.src || ""), dst: String(msg.dst || ""),
+             // omitted when there is no draft at all -- an empty dst has no language
+             dstLang: String(msg.dstLang || "") };
+    livePaint(live);
+    liveArm();
+    if (pinned) pin();
+  }
+
+  function atBottom() {
+    const sh = el.log.scrollHeight || 0, ch = el.log.clientHeight || 0;
+    if (!sh || !ch) return true;
+    return sh - (el.log.scrollTop || 0) - ch < 40;
+  }
+  function pin() { try { el.log.scrollTop = el.log.scrollHeight || 0; } catch { /* no layout */ } }
+  function refreshResume() { el.resume.hidden = pinned; }
+
+  function clearLog() {
+    lines.length = 0; seen.clear();
+    liveClear();                    // ...the sentence in flight goes with the rest
+    twForget();                     // ...and so does what this session had measured of the cadence
+    el.log.replaceChildren();
+    rows = 0;
+    pinned = true; refreshResume();
+  }
+
+  // The palette, as hexes (the :root --spk-1..6 above). spk.color may be the hex itself or a 0-based INDEX into it
+  // (the app sends the index): resolving both keeps the six values defined in one place.
+  const SPEAKER_COLORS = ["#c97c64", "#81972b", "#309da9", "#5e5ad3", "#944baf", "#bf367f"];
+  const colorOf = (c) => {
+    if (typeof c === "number" && isFinite(c))
+      return SPEAKER_COLORS[((c % SPEAKER_COLORS.length) + SPEAKER_COLORS.length) % SPEAKER_COLORS.length];
+    const s = String(c == null ? "" : c).trim();
+    if (/^#[0-9a-fA-F]{3,8}$/.test(s)) return s;
+    if (/^\d+$/.test(s)) return SPEAKER_COLORS[Number(s) % SPEAKER_COLORS.length];
+    return "";
+  };
+
+  /* ---- THE ENGINE'S STATE, as the app last said it ----
+     mode/langA/langB = the LIVE pair (the app sends the live pair to this page: one pair per mode), defaulted to the
+     two languages this feature was built for, so the bar never reads "· → ·". presetReq = what the user ASKED for
+     ("" = never chose), preset = what the engine resolved it to. sessionLines = how many finished lines the SESSION
+     FILE holds (what an export would contain), not how many are on screen. */
+  let trState = { running: false, status: "", preset: "", presetReq: "", asr: "", mt: "", gpu: false,
+                  err: "", mode: "auto", langA: "en", langB: "zh", sessionLines: 0, spkOn: false, speakers: 0 };
+  const nowMs = twNow;
+
+  /* ---- the acknowledgement: the export's answer, and the app's warnings ----
+     The status line is borrowed for a few seconds rather than given a banner of its own: a second strip appearing
+     would move the dialogue. `ack` outranks the status while it lasts, and the timer is single. */
+  let ack = null, ackTimer = null;
+  function showAck(text, isError, ms) {
+    ack = { text, isError };
+    if (ackTimer) clearTimeout(ackTimer);
+    ackTimer = setTimeout(() => { ack = null; ackTimer = null; paintState(); }, ms);
+    wake();          // an ack the idle fade had already hidden would be an ack nobody saw
+    paintState();
+  }
+
+  /* RV4-4 (the player's review, 23/10): an engine that is NOT running -- its first start, a death and its restart, a
+     spawn that keeps failing -- reads "starting…" while a start is plausible, then "engine not running" (red) once
+     it has been down ENGINE_DOWN_MS. "loading models…" is said only of an engine that IS running. */
+  const ENGINE_DOWN_MS = 15000;
+  let engineDownSince = 0, engineDownTimer = null;
+  function noteEngineRunning(running) {
+    if (running) {
+      engineDownSince = 0;
+      if (engineDownTimer) { clearTimeout(engineDownTimer); engineDownTimer = null; }
+    } else if (!engineDownSince) {
+      engineDownSince = nowMs() || 1;
+      engineDownTimer = setTimeout(() => { engineDownTimer = null; paintState(); }, ENGINE_DOWN_MS + 50);
+    }
+  }
+  // RV4-2: `models` as the app sends it -- an OBJECT {asr, mt} -- or a string (an older sender, the mock).
+  const shortModel = (m) => cleanName(String(m || "").replace(/^ggml-/i, "").replace(/\.(bin|gguf)$/i, "")
+    .replace(/-Instruct.*$/i, ""), 60);
+  const asrLabel = (m) => cleanName(String(m || "").split(/\s*→\s*/).map(shortModel).filter(Boolean).join(" → "), 80);
+
+  /* THE STATE LINE: what the engine is doing, then what it runs on -- "listening · small → turbo · Qwen3-4B · GPU ·
+     2 inputs · 3 voices". "listening" is said ONLY while the app says the live path runs (the engine's own word
+     also covers its idle state, and a window that said "listening" with every microphone closed would be lying). */
+  const plural = (n, one, many) => n + " " + (n === 1 ? one : many);
+  function stateText() {
+    const s = trState.status;
+    if (s === "error") return { text: trState.err ? "error — " + cleanNotice(trState.err) : "error", cls: "error" };
+    if (s === "off") return { text: "engine off", cls: "" };
+    if (!trState.running) {
+      const gone = engineDownSince > 0 && nowMs() - engineDownSince >= ENGINE_DOWN_MS;
+      return gone ? { text: "engine not running", cls: "error" } : { text: "starting…", cls: "loading" };
+    }
+    if (s === "loading") return { text: "loading models…", cls: "loading" };
+    // THE DRAIN (the ADDENDUM FIX ROUND): Listen is off -- the microphones are closed -- but the engine is still turning
+    // what it heard into lines (live.on stays true until it is done): they keep coming, and the window says why.
+    if (onAir && !wanted) return { text: "Finishing the last sentences…", cls: "loading" };
+    // R4: asked, not confirmed yet -- unless the engine said why it will not (RVB-5: a refusal is never "starting" for ever)
+    if (!onAir && wanted) return trState.err ? { text: "could not listen — " + cleanNotice(trState.err), cls: "error" }
+                                             : { text: "starting to listen…", cls: "loading" };
+    const head = onAir ? (s === "transcribing" ? "transcribing…" : "listening")
+                       : (s === "analyzing" ? "analysing a film" : "not listening");
+    const parts = [head];
+    if (trState.asr) parts.push(trState.asr);
+    if (trState.mt) parts.push(trState.mt);
+    if (trState.asr || trState.mt) parts.push(trState.gpu ? "GPU" : "CPU");
+    if (onAir) parts.push(plural(strips.length, "input", "inputs"));
+    if (onAir && trState.spkOn && trState.speakers > 0) parts.push(plural(trState.speakers, "voice", "voices"));
+    return { text: parts.join(" · "), cls: onAir ? (s === "transcribing" ? "transcribing" : "listening") : "" };
+  }
+  function paintState() {
+    const st = ack ? { text: ack.text, cls: ack.isError ? "error" : "" } : stateText();
+    if (el.state.textContent !== st.text) el.state.textContent = st.text;
+    ["is-loading", "is-listening", "is-transcribing", "is-error"].forEach((c) => el.state.classList.remove(c));
+    if (st.cls) el.state.classList.add("is-" + st.cls);
+    // the whole sentence as the tooltip too (a narrow window cuts it short)
+    el.state.title = st.text;
+  }
+
+  // The tooltip says what the button would ACTUALLY save, so a reader can tell "nothing yet" from "the whole meeting".
+  function paintExport() {
+    const n = Number(trState.sessionLines) || 0;
+    el.exportBtn.title = "Save the whole session as a Word document (.docx)"
+      + (n > 0 ? " — " + n + (n === 1 ? " line" : " lines") : " — nothing recorded yet");
+  }
+
+  /* =========================================================================================================
+     THE SOURCE PLATE -- the strips, the picker, Listen, the meters.
+     The APP is the authority on the strips (it validates them like the engine does, keeps them in app.txt, and
+     sends them back as translatorState.live.inputs): this page edits OPTIMISTICALLY, sends liveConfig with the whole
+     set, and the echo WINS -- except over the control under the user's hand (a name being typed, a trim being
+     dragged), and except for a short PENDING window after each edit: an echo the app had already posted before it
+     read ours would otherwise put the old set back for a moment (a just-added strip blinking out and in).
+     ========================================================================================================= */
+  const MAX_STRIPS = 4;         // TrPipe.h kMaxLiveInputs
+  const MAX_CHAN = 8;           // TrPipe.h kLiveMaxChan (0 = the mix)
+  const GAIN_MIN = -24, GAIN_MAX = 24, GAIN_STEP = 0.5;   // TrPipe.h kLiveGainMinDb / kLiveGainMaxDb
+  const PENDING_MS = 1500;      // how long an edit may wait for its echo before the app's word stands
+  const LISTEN_PENDING_MS = 6000;
+  const TRIM_SEND_MS = 200;     // a trim being dragged reaches the app at most this often (the meter answers it)
+  const KINDS = { in: "Input", out: "Sound of an output", app: "Application", wav: "Test file" };
+  const KIND_TAG = { in: "In", out: "Out", app: "App", wav: "Wav" };
+  // A key's kind -- and no key at all when it holds a '|' (fix round, the ADDENDUM's RVA-10): '|' is the LANE separator
+  // ("<key>|<chan>", TrPipe.h liveLaneId), so "in:X|1" next to "in:X" channel 1 would name two strips alike. Refused
+  // here as by the app and the engine: such a source is never listed, never a strip, never sent.
+  const kindOf = (key) => { const s = String(key || ""); const m = /^(in|out|app|wav):./.exec(s); return m && s.indexOf("|") < 0 ? m[1] : ""; };
+  const clampGain = (g) => {
+    const v = Math.round((Number(g) || 0) * 10) / 10;
+    return Math.max(GAIN_MIN, Math.min(GAIN_MAX, v)) || 0;     // (|| 0: never a -0 on the wire)
+  };
+  const fmtGain = (g) => { const v = clampGain(g); return (v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v).toFixed(1) + " dB"; };
+
+  let onAir = false;            // the engine listens: translatorState.live.on, the ECHO -- nothing else lights it
+  let wanted = false;           // the app WANTS it to (translatorState.live.wanted; absent = as `on`): on !== wanted =
+                                // starting or stopping -- the Listen dot blinks, and a second press cancels
+  let strips = [];              // [{uid, key, lane?, label, chan, gainDb, state, why}] -- in the app's order
+  let uidSeq = 0;
+  let pending = null;           // {sent:[wire inputs], until} -- the last liveConfig, until its echo lands
+  let pendingTimer = null;      // ends the pending window ON TIME (the app answers a refused edit ONCE: R4)
+  let heldLive = null;          // the last translatorState.live that arrived inside the pending window
+  let listenPending = null;     // {on, until} -- Listen pressed, until the echo says so
+  let listenTimer = null;
+  let sources = null;           // the engine's list {gen, list:[...]} -- the latest that arrived
+  let trimLive = null;          // {uid, v} -- a trim being moved (input events), not yet committed
+  let trimTimer = null;
+  let dragUid = 0;              // the strip whose trim the pointer holds
+
+  /* What a strip's source IS (its name, its channel count) is known from the engine's list -- which this page only
+     asks for when the picker opens. So the last-known name and channel count of each strip's source are kept in
+     the profile (a convenience of this window's, never authority): after a restart the strips still show
+     "Line (Studio Interface)" and offer its six channels, before anyone has opened the picker. */
+  const KEY_SRC = "suvtitle.live.sources";
+  const SRC_CACHE_MAX = 12;
+  const srcInfo = new Map();    // key -> {label, ch}
+  try {
+    const o = JSON.parse(read(KEY_SRC, "{}"));
+    if (o && typeof o === "object")
+      Object.keys(o).slice(0, SRC_CACHE_MAX).forEach((k) => {
+        const v = o[k];
+        if (kindOf(k) && Array.isArray(v)) srcInfo.set(k, { label: cleanName(v[0], 120), ch: Math.max(0, Math.min(64, parseInt(v[1], 10) || 0)) });
+      });
+  } catch { /* a damaged value: nothing known */ }
+  function rememberSource(src) {
+    if (!src || !kindOf(src.key)) return;
+    const was = srcInfo.get(src.key);
+    if (was && was.label === src.label && was.ch === src.ch) return;
+    srcInfo.delete(src.key);
+    srcInfo.set(src.key, { label: src.label, ch: src.ch });
+    // bounded: the strips' sources first, then the most recent
+    while (srcInfo.size > SRC_CACHE_MAX) {
+      const drop = [...srcInfo.keys()].find((k) => !strips.some((s) => s.key === k));
+      srcInfo.delete(drop !== undefined ? drop : srcInfo.keys().next().value);
+    }
+    const o = {};
+    srcInfo.forEach((v, k) => { o[k] = [v.label, v.ch]; });
+    write(KEY_SRC, JSON.stringify(o));
+  }
+  const sourceOf = (key) => (sources ? sources.list.find((x) => x.key === key) : null) || null;
+  function sourceName(key) {
+    const cur = sourceOf(key), known = srcInfo.get(key);
+    const n = (cur && cur.label) || (known && known.label);
+    if (n) return n;
+    const k = kindOf(key);
+    if (k === "app" || k === "wav") return cleanName(String(key).slice(k.length + 1).split(/[\\/]/).pop(), 120);
+    return KINDS[k] || "Source";
+  }
+  function channelsOf(key) {
+    const cur = sourceOf(key), known = srcInfo.get(key);
+    const ch = (cur && cur.ch > 0) ? cur.ch : (known && known.ch > 0 ? known.ch : 0);
+    return Math.min(MAX_CHAN, ch);
+  }
+
+  // THE RULE (TrPipe.h unpackLive): one key twice only with two different channels >= 1 -- never twice on one
+  // channel, never a channel next to its own mix.
+  const clash = (list, key, chan, exceptUid) =>
+    list.some((s) => s.uid !== exceptUid && s.key === key && (s.chan === chan || s.chan === 0 || chan === 0));
+  const wireOf = (s) => ({ key: s.key, label: s.label, chan: s.chan, gainDb: clampGain(s.gainDb) });
+  const sameWire = (a, b) => a.length === b.length && a.every((x, i) => x.key === b[i].key && x.chan === b[i].chan
+    && x.label === b[i].label && Math.abs(x.gainDb - b[i].gainDb) < 0.05);
+
+  // A STRIP'S NAME ON THE WIRE (TrPipe.h LANES, R1) -- what its meter (liveLevels) and its speaker (spk.slot) go by: the
+  // app's echo says it (live.inputs[].lane); a strip the echo has not named yet (just added, its channel just changed) is
+  // named by the same rule, BUILT from {key, chan} and never parsed back: the key for a mix strip, "<key>|<chan>" for a
+  // one-channel strip. Never the key alone for a channel: "canal 1 = moi, canal 2 = l'invité" are two strips.
+  const laneRule = (key, chan) => (chan ? key + "|" + chan : key);
+  const laneOf = (s) => s.lane || laneRule(s.key, s.chan);
+
+  // One input of the echo, read defensively (the app validated it; a page must still not paint garbage).
+  function inputOf(x) {
+    if (!x || typeof x !== "object" || !kindOf(x.key)) return null;
+    const chan = Math.round(Number(x.chan) || 0);
+    const lane = typeof x.lane === "string" && x.lane.length <= 600 ? x.lane : "";   // a key <= 512 bytes + "|8"
+    return { key: String(x.key), lane, label: cleanLabel(x.label), chan: chan >= 0 && chan <= MAX_CHAN ? chan : 0,
+             gainDb: clampGain(x.gainDb), state: String(x.state || "").toLowerCase(), why: cleanNotice(x.why) };
+  }
+
+  // THE EDIT: the new set, painted at once, sent WHOLE (0..4 strips), pending until its echo.
+  function commitStrips(next) {
+    strips = next;
+    const inputs = strips.map(wireOf);
+    pending = { sent: inputs, until: nowMs() + PENDING_MS };
+    if (pendingTimer) clearTimeout(pendingTimer);
+    pendingTimer = setTimeout(pendingOver, PENDING_MS);
+    paintStrips();
+    paintPicker();
+    paintState();
+    send({ type: "liveConfig", inputs });
+  }
+
+  // The pending window is over: the app's last word held meanwhile stands now -- a REFUSED edit (R4: a warn, and the
+  // previous strips re-sent ONCE) goes back to what the app keeps, with no further message needed.
+  function pendingOver() {
+    pendingTimer = null;
+    const lv = heldLive;
+    heldLive = null;
+    // its strips, with what is true NOW of listening (a later state may have moved `on` without listing the strips)
+    if (pending && lv) applyLive(Object.assign({}, lv, { on: onAir, wanted }));
+  }
+
+  // THE ECHO: translatorState.live.
+  function applyLive(lv) {
+    const was = onAir, wasWanted = wanted;
+    onAir = lv.on === true;
+    wanted = typeof lv.wanted === "boolean" ? lv.wanted : onAir;
+    if (listenPending && listenPending.on === onAir) endListenPending();
+    // no `inputs` at all = not reported (the strips stand); an EMPTY list = no strip
+    const echo = Array.isArray(lv.inputs) ? lv.inputs.map(inputOf).filter(Boolean).slice(0, MAX_STRIPS) : null;
+    if (pending && echo) {
+      if (sameWire(echo.map(wireOf), pending.sent)) pending = null;   // our edit landed
+      else if (!(nowMs() < pending.until)) pending = null;            // waited long enough: the app's word stands
+    }
+    if (!echo) {
+      /* the strips as they are */
+    } else if (pending) {
+      // our set stands a moment longer; only what the ENGINE says of each input travels (state, why)
+      strips.forEach((s) => {
+        const e = echo.find((x) => x.key === s.key && x.chan === s.chan) || echo.find((x) => x.key === s.key);
+        if (e) { s.state = e.state; s.why = e.why; }
+      });
+    } else {
+      // the echo wins; each strip keeps its page identity (same key + channel first, then the same key), so a strip
+      // whose channel just changed is still the element that has the focus
+      const used = new Set();
+      const pick = (f) => { const s = strips.find((x) => !used.has(x.uid) && f(x)); if (s) used.add(s.uid); return s; };
+      strips = echo.map((e) => {
+        const s = pick((x) => x.key === e.key && x.chan === e.chan) || pick((x) => x.key === e.key);
+        return Object.assign({ uid: s ? s.uid : ++uidSeq }, e);
+      });
+    }
+    if (!pending) heldLive = null;       // still pending: the app's last LIST stands when the window ends (pendingOver)
+    else if (echo) heldLive = lv;
+    if (!onAir || !wanted) metersOff();  // (the drain: the microphones are closed -- no meter says they still hear)
+    paintStrips();
+    paintPicker();
+    // listening starts: the idle fade may begin; it stops -- or starts FINISHING -- the deck comes back
+    if (onAir !== was || wanted !== wasWanted) wake();
+  }
+
+  /* ---- the strips, painted. One element per strip, keyed by the page's uid and updated in place (a rebuild would
+     take the focus from a name being typed and restart every transition). ---- */
+  const stripEls = new Map();
+  const stripOf = (uid) => strips.find((s) => s.uid === uid) || null;
+  const mk = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text;
+    return n;
+  };
+  function buildStrip(uid) {
+    const root = mk("div", "strip");
+    root.setAttribute("role", "group");
+    const lamp = mk("span", "strip-lamp");
+    lamp.setAttribute("aria-hidden", "true");
+    const name = mk("input", "strip-name");
+    name.type = "text";
+    name.setAttribute("type", "text");
+    name.setAttribute("spellcheck", "false");
+    name.setAttribute("autocomplete", "off");
+    name.setAttribute("placeholder", "Speaker name");
+    name.setAttribute("aria-label", "Speaker name");
+    const x = mk("button", "strip-x", "×");
+    x.type = "button";
+    x.setAttribute("type", "button");
+    const src = mk("div", "strip-src");
+    const kind = mk("span", "strip-kind");
+    const srcName = mk("span", "strip-src-name");
+    src.appendChild(kind); src.appendChild(srcName);
+    const why = mk("div", "strip-why");
+    why.hidden = true;
+    const ch = mk("select", "strip-ch");
+    ch.setAttribute("aria-label", "Channel");
+    const trim = mk("input", "strip-trim");
+    trim.type = "range";
+    trim.setAttribute("type", "range");
+    trim.setAttribute("min", String(GAIN_MIN)); trim.setAttribute("max", String(GAIN_MAX));
+    trim.setAttribute("step", String(GAIN_STEP));
+    trim.setAttribute("aria-label", "Trim");
+    trim.title = "Trim (double-click: 0 dB)";
+    const db = mk("span", "strip-db");
+    const meter = mk("div", "meter");
+    meter.setAttribute("aria-hidden", "true");
+    const fill = mk("span", "meter-fill"), peak = mk("span", "meter-peak");
+    meter.appendChild(fill); meter.appendChild(peak);
+    const head = mk("div", "strip-head"), ctl = mk("div", "strip-ctl");
+    [lamp, name, x].forEach((c) => head.appendChild(c));
+    [ch, trim, db].forEach((c) => ctl.appendChild(c));
+    [head, src, why, ctl, meter].forEach((c) => root.appendChild(c));
+    const n = { root, lamp, name, x, src, kind, srcName, why, ch, trim, db, meter, chSig: "" };
+
+    // the speaker's name: Enter keeps it, Esc gives the old one back, leaving the field keeps it
+    name.addEventListener("input", () => {
+      if (utf8Len(name.value) > LABEL_MAX) name.value = fitBytes(name.value, LABEL_MAX);
+    });
+    name.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); commitName(uid); name.blur(); }
+      else if (e.key === "Escape") { e.preventDefault(); const s = stripOf(uid); name.value = s ? s.label : ""; name.blur(); }
+    });
+    name.addEventListener("blur", () => commitName(uid));
+    ch.addEventListener("change", () => setChannel(uid, parseInt(ch.value, 10)));
+    trim.addEventListener("pointerdown", () => { dragUid = uid; });
+    trim.addEventListener("input", () => trimInput(uid, trim.value));
+    trim.addEventListener("change", () => trimCommit(uid, trim.value));
+    trim.addEventListener("dblclick", () => trimCommit(uid, 0));
+    x.addEventListener("click", () => removeStrip(uid));
+    return n;
+  }
+  function commitName(uid) {
+    const s = stripOf(uid), n = stripEls.get(uid);
+    if (!s || !n) return;
+    const v = cleanLabel(n.name.value) || defaultLabel(sourceName(s.key), s.chan);
+    if (n.name.value !== v && document.activeElement !== n.name) n.name.value = v;
+    if (v === s.label) return;
+    commitStrips(strips.map((x) => (x.uid === uid ? Object.assign({}, x, { label: v }) : x)));
+  }
+  // Is this name still the one the page would have given (so it may follow the channel)? Against the source's
+  // known name when there is one; else by its " · ch N" ending alone.
+  function isDefaultName(s) {
+    const known = sourceOf(s.key) || srcInfo.get(s.key);
+    if (known && known.label) return s.label === defaultLabel(known.label, s.chan);
+    return s.chan > 0 && s.label.endsWith(" · ch " + s.chan);
+  }
+  function setChannel(uid, chan) {
+    const s = stripOf(uid);
+    if (!s || !(chan >= 0 && chan <= MAX_CHAN) || chan === s.chan) { paintStrips(); return; }
+    if (clash(strips, s.key, chan, uid)) { paintStrips(); return; }      // (the select never offers one)
+    let label = s.label;
+    if (isDefaultName(s)) {
+      const known = sourceOf(s.key) || srcInfo.get(s.key);
+      label = known && known.label ? defaultLabel(known.label, chan)
+            : chan > 0 ? s.label.replace(/ · ch \d+$/, "") + " · ch " + chan : s.label.replace(/ · ch \d+$/, "");
+    }
+    // (lane: "" -- the echo's name was the OLD channel's; laneOf builds the new one until the next echo says it)
+    commitStrips(strips.map((x) => (x.uid === uid ? Object.assign({}, x, { chan, label, lane: "" }) : x)));
+  }
+  // The trim: shown at once, sent at most every TRIM_SEND_MS while it moves, sent exactly when it is let go.
+  function trimInput(uid, raw) {
+    if (!stripOf(uid)) return;
+    trimLive = { uid, v: clampGain(raw) };
+    const n = stripEls.get(uid);
+    if (n) n.db.textContent = fmtGain(trimLive.v);
+    if (!trimTimer) trimTimer = setTimeout(() => {
+      trimTimer = null;
+      if (trimLive) sendTrim(trimLive.uid, trimLive.v, /*final=*/false);
+    }, TRIM_SEND_MS);
+  }
+  function trimCommit(uid, raw) {
+    if (trimTimer) { clearTimeout(trimTimer); trimTimer = null; }
+    dragUid = 0;
+    sendTrim(uid, clampGain(raw), /*final=*/true);
+  }
+  function sendTrim(uid, v, final) {
+    if (final) trimLive = null;
+    const s = stripOf(uid);
+    if (!s) return;
+    if (Math.abs(s.gainDb - v) < 0.05) { paintStrips(); return; }
+    commitStrips(strips.map((x) => (x.uid === uid ? Object.assign({}, x, { gainDb: v }) : x)));
+  }
+  function removeStrip(uid) {
+    if (!stripOf(uid)) return;
+    if (trimLive && trimLive.uid === uid) trimLive = null;
+    commitStrips(strips.filter((x) => x.uid !== uid));
+    // the keyboard lands on the empty slot (the element it was on is gone)
+    if (!el.addSource.disabled) el.addSource.focus();
+  }
+  function addStrip(key, chan) {
+    const src = sourceOf(key);
+    if (!src || src.state !== "ok" || strips.length >= MAX_STRIPS) return;
+    if (!(chan >= 0 && chan <= MAX_CHAN) || clash(strips, key, chan, 0)) return;
+    rememberSource(src);
+    const s = { uid: ++uidSeq, key, label: defaultLabel(src.label, chan), chan, gainDb: 0, state: "", why: "" };
+    commitStrips(strips.concat([s]));
+    closePicker(/*refocus=*/false);
+    // ...and straight into its scribble strip: the next thing to do is to name the speaker
+    const n = stripEls.get(s.uid);
+    if (n) { n.name.focus(); if (typeof n.name.select === "function") n.name.select(); }
+  }
+
+  // An input's state, as the engine says it (INPUT, carried by the app on each strip). "open" lights green only
+  // while listening; a failure stays red after a stop, with its reason, until the next start says otherwise.
+  const INPUT_WHY = { absent: "Not connected", busy: "In use by another program",
+                      denied: "Blocked by Windows' privacy settings", unsupported: "Not supported on this Windows",
+                      stalled: "No sound arriving", error: "Could not be opened" };
+  const BAD_STATES = new Set(["busy", "denied", "unsupported", "error"]);
+  function lampOf(s) {
+    if (BAD_STATES.has(s.state)) return "is-bad";
+    if (!onAir) return "";
+    if (s.state === "open") return "is-open";
+    if (s.state === "stalled") return "is-warn";
+    if (s.state === "absent") return "is-absent";
+    return "";
+  }
+  function whyOf(s) {
+    if (s.state === "open" || !s.state) return "";
+    if (!onAir && !BAD_STATES.has(s.state)) return "";
+    return s.why || INPUT_WHY[s.state] || "";
+  }
+  function paintStrips() {
+    const keep = new Set(strips.map((s) => s.uid));
+    stripEls.forEach((n, uid) => {
+      if (keep.has(uid)) return;
+      n.root.remove(); stripEls.delete(uid); meters.delete(uid);
+    });
+    strips.forEach((s, i) => {
+      let n = stripEls.get(s.uid);
+      if (!n) { n = buildStrip(s.uid); stripEls.set(s.uid, n); }
+      if (el.strips.children[i] !== n.root) el.strips.insertBefore(n.root, el.strips.children[i] || null);
+      fillStrip(n, s);
+    });
+    const full = strips.length >= MAX_STRIPS;
+    el.addSource.disabled = full;
+    el.addSource.title = full ? "Up to " + MAX_STRIPS + " sources at once — remove one to add another"
+                              : "Add an input, the sound of an output or an application";
+    document.body.classList.toggle("no-strips", strips.length === 0);
+    paintListen();
+    fitDeck();
+  }
+  function fillStrip(n, s) {
+    const label = s.label || defaultLabel(sourceName(s.key), s.chan);
+    n.root.dataset.key = s.key;
+    n.root.dataset.chan = String(s.chan);
+    const lamp = lampOf(s);
+    n.lamp.className = "strip-lamp" + (lamp ? " " + lamp : "");
+    const why = whyOf(s);
+    n.root.setAttribute("aria-label", label + (why ? " — " + why : onAir && s.state === "open" ? " — open" : ""));
+    // the control under the user's hand keeps what he is doing
+    if (document.activeElement !== n.name && n.name.value !== s.label) n.name.value = s.label;
+    n.name.title = label + " — the speaker's name on the lines (Enter keeps it)";
+    n.x.setAttribute("aria-label", "Remove " + label);
+    n.x.title = "Remove this source";
+    const k = kindOf(s.key), srcName = sourceName(s.key);
+    n.kind.textContent = KIND_TAG[k] || "";
+    n.srcName.textContent = srcName;
+    n.src.title = (KINDS[k] || "Source") + ": " + srcName;
+    n.why.textContent = why;
+    n.why.hidden = !why;
+    n.why.className = "strip-why" + (BAD_STATES.has(s.state) ? " is-bad" : "");
+    paintChannels(n, s);
+    const held = trimLive && trimLive.uid === s.uid;
+    const g = held ? trimLive.v : s.gainDb;
+    if (!held && dragUid !== s.uid && n.trim.value !== String(g)) n.trim.value = String(g);
+    n.db.textContent = fmtGain(g);
+    paintMeter(s.uid);
+  }
+  // The channel selector: the mix, then each channel of the device -- the ones another strip of the same device
+  // holds (or all of them next to its mix) offered disabled, so the rule is visible where it bites.
+  function paintChannels(n, s) {
+    const known = channelsOf(s.key);
+    const count = Math.max(known > 0 ? (known > 1 ? known : 0) : 2, s.chan);
+    const opts = [[0, "Mix"]];
+    for (let c = 1; c <= Math.min(MAX_CHAN, count); c++) opts.push([c, "Ch " + c]);
+    const sig = opts.map(([c]) => c + (clash(strips, s.key, c, s.uid) ? "x" : "")).join(",");
+    if (n.chSig !== sig) {
+      n.ch.replaceChildren();
+      opts.forEach(([c, t]) => {
+        const o = mk("option", "", t);
+        o.value = String(c);
+        o.disabled = c !== s.chan && clash(strips, s.key, c, s.uid);
+        n.ch.appendChild(o);
+      });
+      n.chSig = sig;
+    }
+    if (n.ch.value !== String(s.chan)) n.ch.value = String(s.chan);
+    n.ch.title = known > 0 ? "The whole device (Mix), or one of its " + known + " channels"
+                           : "The whole device (Mix), or one channel (open Add source once to list all of them)";
+  }
+
+  /* ---- THE METERS: liveLevels, -60..0 dBFS, peak hold 1.5 s, clip at -1 dBFS held 2 s; empty when the levels stop
+     (STALE) and whenever the engine is not listening -- a meter frozen on its last value would say a microphone
+     is still hearing something. Each strip reads ITS LANE's level (laneOf: TrPipe.h LANES) and nothing else -- two
+     strips on two channels of one device have two meters; a channel strip never shows its device's mix. ---- */
+  const METER_FLOOR_DB = -60, CLIP_DB = -1, PEAK_HOLD_MS = 1500, CLIP_HOLD_MS = 2000, LEVELS_STALE_MS = 1200;
+  const meters = new Map();     // uid -> {x, pk, pkAt, clipAt, db}
+  let staleTimer = null;
+  const dbToX = (db) => Math.max(0, Math.min(1, (db - METER_FLOOR_DB) / -METER_FLOOR_DB));
+  function levelFor(lv, s) {
+    const own = Object.prototype.hasOwnProperty;
+    const id = laneOf(s);
+    const v = own.call(lv, id) ? lv[id] : undefined;
+    if (v === undefined || v === null || v === "" || typeof v === "boolean") return null;
+    const d = Number(v);
+    return Number.isFinite(d) ? Math.max(-120, Math.min(24, d)) : null;
+  }
+  function applyLevels(msg) {
+    if (!onAir || !wanted) return;            // levels only WHILE LISTENING (the director's rule; the drain is not)
+    const lv = msg && msg.levels;
+    if (!lv || typeof lv !== "object" || Array.isArray(lv)) return;
+    const now = nowMs();
+    strips.forEach((s) => {
+      const db = levelFor(lv, s);
+      if (db === null) return;
+      const m = meters.get(s.uid) || { x: 0, pk: 0, pkAt: NaN, clipAt: NaN, db: -120 };
+      m.x = dbToX(db);
+      m.db = db;
+      if (!(now - m.pkAt < PEAK_HOLD_MS) || m.x >= m.pk) { m.pk = m.x; m.pkAt = now; }
+      if (db >= CLIP_DB) m.clipAt = now;
+      meters.set(s.uid, m);
+      paintMeter(s.uid);
+    });
+    if (staleTimer) clearTimeout(staleTimer);
+    staleTimer = setTimeout(() => { staleTimer = null; metersOff(); }, LEVELS_STALE_MS);
+  }
+  function metersOff() {
+    if (staleTimer) { clearTimeout(staleTimer); staleTimer = null; }
+    meters.clear();
+    strips.forEach((s) => paintMeter(s.uid));
+  }
+  function paintMeter(uid) {
+    const n = stripEls.get(uid);
+    if (!n) return;
+    const m = meters.get(uid);
+    const x = m ? m.x : 0, pk = m ? m.pk : 0;
+    n.meter.style.setProperty("--lvl", x.toFixed(3));
+    n.meter.style.setProperty("--pk", pk.toFixed(3));
+    n.meter.classList.toggle("is-lit", !!m && pk > 0);
+    n.meter.classList.toggle("is-clip", !!m && nowMs() - m.clipAt < CLIP_HOLD_MS);
+    n.meter.title = m ? m.db.toFixed(1) + " dBFS" : "";
+  }
+
+  /* ---- LISTEN: the latch. Pressed = the page ASKS (liveListen); only the app's echo (translatorState.live.on) lights
+     the button and the ON AIR lamp. Between the two the dot blinks (LISTEN_PENDING_MS at most). With no strip it
+     still answers: a hint here, the app's own word after it, and the empty slot calls attention to itself. ---- */
+  function endListenPending() {
+    listenPending = null;
+    if (listenTimer) { clearTimeout(listenTimer); listenTimer = null; }
+  }
+  let beckonTimer = null;
+  function beckonAdd() {
+    el.addSource.classList.add("is-beckon");
+    if (beckonTimer) clearTimeout(beckonTimer);
+    beckonTimer = setTimeout(() => { beckonTimer = null; el.addSource.classList.remove("is-beckon"); }, 1800);
+  }
+  function pressListen() {
+    // against what is ASKED (ours in flight, else the app's wish): pressed again while starting = stop
+    const want = !(listenPending ? listenPending.on : wanted);
+    endListenPending();
+    if (want && !strips.length) {
+      beckonAdd();
+      showAck("Add a source first.", false, 4000);
+    } else {
+      listenPending = { on: want };
+      listenTimer = setTimeout(() => { listenTimer = null; listenPending = null; paintListen(); }, LISTEN_PENDING_MS);
+    }
+    paintListen();
+    send({ type: "liveListen", on: want });
+  }
+  function paintListen() {
+    // THE DRAIN (the ADDENDUM FIX ROUND): Listen pressed off, the engine still finishing (on && !wanted) -- the button is
+    // UP (the microphones are closed: what the user asked), the ON AIR lamp BLINKS on its way off (a console's light that
+    // is being released), and a press listens again (the engine resumes: LIVE 1 during the drain).
+    const finishing = onAir && !wanted;
+    el.listenBtn.setAttribute("aria-pressed", onAir && !finishing ? "true" : "false");
+    // the dot blinks between the ask and the echo: ours in flight, or the app's wish the engine has not confirmed yet
+    // (R4: live.wanted -- a start that loads models, a restart after the engine died)
+    el.listenBtn.classList.toggle("is-pending", (!!listenPending && listenPending.on !== onAir) || wanted !== onAir);
+    el.listenBtn.title = finishing ? "Listening stopped — finishing the last sentences (press to listen again)"
+                       : onAir ? "Stop listening"
+                       : strips.length ? "Listen to the sources above" : "Add a source first, then listen";
+    el.onAir.classList.toggle("is-lit", onAir && !finishing);
+    el.onAir.classList.toggle("is-finishing", finishing);
+    document.body.classList.toggle("is-on-air", onAir && !finishing);
+    paintState();
+  }
+
+  /* ---- THE PICKER ----
+     Each opening asks the engine for its list (liveSources{}): the engine ENUMERATES, it opens nothing -- no
+     microphone is opened before the user adds it and presses Listen. Rows that cannot be added say why. ---- */
+  const SECTIONS = [["in", "Inputs", "No input found."],
+                    ["out", "Sound of an output", "No output found."],
+                    ["app", "Applications", "No application is playing sound right now."]];
+  const SRC_STATES = new Set(["ok", "absent", "busy", "denied", "unsupported"]);
+  function sourceFrom(x) {
+    if (!x || typeof x !== "object") return null;
+    const kind = String(x.kind || "").toLowerCase();
+    const key = String(x.key || "");
+    if (!(kind === "in" || kind === "out" || kind === "app") || kindOf(key) !== kind || key.length > 512) return null;
+    const st = String(x.state || "").toLowerCase();
+    const flags = new Set((Array.isArray(x.flags) ? x.flags : String(x.flags || "").split(","))
+      .map((f) => String(f).trim().toLowerCase()).filter(Boolean));
+    return { kind, key, label: cleanName(x.label, 120) || sourceName(key), state: SRC_STATES.has(st) ? st : "error",
+             rate: Math.max(0, Number(x.rate) || 0), ch: Math.max(0, Math.min(64, parseInt(x.ch, 10) || 0)), flags };
+  }
+  function applySources(msg) {
+    if (!msg || !Array.isArray(msg.list)) return;
+    // The latest list to ARRIVE is the list: the app forwards whole lists in order, and an engine restart starts
+    // `gen` again at 1 -- so gens are never compared across messages here.
+    const first = !sources;
+    sources = { gen: Number(msg.gen) || 0, list: msg.list.map(sourceFrom).filter(Boolean) };
+    strips.forEach((s) => { const src = sourceOf(s.key); if (src) rememberSource(src); });
+    paintStrips();
+    paintPicker();
+    if (first && !el.picker.hidden && document.activeElement === el.pickerClose) focusPick(0);
+  }
+  const SRC_WHY = { absent: "Not connected", busy: "In use by another program (exclusive mode)",
+                    denied: "Windows blocks microphone access for desktop apps (Settings › Privacy › Microphone)",
+                    error: "Unavailable" };
+  // Can this source be added, and on which channel -- or why not. The default action: its mix when it is on no
+  // strip yet, else its lowest free channel (a device already on channels).
+  function addPlan(src) {
+    if (strips.length >= MAX_STRIPS) return { chan: -1, why: "" };       // (said once, at the top)
+    if (src.state !== "ok") {
+      const why = src.state === "unsupported"
+        ? (src.kind === "app" ? "Needs Windows 11 (or Windows 10 build 20348 or later)" : "Not supported")
+        : SRC_WHY[src.state] || "Unavailable";
+      return { chan: -1, why };
+    }
+    const mine = strips.filter((s) => s.key === src.key);
+    if (!mine.length) return { chan: 0, why: "" };
+    if (src.ch <= 1) return { chan: -1, why: "Already on a strip" };
+    if (mine.some((s) => s.chan === 0))
+      return { chan: -1, why: "Already on a strip as a whole (Mix) — set that strip to one channel to add another" };
+    for (let c = 1; c <= Math.min(MAX_CHAN, src.ch); c++) if (!clash(strips, src.key, c, 0)) return { chan: c, why: "" };
+    return { chan: -1, why: src.ch > 1 ? "Every channel is already on a strip" : "Already on a strip" };
+  }
+  function openPicker() {
+    if (!el.picker.hidden) return;
+    el.picker.hidden = false;
+    el.addSource.setAttribute("aria-expanded", "true");
+    send({ type: "liveSources" });
+    paintPicker();
+    focusPick(0);
+    wake();
+  }
+  function closePicker(refocus) {
+    if (el.picker.hidden) return;
+    el.picker.hidden = true;
+    el.addSource.setAttribute("aria-expanded", "false");
+    if (refocus && !el.addSource.disabled) el.addSource.focus();
+    // (fix round, RVB-7: the picker CLOSED -- the app stops asking the engine for lists nobody reads, a respawned
+    // engine included; the next opening asks again)
+    send({ type: "liveSources", open: false });
+    wake();
+  }
+  const pickButtons = () => Array.from(el.pickerList.querySelectorAll(".pk-add, .pk-ch")).filter((b) => !b.disabled);
+  function focusPick(i) {
+    const b = pickButtons();
+    if (b.length) b[Math.max(0, Math.min(b.length - 1, i))].focus(); else el.pickerClose.focus();
+  }
+  function paintPicker() {
+    if (el.picker.hidden) return;
+    const had = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.pick : "";
+    const full = strips.length >= MAX_STRIPS;
+    el.pickerNote.textContent = full ? "Up to " + MAX_STRIPS + " sources at once — remove one to add another."
+                              : !sources ? "Looking for sources…" : "";
+    el.pickerNote.hidden = !el.pickerNote.textContent;
+    el.pickerList.replaceChildren();
+    if (!sources) return;
+    let refocus = null;
+    SECTIONS.forEach(([kind, title, none]) => {
+      const sec = mk("div", "pk-sec");
+      sec.appendChild(mk("div", "pk-sec-title", title));
+      const rows = sources.list.filter((x) => x.kind === kind).slice()
+        .sort((a, b) => (a.state === "ok" ? 0 : 1) - (b.state === "ok" ? 0 : 1)
+                     || (b.flags.has("default") ? 1 : 0) - (a.flags.has("default") ? 1 : 0)
+                     || (b.flags.has("comm") ? 1 : 0) - (a.flags.has("comm") ? 1 : 0)
+                     || a.label.localeCompare(b.label));
+      if (!rows.length) sec.appendChild(mk("div", "pk-none", none));
+      rows.forEach((src) => {
+        const plan = addPlan(src);
+        const row = mk("div", "pk-row" + (plan.chan < 0 ? " is-off" : ""));
+        row.dataset.key = src.key;
+        const add = mk("button", "pk-add");
+        add.type = "button";
+        add.setAttribute("type", "button");
+        add.dataset.pick = src.key + "#" + plan.chan;
+        add.disabled = plan.chan < 0;
+        add.appendChild(mk("span", "pk-dot" + (src.state === "ok" ? "" : src.state === "absent" ? " is-off" : " is-bad")));
+        add.appendChild(mk("span", "pk-name", src.label));
+        if (src.flags.has("default")) add.appendChild(mk("span", "pk-badge", "Default"));
+        if (src.flags.has("comm")) add.appendChild(mk("span", "pk-badge", "Communications"));
+        add.title = plan.chan < 0 ? (plan.why || src.label)
+                  : "Add " + src.label + (plan.chan > 0 ? " — channel " + plan.chan : "");
+        add.addEventListener("click", () => addStrip(src.key, plan.chan));
+        row.appendChild(add);
+        if (plan.why) row.appendChild(mk("div", "pk-why", plan.why));
+        // a device with several channels: each one on its own (inputs and outputs; an application is one stream)
+        if (src.state === "ok" && !full && src.kind !== "app" && src.ch > 1) {
+          const chips = mk("span", "pk-chips");
+          chips.setAttribute("role", "group");
+          chips.setAttribute("aria-label", "One channel of " + src.label);
+          for (let c = 0; c <= Math.min(MAX_CHAN, src.ch); c++) {
+            const b = mk("button", "pk-ch", c === 0 ? "Mix" : String(c));
+            b.type = "button";
+            b.setAttribute("type", "button");
+            b.dataset.pick = src.key + "#" + c;
+            b.disabled = clash(strips, src.key, c, 0);
+            b.title = c === 0 ? "The whole device (all its channels summed)" : "Channel " + c + " alone";
+            b.addEventListener("click", () => addStrip(src.key, c));
+            chips.appendChild(b);
+          }
+          row.appendChild(chips);
+        }
+        sec.appendChild(row);
+      });
+      el.pickerList.appendChild(sec);
+    });
+    // a list pushed while the keyboard was on a row: back on the same row
+    if (had) refocus = pickButtons().find((b) => b.dataset.pick === had);
+    if (refocus) refocus.focus();
+  }
+
+  /* ---- the window's own state (RV4-7): its REAL always-on-top, as main.cpp read it back; absent = left as is ---- */
+  function applyWindow(msg) {
+    if (typeof msg.topmost === "boolean") { onTop = msg.topmost; paintPin(); }
+  }
+
+  function onMessage(data) {
+    let msg = data;
+    if (typeof data === "string") { try { msg = JSON.parse(data); } catch { return; } }
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "translatorState") {
+      // a Clear (from either side): a new session. The bare {cleared:true} carries nothing else to read.
+      if (msg.cleared === true) clearLog();
+      if (typeof msg.running !== "boolean" && !msg.status && !msg.live) return;
+      const p0 = pair();
+      const models = msg.models;
+      trState = { running: !!msg.running, status: String(msg.status || ""),
+                  preset: String(msg.preset || ""), presetReq: String(msg.presetReq || ""),
+                  asr: asrLabel(models && typeof models === "object" ? models.asr : models),
+                  mt: models && typeof models === "object" ? shortModel(models.mt) : "",
+                  gpu: !!msg.gpu, err: String(msg.err || ""),
+                  // THE ENGINE'S ECHO WINS over whatever this window optimistically painted: a code the engine could
+                  // not honour never appears in it (TrPipe.h), so the bar never advertises a pair that is not running.
+                  mode: String(msg.mode || trState.mode || "auto"),
+                  langA: normLang(msg.langA) || "en",
+                  langB: normLang(msg.langB) || "zh",
+                  sessionLines: Number(msg.sessionLines) || 0,
+                  spkOn: !!(msg.spk && msg.spk.on), speakers: Math.max(0, Number(msg.spk && msg.spk.speakers) || 0) };
+      // (a string `models` from an older sender: its first half is the ASR, the rest the MT)
+      if (typeof models === "string" && models.indexOf(" · ") > 0) {
+        trState.asr = asrLabel(models.slice(0, models.indexOf(" · ")));
+        trState.mt = shortModel(models.slice(models.indexOf(" · ") + 3).split(" ")[0]);
+      }
+      noteEngineRunning(trState.running);
+      if (msg.live && typeof msg.live === "object") applyLive(msg.live);
+      paintState();
+      paintBar();
+      paintPreset();
+      paintExport();
+      // The pair moving changes what "show A" MEANS: the log is re-painted in the language now asked for. Guarded: a
+      // state arrives on every status tick, and re-rendering the dialogue that often would be the flash §7 avoids.
+      const p1 = pair();
+      if (show !== "both" && (p0.a !== p1.a || p0.b !== p1.b)) renderLog();
+      // NOT wake(): idle means the READER is idle, not the conversation (an error still shows: it pins itself).
+    } else if (msg.type === "translatorLine") {
+      const spk = (typeof msg.spk === "object" && msg.spk) || {};
+      const line = { t: msg.t, lang: String(msg.lang || ""), src: String(msg.src || ""),
+                     dst: String(msg.dst || ""), ms: Number(msg.ms) || 0,
+                     waitMs: Number(msg.waitMs) || 0,
+                     segId: segIdOf(msg.segId),   // "" = finishes no live segment
+                     // retained, not merely rendered: a display-language switch re-paints the log from these
+                     dstLang: String(msg.dstLang || ""), pass: !!msg.pass,
+                     // W3: which sentence of its utterance this is, and whether it is the last
+                     seq: Number(msg.seq) || 0, closes: closesOf(msg),
+                     spk: { key: String(spk.key || ""), label: cleanName(spk.label, 80),
+                            color: colorOf(spk.color) } };
+      const id = identity(line);
+      if (seen.has(id)) return;           // the reload replay: apply each line at most once
+      seen.add(id);
+      lines.push(line);
+      if (lines.length > MAX) lines.splice(0, lines.length - MAX).forEach((d) => seen.delete(identity(d)));
+      // The draft has become the thing itself -- unless it does NOT close its utterance (W3): then the live line
+      // survives with its committed sentence cut off the front. A final for a DIFFERENT segment leaves it alone.
+      if (line.segId && live && live.segId === line.segId) {
+        if (line.closes) liveClear();
+        else             liveTrimHead(line);
+      }
+      const host = liveLift();
+      appendLine(line);
+      liveDrop(host);
+      if (pinned) pin();
+      refreshResume();
+    } else if (msg.type === "translatorPartial") {
+      applyPartial(msg);                  // replace-in-place, silent for the resume pill
+    } else if (msg.type === "translatorEnd") {
+      applyEnd(msg);                      // the live line falls, and nothing is appended
+    } else if (msg.type === "translatorExported") {
+      // THREE outcomes, two worth a word: ok -> the file name alone (the user chose the folder); err -> the app's
+      // sentence, in the error style and for longer; err=cancelled -> NOTHING (they closed the dialog).
+      if (msg.ok) {
+        const p = String(msg.path || "");
+        showAck("Saved · " + cleanName(p.split(/[\\/]/).pop() || p, 120), false, 4000);
+      } else if (String(msg.err || "") !== "cancelled") {
+        showAck("Export failed — " + (cleanNotice(msg.err) || "unknown error"), true, 6000);
+      }
+    } else if (msg.type === "liveSources") {
+      applySources(msg);
+    } else if (msg.type === "liveLevels") {
+      applyLevels(msg);
+    } else if (msg.type === "translatorWindow") {
+      applyWindow(msg);
+    } else if (msg.type === "warn") {
+      const t = cleanNotice(msg.text);
+      if (t) showAck(t, true, 6000);
+    }
+  }
+  if (hasWebView) window.chrome.webview.addEventListener("message", (e) => onMessage(e.data));
+
+  /* ---- THE TRANSLATE ROW AND THE BAR (1.1.0 W2) -------------------------------------------------------------
+     Two kinds of thing: "Translate" steers the ENGINE (every change goes out as translatorCtl and comes back as a
+     STATE echo, which wins); "Show" and "Text" steer THIS WINDOW and are never sent anywhere. */
+  const DIRS = [["auto", "⇄"], ["a2b", "→"], ["b2a", "←"]];
+  const PRESETS = [["auto", "Auto"], ["quality", "Quality"], ["balanced", "Balanced"], ["light", "Light"]];
+  function fillSelect(sel) {
+    sel.replaceChildren();
+    TR_LANGS.forEach(([code]) => {
+      const o = document.createElement("option");
+      o.value = code; o.textContent = langName(code);      // U1: "日本語 (Japanese)"
+      sel.appendChild(o);
+    });
+  }
+  // The deck wraps on a narrow window and grows with the strips; the log's top gutter has to follow it, or the first
+  // paragraph sits underneath it. Measured, never guessed (a ResizeObserver where there is one, and after each paint).
+  function fitDeck() {
+    let h = 0;
+    try { h = Math.round(el.deck.getBoundingClientRect().height); } catch { /* no layout */ }
+    if (h > 0) document.documentElement.style.setProperty("--deck-h", h + "px");
+  }
+  function paintBar() {
+    const p = pair();
+    el.langA.value = p.a;
+    el.langB.value = p.b;
+    el.langA.title = langName(p.a);            // (U1: a narrow deck cuts a long name short -- the whole of it)
+    el.langB.title = langName(p.b);
+    const mode = DIRS.some(([v]) => v === trState.mode) ? trState.mode : "auto";
+    const glyph = (DIRS.find(([v]) => v === mode) || DIRS[0])[1];
+    if (el.dirBtn.textContent !== glyph) el.dirBtn.textContent = glyph;
+    el.dirBtn.title = mode === "auto"
+      ? "Both ways — the language of each sentence is detected (click for " + langName(p.a)
+        + " → " + langName(p.b) + " only)"
+      : mode === "a2b"
+        ? langName(p.a) + " → " + langName(p.b) + " only (click for the other way round)"
+        : langName(p.b) + " → " + langName(p.a) + " only (click for both ways)";
+    // the same three states, spelled out (the wide layout; the narrow one keeps the glyph alone)
+    [[el.modeAuto, "auto", "Both ways", "Both ways — the language of each sentence is detected"],
+     [el.modeA2B, "a2b", codeTag(p.a) + " → " + codeTag(p.b), langName(p.a) + " → " + langName(p.b) + " only"],
+     [el.modeB2A, "b2a", codeTag(p.b) + " → " + codeTag(p.a), langName(p.b) + " → " + langName(p.a) + " only"]]
+      .forEach(([b, v, txt, tip]) => {
+        if (b.textContent !== txt) b.textContent = txt;
+        b.title = tip;
+        b.classList.toggle("is-on", mode === v);
+        b.setAttribute("aria-pressed", mode === v ? "true" : "false");
+      });
+    // (U1: the segments say the bare native name -- the deck stays one row --, their tooltips the whole "日本語 (Japanese)")
+    const lab = { both: "Both", a: langNative(p.a), b: langNative(p.b) };
+    const full = { a: langName(p.a), b: langName(p.b) };
+    [[el.showBoth, "both"], [el.showA, "a"], [el.showB, "b"]].forEach(([b, v]) => {
+      b.textContent = lab[v];
+      b.classList.toggle("is-on", show === v);
+      b.setAttribute("aria-pressed", show === v ? "true" : "false");
+      b.title = v === "both"
+        ? "Show the translation with the original underneath"
+        : "Show only " + full[v] + " — one line per sentence";
+    });
+    // A longer language name can be what tips a row onto a second line, so the gutter is re-measured here too.
+    fitDeck();
+  }
+  // The preset: what the user ASKED for when he did (presetReq), else what runs; Auto says what it chose.
+  function paintPreset() {
+    const has = (v) => PRESETS.some(([x]) => x === v);
+    const want = has(trState.presetReq) ? trState.presetReq : has(trState.preset) ? trState.preset : "balanced";
+    if (el.presetSel.value !== want) el.presetSel.value = want;
+    const ran = PRESETS.find(([x]) => x === trState.preset);
+    el.presetSel.title = "The models' preset — Quality is slower and more accurate, Light is for a computer without "
+      + "a GPU to spare, Auto picks for this computer" + (want === "auto" && ran && ran[0] !== "auto"
+        ? " (it chose " + ran[1] + ")" : "") + ". Shared with the player.";
+  }
+  // A pair travels WHOLE (half of it is a change the engine throws away), and the same language on both halves is
+  // refused by SWAPPING rather than by an error: asking for "A = 繁體中文" while B is already 繁體中文 can only mean
+  // "put them the other way round". A half that is NOT a code ("" from the normaliser) is never sent.
+  function pickPair(which, code) {
+    if (!code) { paintBar(); return; }
+    const p = pair();
+    const a  = which === "a" ? code : (code === p.a ? p.b : p.a);
+    const b  = which === "a" ? (code === p.b ? p.a : p.b) : code;
+    if (!a || !b || a === b) { paintBar(); return; }   // nothing (sendable) to ask for
+    const moved = (a !== p.a || b !== p.b);
+    // Optimistic, and overwritten by the engine's echo on the next STATE.
+    trState = { ...trState, langA: a, langB: b };
+    paintBar();
+    if (moved && show !== "both") renderLog();
+    send({ type: "translatorCtl", langA: a, langB: b });
+  }
+  function setMode(next) {
+    if (next === trState.mode) return;                 // nothing changed: nothing travels
+    trState = { ...trState, mode: next };              // optimistic; the STATE echo is the truth
+    paintBar();
+    send({ type: "translatorCtl", mode: next });
+  }
+  function applyShow(v, persist) {
+    if (!(v === "a" || v === "b" || v === "both") || v === show) return;
+    show = v;
+    if (persist) write(KEY_SHOW, v);
+    paintBar();
+    renderLog();
+    if (pinned) pin();
+  }
+  const setShow = (v) => applyShow(v, /*persist=*/true);
+  fillSelect(el.langA); fillSelect(el.langB);
+  el.langA.addEventListener("change", () => pickPair("a", normLang(el.langA.value)));
+  el.langB.addEventListener("change", () => pickPair("b", normLang(el.langB.value)));
+  el.dirBtn.addEventListener("click", () => {
+    const i = DIRS.findIndex(([v]) => v === trState.mode);
+    setMode(DIRS[(i < 0 ? 0 : i + 1) % DIRS.length][0]);
+  });
+  [[el.modeAuto, "auto"], [el.modeA2B, "a2b"], [el.modeB2A, "b2a"]].forEach(([b, v]) => {
+    b.addEventListener("click", () => setMode(v));
+  });
+  el.presetSel.addEventListener("change", () => {
+    const v = el.presetSel.value;
+    if (!PRESETS.some(([x]) => x === v)) { paintPreset(); return; }
+    if (v === (trState.presetReq || trState.preset)) return;   // nothing changed: nothing travels
+    trState = { ...trState, presetReq: v };            // optimistic; the STATE echo is the truth
+    paintPreset();
+    send({ type: "translatorCtl", preset: v });
+  });
+  [[el.showBoth, "both"], [el.showA, "a"], [el.showB, "b"]].forEach(([b, v]) => {
+    b.addEventListener("click", () => setShow(v));
+  });
+
+  /* ---- the window's controls ---- */
+  function paintPin() {
+    el.pinToggle.classList.toggle("is-on", onTop);
+    el.pinToggle.setAttribute("aria-pressed", onTop ? "true" : "false");
+  }
+  function paintThemeBtn() {
+    const t = themeNow() === "light" ? "Dark theme" : "Light theme";
+    el.themeBtn.title = t;
+    el.themeBtn.setAttribute("aria-label", t);
+  }
+  function setTheme(t) {
+    applyTheme(t);
+    write(THEME_KEY, t);          // ...and the player follows (the storage event)
+    paintThemeBtn();
+  }
+  el.fontDown.addEventListener("click", () => bumpFont(-2));
+  el.fontUp.addEventListener("click", () => bumpFont(+2));
+  el.clearBtn.addEventListener("click", () => { clearLog(); send({ type: "translatorCtl", clear: true }); });
+  // `format` travels EXPLICITLY even though the app defaults to docx: the day another format is added, a surface that
+  // had been relying on the default would silently change format.
+  el.exportBtn.addEventListener("click", () => send({ type: "translatorExport", format: "docx" }));
+  el.pinToggle.addEventListener("click", () => {
+    onTop = !onTop;
+    paintPin();
+    // translatorCtl{alwaysOnTop}: the native window (SetWindowPos HWND_TOPMOST); its REAL state comes back as
+    // translatorWindow{topmost} and wins (RV4-7)
+    send({ type: "translatorCtl", alwaysOnTop: onTop });
+  });
+  el.themeBtn.addEventListener("click", () => setTheme(themeNow() === "light" ? "dark" : "light"));
+  el.resume.addEventListener("click", () => { pinned = true; pin(); refreshResume(); el.log.focus(); });
+  el.log.addEventListener("scroll", () => { pinned = atBottom(); refreshResume(); });
+  el.listenBtn.addEventListener("click", pressListen);
+  el.addSource.addEventListener("click", () => { if (el.picker.hidden) openPicker(); else closePicker(true); });
+  el.pickerClose.addEventListener("click", () => closePicker(true));
+  // the picker by the keyboard: arrows move between the rows (and their channels), Esc closes it
+  el.picker.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); closePicker(true); return; }
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    const b = pickButtons(), i = b.indexOf(document.activeElement);
+    e.preventDefault();
+    focusPick(i < 0 ? 0 : i + (e.key === "ArrowDown" ? 1 : -1));
+  });
+  // ...and a press anywhere else closes it
+  const inside = (node, root) => { for (let n = node; n; n = n.parentNode) if (n === root) return true; return false; };
+  window.addEventListener("pointerdown", (e) => {
+    if (!el.picker.hidden && !inside(e.target, el.picker) && !inside(e.target, el.addSource)) closePicker(false);
+  });
+  window.addEventListener("pointerup", () => { dragUid = 0; });
+  window.addEventListener("pointercancel", () => { dragUid = 0; });
+
+  // Ctrl+wheel = zoom the dialogue, the gesture every reader already knows.
+  window.addEventListener("wheel", (e) => {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    bumpFont(e.deltaY < 0 ? +2 : -2);
+  }, { passive: false });
+
+  const typing = (t) => !!t && t.tagName === "INPUT" && String(t.type || "").toLowerCase() === "text";
+  window.addEventListener("keydown", (e) => {
+    // Fix round (RVB-14): the deck has FADED while the keyboard was on one of its controls (Listen pressed from the
+    // keyboard, then 3 s of reading): the key that wakes it only wakes it -- Space / Enter must not act on a control the
+    // user cannot see (stop the listening, remove a strip). The next key acts, on a deck in sight.
+    const asleep = el.deck.classList.contains("is-idle");
+    wake();
+    if (asleep && inside(e.target, el.deck)) { e.preventDefault(); return; }
+    // a name being typed keeps its keys (End, Ctrl+-...): they are the text field's
+    if (typing(e.target)) return;
+    if (e.key === "Escape" && !el.picker.hidden) { e.preventDefault(); closePicker(true); }
+    else if (e.ctrlKey && (e.key === "+" || e.key === "=")) { e.preventDefault(); bumpFont(+2); }
+    else if (e.ctrlKey && e.key === "-") { e.preventDefault(); bumpFont(-2); }
+    // RV4-8: by the PHYSICAL key -- on AZERTY the top-row 0 types "à" without Shift, so e.key is "à"
+    else if (e.ctrlKey && (e.code === "Digit0" || e.code === "Numpad0" || e.key === "0")) { e.preventDefault(); font = 28; applyFont(); write(KEY_FONT, font); pin(); }
+    else if (e.key === "End") { pinned = true; pin(); refreshResume(); }
+  });
+
+  /* ---- the idle fade: after a few still seconds the window is only the conversation -- WHILE LISTENING. Not while
+     the picker is open or a name is being typed (the deck would fade under the hand), and not when nothing is
+     listening (there is nothing to read, and Listen must stay in sight). The ON AIR tally stays. ---- */
+  const IDLE_MS = 3000;
+  let idleTimer = null;
+  // (not while FINISHING either: the window is saying "Finishing the last sentences…", and that must be read)
+  const idleAllowed = () => onAir && wanted && el.picker.hidden && !typing(document.activeElement);
+  function wake() {
+    el.deck.classList.remove("is-idle");
+    el.state.classList.remove("is-idle");
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      if (!idleAllowed()) return;
+      el.deck.classList.add("is-idle");
+      el.state.classList.add("is-idle");
+    }, IDLE_MS);
+  }
+  ["pointermove", "pointerdown", "focusin"].forEach((t) => window.addEventListener(t, wake));
+  // Resizing can change how many rows the deck takes; the gutter follows. Deliberately NOT a wake: the reader has
+  // not moved, the window has.
+  window.addEventListener("resize", fitDeck);
+  try { if (typeof ResizeObserver === "function") new ResizeObserver(fitDeck).observe(el.deck); } catch { /* none */ }
+
+  /* =====================================================================
+     Design-time mock (browser dev only — never runs inside WebView2).
+     It plays the app AND the engine, so the whole window can be watched in a plain browser: two strips on one
+     interface (channel 1 and 2: "Me" and "Guest" -- the user's own setup), the picker's list, Listen, the meters,
+     and 1.1.0's scripted meeting spoken by the strips. The address's #fragment sets the scene for a screenshot:
+     #listen (listening at once), #empty (no strip), #picker (the picker open), #light / #dark (the theme), #awake
+     (the deck never fades: a reader who keeps moving).
+     ===================================================================== */
+  const mock = (() => {
+    const UR = "in:{0.0.1.00000000}.{3c1e5a20-mock-iface}";
+    const LIST = [
+      { kind: "in", key: UR, label: "Line (Studio Interface)", state: "ok", rate: 48000, ch: 6, flags: "default" },
+      { kind: "in", key: "in:{0.0.1.00000000}.{mock-headset}", label: "Headset Microphone (Jabra Evolve2 65)",
+        state: "ok", rate: 16000, ch: 1, flags: "comm" },
+      { kind: "in", key: "in:{0.0.1.00000000}.{mock-cable}", label: "CABLE Output (VB-Audio Virtual Cable)",
+        state: "ok", rate: 48000, ch: 2, flags: "" },
+      { kind: "in", key: "in:{0.0.1.00000000}.{mock-array}", label: "Microphone Array (Realtek(R) Audio)",
+        state: "denied", rate: 48000, ch: 2, flags: "" },
+      { kind: "out", key: "out:{0.0.0.00000000}.{mock-speakers}", label: "Speakers (Realtek(R) Audio)",
+        state: "ok", rate: 48000, ch: 2, flags: "default" },
+      { kind: "out", key: "out:{0.0.0.00000000}.{mock-headset}", label: "Headset Earphone (Jabra Evolve2 65)",
+        state: "ok", rate: 48000, ch: 2, flags: "comm" },
+      { kind: "app", key: "app:Zoom.exe", label: "Zoom Meetings", state: "ok", rate: 48000, ch: 2, flags: "" },
+      { kind: "app", key: "app:ms-teams.exe", label: "Microsoft Teams", state: "ok", rate: 48000, ch: 2, flags: "" },
+      { kind: "app", key: "app:firefox.exe", label: "Firefox", state: "ok", rate: 48000, ch: 2, flags: "" },
+    ];
+    const hash = String((window.location && window.location.hash) || "");
+    let mStrips = /empty/.test(hash) ? [] : [{ key: UR, label: "Me", chan: 1, gainDb: 0 },
+                                             { key: UR, label: "Guest", chan: 2, gainDb: 3 }];
+    let mOn = false, mGen = 0, mLines = 0;
+    let mA = "fr", mB = "en", mMode = "auto", mPreset = "balanced";
+    let i = 0, timer = null, levelTimer = null, talker = -1;
+    /* 1.1.0's scripted meeting (§7 streaming, W3 several finals in one utterance, an END, an abandoned partial),
+       spoken by the STRIPS: `who` is a strip's position, its name and colour are the strip's. */
+    const script = [
+      { who: 0, lang: "en", src: "Right, let's set the levels before we start.",
+        dst: "Bon, réglons les niveaux avant de commencer.", ms: 620, waitMs: 3200, stream: true,
+        draft: "Bon, réglons les niveaux", revise: "Right, let's set the lever before" },
+      { who: 0, lang: "en", src: "Give me a steady tone on channel three.",
+        dst: "Envoie-moi un signal stable sur la voie trois.", ms: 579, waitMs: 2900 },
+      { who: 1, lang: "fr", src: "D'accord, la voie trois est envoyée.",
+        dst: "Sure — channel three is sending now.", ms: 480, waitMs: 1840, stream: true, draft: "Right, channel three" },
+      { who: 0, lang: "en", src: "Perfect, that's minus eighteen.", dst: "Parfait, ça fait moins dix-huit.", ms: 510, waitMs: 2400 },
+      { who: 1, lang: "fr", src: "Le niveau est un peu bas, je monte de trois décibels.",
+        dst: "The level is a little low — I'll push it three dB.", ms: 660, waitMs: 2100 },
+      { who: 0, lang: "en", stream: true, sentences: [
+          { src: "Right, the room is ready.", dst: "Bon, la salle est prête.", ms: 610, waitMs: 1150, lead: "Let's start" },
+          { src: "Let's start with the drum stems.", dst: "Commençons par les stems de batterie.",
+            ms: 640, waitMs: 1210, lead: "Then we", draft: "Commençons par" },
+          { src: "Then we print the mix.", dst: "Ensuite on exporte le mix.", ms: 590, waitMs: 1080 },
+        ] },
+      { who: 1, lang: "fr", stream: true, end: true, tail: "Euh…", sentences: [
+          { src: "Le niveau est bon maintenant.", dst: "The level is set now.", ms: 470, waitMs: 980, lead: "Euh" },
+        ] },
+      { who: 0, lang: "en", src: "Agreed, so let's — actually, hold on", ms: 0, abandon: true, stream: true },
+    ];
+    const liveOf = () => ({ on: mOn, wanted: mOn,
+      inputs: mStrips.map((s) => Object.assign({}, s, { lane: laneRule(s.key, s.chan), state: mOn ? "open" : "" })) });
+    const state = (status) => onMessage({ type: "translatorState", running: true, status, preset: mPreset,
+      presetReq: mPreset, models: { asr: "small→large-v3-turbo", mt: "Qwen3-4B-Instruct-2507-Q5_K_M.gguf" }, gpu: true,
+      mode: mMode, langA: mA, langB: mB, sessionLines: mLines, spk: { on: true, model: "campplus", speakers: 2 },
+      live: liveOf() });
+    const spkOf = (who, lang) => {
+      const s = mStrips[who % Math.max(1, mStrips.length)] || { key: "x", label: "Speaker", chan: 0 };
+      // the app's speaker key without a voiceprint: {lane, language}; slot = the lane (TrPipe.h LANES)
+      const lane = laneRule(s.key, s.chan);
+      return { key: lane + "|" + lang, slot: lane, label: s.label, color: who % 6 };
+    };
+    const line = (o) => { mLines++; onMessage(o); };
+    const other = (lang) => (lang === mB ? mA : mB);
+    const grow = (text, revise) => {
+      const t = String(text || ""), spaced = /\s/.test(t);
+      const parts = spaced ? t.split(/\s+/) : t.split(""), step = spaced ? 2 : 3, out = [];
+      for (let k = step; k < parts.length; k += step) out.push(parts.slice(0, k).join(spaced ? " " : ""));
+      if (revise) out.splice(Math.max(0, out.length - 1), 0, String(revise));
+      out.push(t);
+      return out;
+    };
+    const PART_MS = 600;
+    const next = (gap) => { talker = -1; state("listening"); i++; timer = setTimeout(tick, gap); };
+    function commitSteps(s, seg) {
+      const steps = [];
+      const part = (src, dst) => steps.push(() =>
+        onMessage({ type: "translatorPartial", segId: seg, t: Date.now(), lang: s.lang, src,
+                    ...(dst ? { dst, dstLang: other(s.lang) } : {}) }));
+      const last = s.sentences.length - 1;
+      s.sentences.forEach((snt, k) => {
+        const join  = /\s/.test(snt.src) ? " " : "";
+        const carry = k ? String(s.sentences[k - 1].lead || "") : "";
+        grow(snt.src).forEach((g) => { if (g.length > carry.length) part(g, snt.draft); });
+        if (snt.lead) part(snt.src + join + snt.lead, snt.draft);
+        steps.push(() => {
+          line({ type: "translatorLine", t: Date.now(), segId: seg, lang: s.lang,
+                      src: snt.src, dst: snt.dst, dstLang: other(s.lang),
+                      ms: snt.ms, waitMs: snt.waitMs, seq: k + 1,
+                      closes: k === last && !s.end, spk: spkOf(s.who, s.lang) });
+          if (snt.lead)
+            onMessage({ type: "translatorPartial", segId: seg, t: Date.now(), lang: s.lang, src: snt.lead });
+        });
+      });
+      if (s.end) { part(String(s.tail || "")); steps.push(() =>
+        onMessage({ type: "translatorEnd", segId: seg })); }
+      return steps;
+    }
+    function tick() {
+      if (!mOn || !mStrips.length) return;
+      const s = script[i % script.length];
+      const seg = i + 1;
+      talker = s.who % mStrips.length;
+      state("transcribing");
+      if (s.sentences) {
+        const steps = commitSteps(s, seg);
+        let k = 0;
+        const beat = () => {
+          steps[k]();
+          if (++k < steps.length) { timer = setTimeout(beat, PART_MS); return; }
+          next(2600);
+        };
+        beat();
+        return;
+      }
+      const final = () => {
+        line({ type: "translatorLine", t: Date.now(), segId: seg, lang: s.lang, src: s.src,
+               dst: s.dst, dstLang: other(s.lang), ms: s.ms, waitMs: s.waitMs, spk: spkOf(s.who, s.lang) });
+        next(2600);
+      };
+      if (!s.stream) { timer = setTimeout(final, 1200); return; }
+      const words = grow(s.src, s.revise);
+      const draftFrom = Math.floor(words.length * 0.6);
+      let k = 0;
+      const step = () => {
+        onMessage({ type: "translatorPartial", segId: seg, t: Date.now(), lang: s.lang, src: words[k],
+                    ...(k >= draftFrom && s.draft ? { dst: s.draft, dstLang: other(s.lang) } : {}) });
+        if (++k < words.length) { timer = setTimeout(step, PART_MS); return; }
+        if (s.abandon) { next(23000); return; }
+        timer = setTimeout(final, 900);
+      };
+      step();
+    }
+    // the meters: the talker near -14 dBFS, everyone else at the room's floor, five times a second
+    function levels() {
+      if (!mOn) return;
+      const lv = {};
+      mStrips.forEach((s, k) => {
+        const db = (k === talker ? -16 + Math.random() * 13 : -54 + Math.random() * 8) + (Number(s.gainDb) || 0);
+        lv[laneRule(s.key, s.chan)] = Math.round(db * 10) / 10;   // keyed by LANE, as the engine names them
+      });
+      onMessage({ type: "liveLevels", levels: lv });
+      levelTimer = setTimeout(levels, 200);
+    }
+    function listen(on) {
+      if (on && !mStrips.length) { onMessage({ type: "warn", text: "Add a source first." }); return; }
+      mOn = on;
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (levelTimer) { clearTimeout(levelTimer); levelTimer = null; }
+      talker = -1;
+      state("listening");
+      if (on) { timer = setTimeout(tick, 900); levels(); }
+    }
+    function start() {
+      const th = /light/.test(hash) ? "light" : /dark/.test(hash) ? "dark" : "";
+      if (th) { applyTheme(th); paintThemeBtn(); }
+      onMessage({ type: "translatorWindow", topmost: true });
+      if (/awake/.test(hash)) { const keep = () => { wake(); setTimeout(keep, 1000); }; keep(); }
+      state("loading");
+      setTimeout(() => {
+        state("listening");
+        if (/listen/.test(hash)) listen(true);
+        if (/picker/.test(hash)) openPicker();
+      }, 400);
+    }
+    function handle(msg) {
+      if (!msg) return;
+      if (msg.type === "translatorExport") {
+        // a fake path: a mock that wrote a file would be a mock with teeth
+        setTimeout(() => onMessage({ type: "translatorExported", ok: true,
+          path: "C:\\Users\\me\\Documents\\SuVtitle Live 2026-10-25 15-40.docx", lines: mLines }), 700);
+        return;
+      }
+      if (msg.type === "liveSources") {
+        if (msg.open === false) return;          // (the picker closed: nothing to answer)
+        setTimeout(() => onMessage({ type: "liveSources", gen: ++mGen, list: LIST }), 250);
+        return;
+      }
+      if (msg.type === "liveListen") { listen(!!msg.on); return; }
+      if (msg.type === "liveConfig") {
+        // the app's own rules: <= 4, one key twice only on two different channels >= 1
+        const ins = Array.isArray(msg.inputs) ? msg.inputs : [];
+        const bad = ins.length > MAX_STRIPS || ins.some((a, k) => ins.some((b, j) => j < k && a.key === b.key
+          && (a.chan === b.chan || !a.chan || !b.chan)));
+        if (bad) onMessage({ type: "warn", text: "That source is already on a strip." });
+        else mStrips = ins.map((x) => ({ key: x.key, label: x.label, chan: x.chan, gainDb: x.gainDb }));
+        if (mOn && !mStrips.length) listen(false); else state("listening");
+        return;
+      }
+      if (msg.type !== "translatorCtl") return;
+      // the echo a real engine would send -- refusing a degenerate pair, as the engine does
+      if (typeof msg.langA === "string" && typeof msg.langB === "string"
+          && msg.langA !== msg.langB) { mA = msg.langA; mB = msg.langB; }
+      if (typeof msg.mode === "string" && msg.mode) mMode = msg.mode;
+      if (typeof msg.preset === "string" && msg.preset) mPreset = msg.preset;
+      if (typeof msg.alwaysOnTop === "boolean") onMessage({ type: "translatorWindow", topmost: msg.alwaysOnTop });
+      if (msg.clear) {
+        if (timer) clearTimeout(timer);
+        i = 0; mLines = 0; timer = mOn ? setTimeout(tick, 600) : null;   // a Clear ENDS the session
+      }
+      state("listening");
+    }
+    return { start, handle };
+  })();
+
+  paintState();
+  paintBar();
+  paintPreset();
+  paintExport();
+  paintStrips();
+  paintPin();
+  paintThemeBtn();
+  refreshResume();
+  wake();
+  if (hasWebView) send({ type: "ready" });   // the app answers with the state, the last lines, the window
+  else mock.start();
+})();
+</script>
+</body>
+</html>

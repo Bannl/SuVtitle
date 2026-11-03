@@ -69,6 +69,26 @@ bool buildTranscript(const Doc& info, const std::vector<Line>& lines, std::strin
 // subtitles carry none). Same package, same fonts, same false-on-empty rule.
 bool buildFileTranscript(const Doc& info, const std::vector<Line>& lines, std::string& out);
 
+// U3 (2026-11-02, the TRANSCRIPTION -- docs/PROGRESS_U3.md section 6): THE SPEAKER TRANSCRIPT of a recording, "clean, usable by
+// professional transcribers": a header block, then ONE PARAGRAPH PER TURN -- its stamp, its speaker, its text (the turn's
+// sentences joined: no subtitle fragment, no translation line). Word's own NAMED styles, so a transcriber restyles each in one
+// place: Title, Subtitle, Normal (every turn is Normal) and the character styles Speaker and Timecode. The stamps come
+// formatted (app/SourceTimecode.h: file-relative or the file's source timecode): no timecode arithmetic here. Same package,
+// same fonts (YaHei / JhengHei), same false-on-empty rule. buildTranscript / buildFileTranscript are unchanged, byte for byte.
+struct TranscriptTurn {
+    std::wstring stamp;      // "[00:01:23]" / "[10:00:03:12]"
+    std::wstring speaker;    // "Speaker 1" / the user's name; "" = no name
+    std::wstring text;
+    std::wstring lang;       // its language (a zh-tw turn wears the Traditional face)
+};
+struct TranscriptDoc {
+    std::wstring title;                 // the file's name
+    std::wstring subtitle;              // "Transcript - 1:44 - 4 speakers"
+    std::vector<std::wstring> header;   // Normal lines: the date and the languages, the timecode, a partial's extent...
+    std::wstring note;                  // the italic line: "Automatic transcription by SuVtitle 1.1.0, to be checked. ..."
+};
+bool buildSpeakerTranscript(const TranscriptDoc& info, const std::vector<TranscriptTurn>& turns, std::string& out);
+
 // ---- the pieces, public so a future .xlsx can reuse them --------------------
 struct Part { std::string name; std::string data; };   // ASCII name, UTF-8 bytes
 // [Content_Types].xml MUST be the first entry of an OPC package. The caller owns

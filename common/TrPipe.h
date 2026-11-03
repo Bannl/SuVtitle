@@ -4,11 +4,13 @@
 //
 // SUVTITLE SPLIT (2026-10-23): this file is AudioPB's translator/TrPipe.h as of commit 641f1aa
 // (APB_TRANSLATOR "v1.0.6"), carried over when the player and its file transcription/translation
-// left AudioPB to become SuVtitle. SuVtitle uses the FILE MODE half (FILE / FCANCEL / FPROXY /
+// left AudioPB to become SuVtitle. SuVtitle 1.0.0 used the FILE MODE half (FILE / FCANCEL / FPROXY /
 // FFOCUS <-> FPROG / FCUE / FDONE / FPROXYDONE, the WH `audio` field) plus the handshake and the
-// STATE/CTL lines the engine needs; the LIVE half (fabric audio, LINE/PARTIAL/END streaming,
-// speakers) is AudioPB's and is described below only until the engine port prunes it. In the text
-// below read "Config"/"the tray" as SuVtitle.exe and "the exe"/"the helper" as SuVtitleEngine.exe.
+// STATE/CTL lines the engine needs. SuVtitle 1.1.0 (2026-10-25) brings the LIVE half back (LINE /
+// PART / END, speakers, CTL clear), fed by the engine's own capture instead of the fabric, with the
+// messages of the "SUVTITLE LIVE" block at the end of this description. In the text below read
+// "Config"/"the tray" as SuVtitle.exe, "the exe"/"the helper" as SuVtitleEngine.exe, and "cable" /
+// "fabric slot" as a live INPUT (a strip of the Live window).
 // The pipe is named \\.\pipe\suvtitle.engine.<appPid>.<seq> (pipeName below).
 // OWNED BY THE DIRECTOR: the engine and the app agents read it, never edit it.
 //
@@ -302,6 +304,132 @@
 //         error): analysing the wrong sound track is worse than not analysing at all -- the
 //         subtitles would be of a dialogue the viewer does not hear.
 //
+//   FILE MODE + THE USER'S OWN MODELS (wave U2, 2026-11-02). The user: "garder le petit menu de selection, avec une
+//   option 'Import model', pour les utilisateurs qui voudraient importer leur propre modele IA". A FILE job may name the
+//   models it runs on. Two fields APPENDED (a FILE naming neither is byte for byte the line it was before U2):
+//     FILE <jobId> <path> <langA> <langB> <mode> <quality> [<have> [<focusMs> [<audio> [<asrModel> [<mtModel>]]]]]
+//         asrModel = "" -- the shipping choice (large-v3-turbo; `quality` as above)
+//                  | the ABSOLUTE path of a whisper.cpp model (its own ggml format, ".bin": tiny ... large, distil,
+//                    fine-tunes, quantized) -- the job's whisper runs on THAT file; `quality` is then not read for it.
+//         mtModel  = "" -- the shipping choice (engine.txt MTMODEL, else Qwen3-4B, else the 1.5B)
+//                  | the ABSOLUTE path of a GGUF llama.cpp runs (an instruct / chat model) -- the job's llama-server
+//                    runs on THAT file, and on nothing else: never the silent fallback to the 1.5B.
+//         A path is "X:\..." or "\\server\share\...", no control character, none of < > " | ? * /, no "." / ".."
+//         segment, no ':' past the drive, at most kModelPathMax bytes (modelPathOk). A malformed one refuses the WHOLE
+//         FILE (one FDONE error), like a malformed `audio`. The files are the user's, REFERENCED IN PLACE (never copied).
+//     The engine checks each named file BEFORE anything loads: it is there, and its HEADER is of the right kind --
+//     modelKindOfHeader below, the ONE classifier both ends use (the app sorts an import with it): never the name.
+//     A named model that is missing, of the wrong kind, or that will not load (GPU or CPU) ends the job with EXACTLY
+//     ONE FDONE error whose sentence BEGINS with kFileModelErrAsr / kFileModelErrMt (then the file's name, quoted, and
+//     why); the app reads which kind with fileModelErrKind and goes back to the default for that kind. A shipping
+//     model's failure never begins so ("ASR model missing: ...", as before). FPROG's asrModel / mtModel (and STATE's
+//     during the job) name the FILE (its leaf), never its folder. The live path never reads these fields (its presets).
+//
+//   TRANSCRIPTION -- THE VOICE PASS (wave U3, 2026-11-02). The user: "un deuxieme bouton pour la Transcription", "les locuteurs
+//   reconnus a la voix". A transcript is the ANALYSIS' original text -- the FCUE `src` of a FILE job, which does not change -- and
+//   its speakers are named by a separate, cheap JOB run once that analysis is complete: the VOICE PASS. It decodes the same sound
+//   track again, computes ONE voiceprint per piece of the transcript and clusters them all at once (the engine's TrSpeaker.h
+//   clusterOffline). FILE / FCUE / FDONE of an analysis are byte for byte what they were.
+//   App -> engine:
+//     FVOICE <jobId> <path> <audio> <spans> <changes>
+//         jobId   = from the app's ONE counter (FILE, FPROXY and FVOICE ids never collide), > 0
+//         path    = the media, absolute, UTF-8 (as FILE's)
+//         audio   = "" | "<ord>:<trackId>" -- the sound track the ANALYSIS was made on (parseAudioSel, as FILE's `audio`)
+//         spans   = packRanges "s-e,s-e,..." in ms: the transcript's PIECES in start order -- a cue, or one LINE of a cue that
+//                   holds a dialogue exchange (its dialogue dashes, split by the app) -- ascending, non-overlapping (touching
+//                   allowed), 1..kVoiceSpanMax of them
+//         changes = "" | "i,j,..." -- the 0-based indexes, ascending, each in 1..n-1, of the spans that are a KNOWN CHANGE of
+//                   speaker from the span before them (a dialogue dash's next line): such a span is never given the label of
+//                   the span before it. A line of 4 fields reads none.
+//         A JOB sharing the FILE jobs' ONE slot and queue: an FVOICE ends a running FILE or FVOICE (its FDONE "cancelled") and a
+//         FILE ends a running FVOICE, in the wire's order; FCANCEL <jobId> stops it at its next step; QUIT and LIVE 1 end it
+//         "cancelled"; during the live (and its drain) it is refused with exactly one FDONE error, as a FILE is. One that does not
+//         parse (no path; an `audio`, `spans` or `changes` that does not; no span; more than kVoiceSpanMax) is refused WHOLE with
+//         exactly one FDONE error saying why -- and, like a malformed FILE, it still ends the running job.
+//   Engine -> app:
+//     FPROG <jobId> voices <doneMs> <totalMs> "" "" <hasVideo> ""
+//         phase "voices" (a value FPROG did not have): doneMs = the end of the last piece heard, totalMs = the file's duration
+//         (0 = unknown). About once a second.
+//     FSPK <jobId> <speakers> <labels> <model>
+//         EXACTLY ONCE per FVOICE that ends ok, right before its FDONE.
+//         speakers = 0..kVoiceSpeakersMax; 0 = no names (the speaker stage is off, or failed: <model> says why)
+//         labels   = "" when speakers is 0; else one decimal per span of the FVOICE, comma-separated, in span order: 0 = no voice
+//                    named for that piece (the app's attach rule), 1..speakers = the speaker, numbered in order of FIRST
+//                    APPEARANCE (every number used)
+//         model    = the stage's tag ("campplus") when speakers > 0; else ONE human sentence: why there are no names
+//     FDONE <jobId> ok|cancelled|error <count> <err>
+//         As a FILE's: exactly one per FVOICE, the last message of its job; count = the pieces given a label.
+//   STATE says "analyzing" while an FVOICE runs (its model fields untouched: no server is involved).
+//
+//   SUVTITLE LIVE (1.1.0, 2026-10-25) -- the LIVE translator came back from AudioPB (the user, 24/10: "la traduction
+//   quitte AudioPB, live compris"), minus the fabric: the engine now CAPTURES the audio itself (WASAPI: an input, the
+//   loopback of an output, one application -- engine/TrCaptureApi.h) and the app says which inputs, and when. Every
+//   LIVE-half description above (LINE / PART / END, THE SEQUENCE, STATE's spk fields, CTL clear) applies again as
+//   written, with "cable" read as "input" and "the tray" as SuVtitle.exe. Live and a FILE job NEVER run at the same
+//   time (the user, 24/10: "on ne fait pas tourner les deux ensemble"): the engine is in ONE of three modes, idle |
+//   live | file, and the live one wins -- starting it cancels a job, a FILE during it is refused.
+//   App -> engine:
+//     LIVE <on> [<n> {<key> <label> <chan> <gainDb>} x n]
+//         on=1: start the live path on these n inputs (1..kMaxLiveInputs), or REPLACE the running set: an input whose
+//               {key, chan, gainDb} did not move keeps running untouched; a new label only renames the lines that
+//               FOLLOW. A FILE job in flight is cancelled first (its FDONE says "cancelled"; its ranges stand, so the
+//               app resumes it after the live). n = 0, n > kMaxLiveInputs or any malformed input refuses the WHOLE
+//               message (unpackLive): STATE err says why and the live state does not change.
+//         on=0: stop listening, then FINISH (n = 0 or absent; director, 26/10, RVA-1): the capture stops at once (the
+//               devices are released), the open utterance is cut when it is long enough to be a sentence, every final
+//               already queued is processed (LINEs as usual, no new drafts), an utterance partly sent with nothing more
+//               gets its END -- and only then STATE live 0. live stays 1 during that drain; a LIVE 1 meanwhile resumes
+//               the capture; a FILE meanwhile is refused as during the live. QUIT does not drain.
+//         key    = the input's stable key, as SRC listed it: "in:<endpoint id>" | "out:<endpoint id>" |
+//                  "app:<exe file name>" | "wav:<path>[@opt...]" (a TEST engine only: a selftest, --cpu) |
+//                  "ain:..." (reserved for AudioIn, the AudioPB link -- a later wave; refused until then)
+//         label  = the strip's name, the speaker's name on screen (<= kLiveLabelMax bytes of UTF-8): display only,
+//                  never part of a key
+//         chan   = 0: the MIX, the sum of the device's channels (AudioPB's mono rule: a voice centred in stereo reads
+//                  +6 dB, which is what the VAD's -38 dBFS gate was calibrated on) | 1..kLiveMaxChan: that channel alone
+//         gainDb = the strip's trim, kLiveGainMinDb..kLiveGainMaxDb, applied BEFORE the mix and before the per-input
+//                  energy that names the speaker
+//         The same key may appear twice only with two different channels >= 1 (one interface, two people: "canal 1
+//         = moi, canal 2 = l'invite"); never twice with one channel, never next to its own mix.
+//         Idempotent. The app's supervisor re-sends the wanted LIVE after a respawn, as it re-sends the pair.
+//     SRCLIST
+//         "Send me the source list." Answered by SRC lines + one SRCEND; from then on a CHANGED list (a device plugged
+//         in or out, an application starting or ending its sound) is pushed again on its own, coalesced.
+//   Engine -> app:
+//     SRC <gen> <kind> <key> <label> <state> <rate> <ch> <flags>
+//         kind  = in | out | app            (wav and ain are never listed)
+//         state = ok | absent | busy | denied | unsupported   (unsupported = application capture on a Windows older
+//                 than 10.0.20348, where the process-loopback API does not exist)
+//         rate/ch = the device's mix format (0 = unknown; an application: the format the engine captures it in)
+//         flags = a comma list of: default (Windows' default device of its kind) | comm (the default COMMUNICATIONS
+//                 device); "" = none
+//     SRCEND <gen> <n>     closes list `gen` (n = how many SRC lines it held: a reader that counted fewer lost some and
+//                          asks again). A newer gen supersedes every older one, whole.
+//     INPUT <key> <state> <why>
+//         state = open | absent | busy | denied | unsupported | stalled | error; why = "" or one human sentence.
+//         Sent on every CHANGE of a live input's state, never repeated. A failing input never stops the others: it
+//         falls silent and says so here.
+//     LEVELS <lane> <dbfs> [<lane> <dbfs> ...]   (lane = liveLaneId(key, chan): see LANES below)
+//         ~5 Hz while the live path runs, nothing otherwise: each input's PEAK over the last ~200 ms after its trim,
+//         in dBFS with one decimal (-120 = silence). Droppable by design: the newest wins.
+//     STATE gains [<live> [<liveMode> <liveLangA> <liveLangB>]] after langB:
+//         live    = 1 while the live path runs. `status` keeps its meaning: listening (idle, or live and quiet) |
+//                   transcribing | analyzing (a FILE job) | loading | error
+//         liveMode/liveLangA/liveLangB = the LIVE pair, which is NOT the player's (the user, 25/10: "une paire par
+//                   mode"): mode/langA/langB above stay the pair the PLAYER's FILE jobs use.
+//     LINE: unchanged on the wire. spkSlot now carries the LANE ID of the dominant strip (liveLaneId below; in AudioPB it
+//         was the fabric slot name of the dominant cable); the app turns it into that strip's label and colour.
+//   LANES (director, 25/10, request R1): a STRIP is named on the wire by its LANE ID = liveLaneId(key, chan) -- the key
+//     alone for a mix strip, "<key>|<chan>" for a one-channel strip -- in LINE.spkSlot and LEVELS, so two strips on two
+//     channels of one device never share a speaker nor a meter. INPUT stays keyed by the DEVICE key: a device's state is
+//     the state of every strip on it.
+//   CTL gains [<scope>] after langB:
+//     CTL <mode> <preset> <clear> [<langA> <langB> [<scope>]]
+//         scope = "" | file: mode / langA / langB are the PLAYER's (exactly as before) | live: they are the LIVE pair.
+//         Any other scope makes the engine IGNORE the whole CTL (a live pair applied to the films by mistake would
+//         re-key their cache). preset is ONE setting whatever the scope (the live draft/final pair; a FILE job's model
+//         when turbo is missing). clear acts on the live path, the only one with a queue.
+//
 // A message neither side understands is IGNORED, never answered: silence on this
 // pipe is normal (nobody is talking), so it can never be a failure signal. The
 // supervisor's watchdog is the CHILD PROCESS DYING, not a missing reply.
@@ -423,6 +551,10 @@ struct WireState {
     // truthful answer rather than an empty one.
     std::string langA = "en";
     std::string langB = "zh";
+    // SUVTITLE LIVE (1.1.0): is the live path running, and on which pair. EMPTY live pair = "not reported" (an engine
+    // without the live mode), never a language: the app keeps what it asked for rather than inventing one.
+    bool        live = false;
+    std::string liveMode, liveLangA, liveLangB;
 };
 
 inline std::string packState(const WireState& s) {
@@ -431,7 +563,9 @@ inline std::string packState(const WireState& s) {
          + "\t" + (s.gpu ? "1" : "0") + "\t" + esc(s.err)
          + "\t" + (s.spkOn ? "1" : "0") + "\t" + esc(s.spkModel)
          + "\t" + std::to_string(s.spkCount)
-         + "\t" + esc(s.langA) + "\t" + esc(s.langB);
+         + "\t" + esc(s.langA) + "\t" + esc(s.langB)
+         + "\t" + (s.live ? "1" : "0")
+         + "\t" + esc(s.liveMode) + "\t" + esc(s.liveLangA) + "\t" + esc(s.liveLangB);
 }
 
 inline bool unpackState(const std::vector<std::string>& t, WireState& s) {
@@ -450,6 +584,11 @@ inline bool unpackState(const std::vector<std::string>& t, WireState& s) {
     // an empty language code is not a fact about this session, it is an absence of one.
     if (t.size() >= 12 && !t[11].empty()) s.langA = unesc(t[11]);
     if (t.size() >= 13 && !t[12].empty()) s.langB = unesc(t[12]);
+    // SUVTITLE LIVE: four more optional fields. Missing = an engine without the live mode: not running, no live pair.
+    s.live      = (t.size() >= 14 && t[13] == "1");
+    s.liveMode  = (t.size() >= 15) ? unesc(t[14]) : std::string();
+    s.liveLangA = (t.size() >= 16) ? unesc(t[15]) : std::string();
+    s.liveLangB = (t.size() >= 17) ? unesc(t[16]) : std::string();
     return true;
 }
 
@@ -574,11 +713,19 @@ struct WireCtl {
     bool        clear = false;
     std::string langA;    // "" = unchanged, else a canonical code (ISO-639-1 or "zh-tw")
     std::string langB;
+    // SUVTITLE LIVE (1.1.0): WHOSE mode and pair -- "" or "file" = the player's (every CTL before 1.1.0), "live" = the
+    // live path's (kCtlScopeLive). An unknown scope is the reader's to ignore whole: see the protocol block.
+    std::string scope;
 };
 
+inline constexpr char kCtlScopeFile[] = "file";
+inline constexpr char kCtlScopeLive[] = "live";
+
 inline std::string packCtl(const WireCtl& c) {
-    return "CTL\t" + esc(c.mode) + "\t" + esc(c.preset) + "\t" + (c.clear ? "1" : "0")
-         + "\t" + esc(c.langA) + "\t" + esc(c.langB);
+    std::string o = "CTL\t" + esc(c.mode) + "\t" + esc(c.preset) + "\t" + (c.clear ? "1" : "0")
+                  + "\t" + esc(c.langA) + "\t" + esc(c.langB);
+    if (!c.scope.empty()) o += "\t" + esc(c.scope);   // appended only when it says something: a player CTL is unchanged
+    return o;
 }
 
 inline bool unpackCtl(const std::vector<std::string>& t, WireCtl& c) {
@@ -596,6 +743,195 @@ inline bool unpackCtl(const std::vector<std::string>& t, WireCtl& c) {
     else if (c.mode == "zh2en") c.mode = "b2a";
     c.langA  = (t.size() >= 5) ? unesc(t[4]) : std::string();
     c.langB  = (t.size() >= 6) ? unesc(t[5]) : std::string();
+    c.scope  = (t.size() >= 7) ? unesc(t[6]) : std::string();
+    return true;
+}
+
+// Is this CTL about the LIVE pair? false for "" and "file"; ctlScopeKnown says whether the reader may act on it at all.
+inline bool ctlIsLive(const WireCtl& c)     { return c.scope == kCtlScopeLive; }
+inline bool ctlScopeKnown(const WireCtl& c) { return c.scope.empty() || c.scope == kCtlScopeFile || c.scope == kCtlScopeLive; }
+
+// ---- SUVTITLE LIVE (1.1.0): LIVE / SRCLIST / SRC / SRCEND / INPUT / LEVELS ----------------------------------------
+// The live path's own messages (the protocol block above). Packed and unpacked HERE, like every other message, so the
+// app and the engine cannot disagree about a field's position. The parsers are STRICT where a wrong reading would do
+// harm (LIVE: capturing the wrong device, or the right one at the wrong gain, is worse than not starting) and LENIENT
+// where a reader can only lose information it would have displayed (SRC, LEVELS).
+inline constexpr uint32_t kMaxLiveInputs = 4;     // strips at once (the user, 25/10: "jusqu'a 4")
+inline constexpr size_t   kLiveKeyMax    = 512;   // bytes; an endpoint id is ~60, a test WAV path can be long
+inline constexpr size_t   kLiveLabelMax  = 64;    // bytes of UTF-8
+inline constexpr uint32_t kLiveMaxChan   = 8;     // channel 1..8 of a device; 0 = the mix
+inline constexpr double   kLiveGainMinDb = -24.0;
+inline constexpr double   kLiveGainMaxDb = 24.0;
+
+// The kinds a key may start with. ain: is RESERVED (AudioIn, a later wave) and refused by liveKeyKind until it exists.
+inline std::string liveKeyKind(const std::string& key) {
+    static const char* const kinds[] = { "in", "out", "app", "wav" };
+    const size_t colon = key.find(':');
+    if (colon == std::string::npos || colon + 1 >= key.size()) return {};
+    const std::string k = key.substr(0, colon);
+    for (const char* x : kinds) if (k == x) return k;
+    return {};
+}
+
+struct WireLiveInput {
+    std::string key;            // in:<id> | out:<id> | app:<exe> | wav:<path>[@opt...]
+    std::string label;          // the strip's name, display only
+    uint32_t    chan = 0;       // 0 = the mix, 1..kLiveMaxChan = that channel
+    double      gainDb = 0.0;   // the trim
+};
+
+// The name of ONE strip on the wire (LINE.spkSlot, LEVELS -- see LANES in the protocol block): its key alone for a mix
+// strip, "<key>|<chan>" for a one-channel strip. '|' cannot occur in a key: an endpoint id has none, and Windows refuses
+// it in a file name and a path (app: and wav: keys). BUILT on both ends from {key, chan}, never parsed back.
+inline std::string liveLaneId(const std::string& key, uint32_t chan) {
+    return chan ? key + "|" + std::to_string(chan) : key;
+}
+
+struct WireLive {
+    bool                       on = false;
+    std::vector<WireLiveInput> inputs;   // empty when on == false
+};
+
+inline std::string fmtGainDb(double g) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "%.1f", g);
+    return b;
+}
+
+inline std::string packLive(const WireLive& l) {
+    std::string o = std::string("LIVE\t") + (l.on ? "1" : "0") + "\t" + std::to_string(l.on ? l.inputs.size() : 0);
+    if (l.on)
+        for (const WireLiveInput& in : l.inputs)
+            o += "\t" + esc(in.key) + "\t" + esc(in.label) + "\t" + std::to_string(in.chan) + "\t" + fmtGainDb(in.gainDb);
+    return o;
+}
+
+// STRICT, and whole-or-nothing: false = the message is refused and the live state must not change. Checks the count,
+// every field's range, the key's kind, and the "same key twice" rule (two different channels >= 1 only).
+inline bool unpackLive(const std::vector<std::string>& t, WireLive& l) {
+    l = WireLive{};
+    if (t.size() < 2 || t[0] != "LIVE") return false;
+    if (t[1] != "0" && t[1] != "1") return false;
+    l.on = (t[1] == "1");
+    if (!l.on) return t.size() == 2 || (t.size() == 3 && t[2] == "0");
+    if (t.size() < 3 || t[2].empty() || t[2].size() > 2) return false;
+    for (char c : t[2]) if (c < '0' || c > '9') return false;
+    const size_t n = (size_t)std::strtoul(t[2].c_str(), nullptr, 10);
+    if (n < 1 || n > kMaxLiveInputs || t.size() != 3 + 4 * n) return false;
+    for (size_t i = 0; i < n; ++i) {
+        WireLiveInput in;
+        in.key   = unesc(t[3 + 4 * i]);
+        in.label = unesc(t[4 + 4 * i]);
+        const std::string& ch = t[5 + 4 * i];
+        const std::string& gn = t[6 + 4 * i];
+        if (in.key.empty() || in.key.size() > kLiveKeyMax || liveKeyKind(in.key).empty()) return false;
+        // '|' is the LANE separator (liveLaneId): "in:X|1" next to "in:X" channel 1 would name two strips alike.
+        if (in.key.find('|') != std::string::npos) return false;
+        if (in.label.size() > kLiveLabelMax) return false;
+        if (ch.empty() || ch.size() > 1 || ch[0] < '0' || ch[0] > '9') return false;
+        in.chan = (uint32_t)(ch[0] - '0');
+        if (in.chan > kLiveMaxChan) return false;
+        char* end = nullptr;
+        in.gainDb = std::strtod(gn.c_str(), &end);
+        if (gn.empty() || !end || *end != '\0' || !(in.gainDb >= kLiveGainMinDb && in.gainDb <= kLiveGainMaxDb)) return false;
+        for (const WireLiveInput& o : l.inputs)
+            if (o.key == in.key && (o.chan == in.chan || o.chan == 0 || in.chan == 0)) return false;
+        l.inputs.push_back(in);
+    }
+    return true;
+}
+
+inline std::string packSrcList() { return "SRCLIST"; }
+inline bool isSrcList(const std::vector<std::string>& t) { return !t.empty() && t[0] == "SRCLIST"; }
+
+struct WireSrc {
+    uint32_t    gen = 0;
+    std::string kind;           // in | out | app
+    std::string key;
+    std::string label;          // the device's friendly name / the application's description
+    std::string state;          // ok | absent | busy | denied | unsupported
+    uint32_t    rate = 0;       // 0 = unknown
+    uint32_t    ch = 0;
+    std::string flags;          // "default", "comm", "default,comm" or ""
+};
+
+inline std::string packSrc(const WireSrc& s) {
+    return "SRC\t" + std::to_string(s.gen) + "\t" + esc(s.kind) + "\t" + esc(s.key) + "\t" + esc(s.label)
+         + "\t" + esc(s.state) + "\t" + std::to_string(s.rate) + "\t" + std::to_string(s.ch) + "\t" + esc(s.flags);
+}
+
+inline bool unpackSrc(const std::vector<std::string>& t, WireSrc& s) {
+    if (t.size() < 6 || t[0] != "SRC") return false;
+    s.gen   = (uint32_t)std::strtoul(t[1].c_str(), nullptr, 10);
+    s.kind  = unesc(t[2]);
+    s.key   = unesc(t[3]);
+    s.label = unesc(t[4]);
+    s.state = unesc(t[5]);
+    s.rate  = (t.size() >= 7) ? (uint32_t)std::strtoul(t[6].c_str(), nullptr, 10) : 0u;
+    s.ch    = (t.size() >= 8) ? (uint32_t)std::strtoul(t[7].c_str(), nullptr, 10) : 0u;
+    s.flags = (t.size() >= 9) ? unesc(t[8]) : std::string();
+    return s.gen != 0 && !s.key.empty();
+}
+
+struct WireSrcEnd { uint32_t gen = 0; uint32_t n = 0; };
+
+inline std::string packSrcEnd(const WireSrcEnd& e) {
+    return "SRCEND\t" + std::to_string(e.gen) + "\t" + std::to_string(e.n);
+}
+
+inline bool unpackSrcEnd(const std::vector<std::string>& t, WireSrcEnd& e) {
+    if (t.size() < 3 || t[0] != "SRCEND") return false;
+    e.gen = (uint32_t)std::strtoul(t[1].c_str(), nullptr, 10);
+    e.n   = (uint32_t)std::strtoul(t[2].c_str(), nullptr, 10);
+    return e.gen != 0;
+}
+
+struct WireInput {
+    std::string key;
+    std::string state;          // open | absent | busy | denied | unsupported | stalled | error
+    std::string why;            // "" or one human sentence
+};
+
+inline std::string packInput(const WireInput& i) {
+    return "INPUT\t" + esc(i.key) + "\t" + esc(i.state) + "\t" + esc(i.why);
+}
+
+inline bool unpackInput(const std::vector<std::string>& t, WireInput& i) {
+    if (t.size() < 3 || t[0] != "INPUT") return false;
+    i.key   = unesc(t[1]);
+    i.state = unesc(t[2]);
+    i.why   = (t.size() >= 4) ? unesc(t[3]) : std::string();
+    return !i.key.empty() && !i.state.empty();
+}
+
+struct WireLevels {
+    std::vector<std::pair<std::string, float>> peaks;   // {lane id (liveLaneId), peak dBFS}
+};
+
+inline std::string packLevels(const WireLevels& l) {
+    std::string o = "LEVELS";
+    for (const auto& p : l.peaks) {
+        char b[32];
+        std::snprintf(b, sizeof(b), "%.1f", (double)p.second);
+        o += "\t" + esc(p.first) + "\t" + b;
+    }
+    return o;
+}
+
+// LENIENT: a pair it cannot read is skipped (a meter that misses one tick is not a fault); values are clamped to
+// [-120, +24] dBFS so a malformed number can never drive a meter off its scale.
+inline bool unpackLevels(const std::vector<std::string>& t, WireLevels& l) {
+    l.peaks.clear();
+    if (t.empty() || t[0] != "LEVELS") return false;
+    for (size_t i = 1; i + 1 < t.size(); i += 2) {
+        const std::string key = unesc(t[i]);
+        char* end = nullptr;
+        double v = std::strtod(t[i + 1].c_str(), &end);
+        if (key.empty() || t[i + 1].empty() || !end || *end != '\0' || !(v == v)) continue;
+        if (v < -120.0) v = -120.0;
+        if (v > 24.0)   v = 24.0;
+        l.peaks.push_back({ key, (float)v });
+    }
     return true;
 }
 
@@ -685,6 +1021,7 @@ struct WireFile {
     std::string have;              // v2: packRanges() of what is already subtitled; "" = none
     uint64_t    focusMs = 0;       // v2: where the playhead is
     std::string audio;             // WH: "" = the first sound track; else "<ord>:<trackId>" (packAudioSel)
+    std::string asrModel, mtModel; // U2: "" = the shipping choice; else an imported model's ABSOLUTE path (modelPathOk)
 };
 
 // WH: the sound track a FILE analyses. ord = 0-based among the container's sound tracks (container
@@ -710,11 +1047,119 @@ inline bool parseAudioSel(const std::string& s, AudioSel& out) {
     return true;
 }
 
+// ---- U2: THE USER'S OWN MODELS (see the protocol block: FILE's asrModel / mtModel) ------------------------------------
+// An imported model's path -- STRICT like parseAudioSel: ABSOLUTE ("X:\..." or "\\server\share\..."), backslashes only, no
+// control character, none of < > " | ? * (the '?' also refuses "\\?\" device paths), no "." / ".." segment (a path that
+// climbs), no ':' past the drive (an alternate stream), not a folder ("...\"), at most kModelPathMax bytes. A relative
+// path would be read wherever the engine happens to stand.
+inline constexpr size_t kModelPathMax = 1024;
+inline bool modelPathOk(const std::string& p) {
+    if (p.size() < 4 || p.size() > kModelPathMax) return false;
+    for (unsigned char c : p)
+        if (c < 0x20 || c == 0x7f || c == '<' || c == '>' || c == '"' || c == '|' || c == '?' || c == '*' || c == '/')
+            return false;
+    const bool drive = ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':' && p[2] == '\\';
+    const bool unc = p[0] == '\\' && p[1] == '\\' && p[2] != '\\' && p[2] != '.';
+    if (!drive && !unc) return false;
+    if (p.find(':', 2) != std::string::npos || p.back() == '\\') return false;
+    size_t at = drive ? 3 : 2;
+    while (at <= p.size()) {                                   // every segment: not empty, not "." nor ".."
+        const size_t sl = p.find('\\', at);
+        const std::string seg = p.substr(at, sl == std::string::npos ? std::string::npos : sl - at);
+        if (seg.empty() || seg == "." || seg == "..") return false;
+        if (sl == std::string::npos) break;
+        at = sl + 1;
+    }
+    return true;
+}
+inline bool modelFieldOk(const std::string& p) { return p.empty() || modelPathOk(p); }
+
+// WHAT A MODEL FILE IS, from its first kModelHeadBytes bytes -- never from its name (the director's rule):
+//   Asr = a whisper.cpp model: magic 0x67676d6c ("ggml", little-endian), then its 11 int32 hyper-parameters and its mel
+//         filters' sizes. The SAME magic began the first llama.cpp files, so the values are checked against what a whisper
+//         model can only be: an audio context of 1500, a text context of 448, 80 or 128 mels (and the filters' n_mel the
+//         same, n_fft 201), audio and text halves of one width and head count, 1-64 layers, a vocabulary of 51 000-60 000.
+//   Mt  = a GGUF (llama.cpp's format): "GGUF", version 2 or 3 (llama.cpp reads no other), 1..2^20 tensors and 1..2^20
+//         metadata keys. Whether llama.cpp can RUN it (its architecture) is the load's to say: a GGUF that will not load
+//         is one FDONE error naming it, like any imported model that fails.
+//   None = anything else, a file cut short before its header ends included; `why` (optional) says which, in words that
+//         end a sentence ("the file ... could not be used: <why>").
+enum class ModelKind { None, Asr, Mt };
+inline constexpr size_t kModelHeadBytes = 64;
+inline ModelKind modelKindOfHeader(const unsigned char* p, size_t n, std::string* why = nullptr) {
+    auto le32 = [p](size_t o) {
+        return (uint32_t)p[o] | ((uint32_t)p[o + 1] << 8) | ((uint32_t)p[o + 2] << 16) | ((uint32_t)p[o + 3] << 24);
+    };
+    auto le64 = [&](size_t o) { return (uint64_t)le32(o) | ((uint64_t)le32(o + 4) << 32); };
+    auto none = [why](const char* w) { if (why) *why = w; return ModelKind::None; };
+    if (n < 4) return none("the file is cut short (no header)");
+    if (p[0] == 'G' && p[1] == 'G' && p[2] == 'U' && p[3] == 'F') {
+        if (n < 24) return none("the file is cut short (its GGUF header ends early)");
+        const uint32_t v = le32(4);
+        if (v != 2 && v != 3) return none("it is a GGUF of a version llama.cpp does not read");
+        const uint64_t tensors = le64(8), keys = le64(16);
+        if (tensors == 0 || tensors > (1ull << 20) || keys == 0 || keys > (1ull << 20))
+            return none("its GGUF header is damaged");
+        return ModelKind::Mt;
+    }
+    if (le32(0) == 0x67676d6cu) {
+        if (n < 56) return none("the file is cut short (its whisper.cpp header ends early)");
+        int32_t h[13];
+        for (size_t i = 0; i < 13; ++i) h[i] = (int32_t)le32(4 + 4 * i);
+        // n_vocab, n_audio_ctx, n_audio_state, n_audio_head, n_audio_layer, n_text_ctx, n_text_state, n_text_head,
+        // n_text_layer, n_mels, ftype -- then the mel filters' n_mel and n_fft
+        const bool ok = h[0] >= 51000 && h[0] <= 60000 && h[1] == 1500 && h[5] == 448
+                     && h[2] >= 64 && h[2] <= 8192 && h[6] == h[2] && h[3] >= 1 && h[3] <= 64 && h[7] == h[3]
+                     && h[4] >= 1 && h[4] <= 64 && h[8] >= 1 && h[8] <= 64
+                     && (h[9] == 80 || h[9] == 128) && h[11] == h[9] && h[12] == 201 && h[10] >= 0;
+        if (!ok) return none("it is a ggml file, but not a whisper.cpp model");
+        return ModelKind::Asr;
+    }
+    if (p[2] == 'g' && p[3] == 'g') return none("it is an older ggml file (llama.cpp's first formats), not a whisper.cpp model");
+    return none("it is neither a whisper.cpp model (.bin) nor a GGUF model (.gguf)");
+}
+// The kind of the FILE at `path` (its first bytes, read shared -- the user may have it open). A file that cannot be opened
+// is None, `why` = "the file is not there"; a folder is None too. Both ends call it: the app on an import and a pick, the
+// engine on every FILE that names a model.
+inline ModelKind modelFileKind(const std::wstring& path, std::string* why = nullptr) {
+    const DWORD at = ::GetFileAttributesW(path.c_str());
+    if (at == INVALID_FILE_ATTRIBUTES || (at & FILE_ATTRIBUTE_DIRECTORY)) {
+        if (why) *why = "the file is not there";
+        return ModelKind::None;
+    }
+    HANDLE h = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        if (why) *why = "the file could not be opened";
+        return ModelKind::None;
+    }
+    unsigned char head[kModelHeadBytes] = {};
+    DWORD got = 0;
+    const BOOL rd = ::ReadFile(h, head, (DWORD)sizeof(head), &got, nullptr);
+    ::CloseHandle(h);
+    if (!rd) {
+        if (why) *why = "the file could not be read";
+        return ModelKind::None;
+    }
+    return modelKindOfHeader(head, got, why);
+}
+// An FDONE error about an IMPORTED model BEGINS with one of these, then the file's name and why it failed -- the app falls
+// back to the default for THAT kind (fileModelErrKind: "asr" | "mt" | "" = not an imported model's failure).
+inline const char* const kFileModelErrAsr = "The transcription model \"";
+inline const char* const kFileModelErrMt  = "The translation model \"";
+inline std::string fileModelErrKind(const std::string& err) {
+    if (err.rfind(kFileModelErrAsr, 0) == 0) return "asr";
+    if (err.rfind(kFileModelErrMt, 0) == 0) return "mt";
+    return std::string();
+}
+
 inline std::string packFile(const WireFile& f) {
     std::string o = "FILE\t" + std::to_string(f.jobId) + "\t" + esc(f.path) + "\t" + esc(f.langA)
                   + "\t" + esc(f.langB) + "\t" + esc(f.mode) + "\t" + esc(f.quality)
                   + "\t" + esc(f.have) + "\t" + std::to_string(f.focusMs);
-    if (!f.audio.empty()) o += "\t" + esc(f.audio);   // WH: appended only when it says something
+    const bool models = !f.asrModel.empty() || !f.mtModel.empty();
+    if (!f.audio.empty() || models) o += "\t" + esc(f.audio);   // WH: appended only when it says something (or U2 follows)
+    if (models) o += "\t" + esc(f.asrModel) + "\t" + esc(f.mtModel);   // U2: only when a model is named
     return o;
 }
 
@@ -729,13 +1174,17 @@ inline bool unpackFile(const std::vector<std::string>& t, WireFile& f) {
     f.have    = (t.size() >= 8) ? unesc(t[7]) : std::string();
     f.focusMs = (t.size() >= 9) ? ::_strtoui64(t[8].c_str(), nullptr, 10) : 0ull;
     f.audio   = (t.size() >= 10) ? unesc(t[9]) : std::string();
+    f.asrModel = (t.size() >= 11) ? unesc(t[10]) : std::string();   // U2
+    f.mtModel  = (t.size() >= 12) ? unesc(t[11]) : std::string();   // U2
     // A `have` that does not parse is a refusal of the whole FILE, not "none": analysing a film
     // the tray believes half-done from scratch is merely slow, but the opposite mistake -- a
     // reader that skips what it cannot read -- leaves holes nobody will ever fill. The same for
-    // a malformed `audio` (WH): the wrong sound track would be subtitles of another dialogue.
+    // a malformed `audio` (WH): the wrong sound track would be subtitles of another dialogue. And
+    // for a malformed model path (U2): the job would run on a model nobody chose.
     std::vector<MsRange> chk;
     AudioSel a;
-    return f.jobId != 0 && !f.path.empty() && parseRanges(f.have, chk) && parseAudioSel(f.audio, a);
+    return f.jobId != 0 && !f.path.empty() && parseRanges(f.have, chk) && parseAudioSel(f.audio, a)
+        && modelFieldOk(f.asrModel) && modelFieldOk(f.mtModel);
 }
 
 // v2: the playhead moved. One number, and stale ids are the reader's to drop.
@@ -880,6 +1329,122 @@ inline bool unpackProxyDone(const std::vector<std::string>& t, WireProxyDone& d)
     d.out   = unesc(t[3]);
     d.err   = (t.size() >= 5) ? unesc(t[4]) : std::string();
     return d.jobId != 0;
+}
+
+// ---- U3: THE VOICE PASS (see the protocol block: FVOICE / FSPK) -------------------------------------------------------------
+// The transcript's speakers. An FVOICE names the PIECES of a finished analysis' transcript (its cues; the lines of a cue that
+// holds a dialogue exchange) and the engine answers ONE label per piece (FSPK). Parsed STRICTLY at both ends, like FILE's
+// fields: a list read half-way would name the wrong people.
+inline constexpr size_t   kVoiceSpanMax     = 20000;   // pieces an FVOICE may name (a 6 h recording's cues, with room)
+inline constexpr uint32_t kVoiceSpeakersMax = 64;      // FSPK's ceiling (engine.txt SPKMAX stays far below it)
+
+struct WireVoice {
+    uint64_t    jobId = 0;
+    std::string path;              // the media, absolute, UTF-8
+    std::string audio;             // "" = the first sound track; else "<ord>:<trackId>" (packAudioSel): the analysis' track
+    std::string spans;             // packRanges(): the pieces in start order (ms), touching allowed
+    std::string changes;           // packChanges(): the pieces that are a KNOWN change of speaker from the piece before
+};
+
+inline std::string packChanges(const std::vector<uint32_t>& c) {
+    std::string o;
+    for (uint32_t i : c) {
+        if (!o.empty()) o += ',';
+        o += std::to_string(i);
+    }
+    return o;
+}
+
+// STRICT, like parseRanges: "" = none; else decimal indexes (1-9 digits), comma-separated, strictly ascending, each in
+// 1..n-1 -- n = the span count (the first piece has no predecessor to differ from).
+inline bool parseChanges(const std::string& s, size_t n, std::vector<uint32_t>& out) {
+    out.clear();
+    if (s.empty()) return true;
+    size_t at = 0;
+    while (at <= s.size()) {
+        const size_t comma = s.find(',', at);
+        const std::string one = s.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+        if (one.empty() || one.size() > 9) { out.clear(); return false; }
+        for (char c : one) if (c < '0' || c > '9') { out.clear(); return false; }
+        const uint32_t v = (uint32_t)std::strtoul(one.c_str(), nullptr, 10);
+        if (v < 1 || (size_t)v >= n || (!out.empty() && v <= out.back())) { out.clear(); return false; }
+        out.push_back(v);
+        if (comma == std::string::npos) break;
+        at = comma + 1;
+    }
+    return true;
+}
+
+inline std::string packVoice(const WireVoice& v) {
+    return "FVOICE\t" + std::to_string(v.jobId) + "\t" + esc(v.path) + "\t" + esc(v.audio)
+         + "\t" + esc(v.spans) + "\t" + esc(v.changes);
+}
+
+// A job id, a path, a sound track that parses, 1..kVoiceSpanMax spans that parse, and changes that parse against them --
+// anything else refuses the WHOLE request (the engine answers its one FDONE error).
+inline bool unpackVoice(const std::vector<std::string>& t, WireVoice& v) {
+    if (t.size() < 5 || t[0] != "FVOICE") return false;
+    v.jobId   = jobIdOf(t[1]);
+    v.path    = unesc(t[2]);
+    v.audio   = unesc(t[3]);
+    v.spans   = unesc(t[4]);
+    v.changes = (t.size() >= 6) ? unesc(t[5]) : std::string();
+    std::vector<MsRange> r;
+    AudioSel a;
+    std::vector<uint32_t> c;
+    return v.jobId != 0 && !v.path.empty() && parseAudioSel(v.audio, a) && parseRanges(v.spans, r)
+        && !r.empty() && r.size() <= kVoiceSpanMax && parseChanges(v.changes, r.size(), c);
+}
+
+struct WireSpk {
+    uint64_t              jobId = 0;
+    uint32_t              speakers = 0;   // 0 = no names
+    std::vector<uint32_t> labels;         // one per span of the FVOICE (0 = none named); empty when speakers is 0
+    std::string           model;          // the stage's tag -- or, with no names, the sentence why
+};
+
+inline std::string packSpk(const WireSpk& s) {
+    std::string l;
+    for (uint32_t x : s.labels) {
+        if (!l.empty()) l += ',';
+        l += std::to_string(x);
+    }
+    return "FSPK\t" + std::to_string(s.jobId) + "\t" + std::to_string(s.speakers) + "\t" + l + "\t" + esc(s.model);
+}
+
+// STRICT: digits only; speakers <= kVoiceSpeakersMax; no label when speakers is 0, at least one otherwise; every label <=
+// speakers and every number 1..speakers used (they are numbered in order of first appearance).
+inline bool unpackSpk(const std::vector<std::string>& t, WireSpk& s) {
+    s = WireSpk{};
+    if (t.size() < 4 || t[0] != "FSPK") return false;
+    s.jobId = jobIdOf(t[1]);
+    if (t[2].empty() || t[2].size() > 3) return false;
+    for (char c : t[2]) if (c < '0' || c > '9') return false;
+    s.speakers = (uint32_t)std::strtoul(t[2].c_str(), nullptr, 10);
+    if (s.speakers > kVoiceSpeakersMax) return false;
+    const std::string& l = t[3];
+    if (s.speakers == 0) {
+        if (!l.empty()) return false;
+    } else {
+        if (l.empty()) return false;
+        std::vector<char> used(s.speakers + 1, 0);
+        size_t at = 0;
+        while (at <= l.size()) {
+            const size_t comma = l.find(',', at);
+            const std::string one = l.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+            if (one.empty() || one.size() > 3) return false;
+            for (char c : one) if (c < '0' || c > '9') return false;
+            const uint32_t v = (uint32_t)std::strtoul(one.c_str(), nullptr, 10);
+            if (v > s.speakers || s.labels.size() >= kVoiceSpanMax) return false;
+            used[v] = 1;
+            s.labels.push_back(v);
+            if (comma == std::string::npos) break;
+            at = comma + 1;
+        }
+        for (uint32_t k = 1; k <= s.speakers; ++k) if (!used[k]) return false;
+    }
+    s.model = (t.size() >= 5) ? unesc(t[4]) : std::string();
+    return s.jobId != 0;
 }
 
 // ---------------------------------------------------------------------------

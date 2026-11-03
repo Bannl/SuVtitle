@@ -148,15 +148,17 @@ TARGETS = {
             ("RV2-2: stop() cannot end the HELLO wait", "app/TranslatorManager.cpp",
              "tp::readMessage(pipe, hello, kConnectDeadlineMs, &broken, quitEv, &woken)",
              "tp::readMessage(pipe, hello, kConnectDeadlineMs, &broken, nullptr, &woken)"),
+            # (U2b re-point, 02/11/2026: the LIVE wave's supervisor reads the time once per lap -- `now - lastSpawn`; same intent)
             ("RV2-5: a death soon after HELLO is not a failed start (the crash loop says nothing again)", "app/TranslatorManager.cpp",
-             "        if (::GetTickCount64() - lastSpawn < 30000) {\n            failedStart();",
+             "        if (now - lastSpawn < 30000) {\n            failedStart();",
              "        if (false) {\n            failedStart();"),
         ]),
     # WE (player v2): the player's CORE, driven against the fake host (the bridge in a box)
     "player": dict(
         smoke="tests/cpp/player_smoke.cpp", sources=[],
         files=["app/TrPlayer.h", "app/TrWindowState.h", "app/TrFileStore.h", "app/JsonW.h", "common/TrPipe.h",
-               "tests/web/we_vectors.txt", "app/MediaTracks.h", "app/SubtitleReader.h"],
+               "tests/web/we_vectors.txt", "app/MediaTracks.h", "app/SubtitleReader.h",
+               "app/TrTranscript.h", "app/SourceTimecode.h"],   # (U3: TrPlayer.h includes them)
         inc=["common"], libs=["user32.lib", "shlwapi.lib", "ole32.lib"], helper=None,
         copies=[("tests/web/we_vectors.txt", "tests/cpp/we_vectors.txt")],
         mutants=[
@@ -168,13 +170,13 @@ TARGETS = {
              "            const size_t at = (cur_ == npos) ? items_.size() : cur_ + 1;\n"
              "            if (insertItems(at, add) && !firstId) firstId = add.front().id;\n"
              "        }\n"
-             "        if (firstId) loadItem(indexOf(firstId), true, -1);",
+             "        if (firstId) loadItem(indexOf(firstId), true, -1, analyseFirst);",
              "        const size_t stale = firstId ? indexOf(firstId) : npos;\n"
              "        if (!add.empty()) {\n"
              "            const size_t at = (cur_ == npos) ? items_.size() : cur_ + 1;\n"
              "            if (insertItems(at, add) && !firstId) firstId = add.front().id;\n"
              "        }\n"
-             "        if (firstId) loadItem(stale != npos ? stale : indexOf(firstId), true, -1);"),
+             "        if (firstId) loadItem(stale != npos ? stale : indexOf(firstId), true, -1, analyseFirst);"),
             ("C3: two cues TOUCHING by 1 ms taken for an overlap (the resumed run's first cue dropped)", "app/TrPlayer.h",
              "constexpr uint64_t kTouchMs       = 1;", "constexpr uint64_t kTouchMs       = 0;"),
             ("C4: a switch during a reload judged against the OLD page's folders", "app/TrPlayer.h",
@@ -190,8 +192,9 @@ TARGETS = {
              "if (!host_.identity(path, size, mtime)) return false;"),
             ("P8: persist() leaves the running analysis unsaved", "app/TrPlayer.h",
              # (WG: persist() flushes the per-language files and the edits first -- the mutant keeps that, drops the save)
-             "    void persist() {\n        flushFiles();\n        for (Job& j : jobs_) savePartial(*j.set);",
-             "    void persist() {\n        flushFiles();"),
+             # (U2b re-point: the user's answer 02/11 -- G2's flushDocxDue() now follows flushFiles(); the mutant keeps both)
+             "    void persist() {\n        flushFiles();\n        flushDocxDue();                                      // U2b (G2): the last rename never lost\n        for (Job& j : jobs_) savePartial(*j.set);",
+             "    void persist() {\n        flushFiles();\n        flushDocxDue();                                      // U2b (G2): the last rename never lost"),
             ("the latest FPROG trusted at once (no lag: a crash claims a window whose cues may be missing)", "app/TrPlayer.h",
              "S.confirmed = merged(S.confirmed, j->lastProg);\n            j->lastProg = rg;",
              "S.confirmed = merged(S.confirmed, rg);\n            j->lastProg = rg;"),
@@ -201,9 +204,41 @@ TARGETS = {
             ("FFOCUS on every report (the rule bypassed)", "app/TrPlayer.h",
              "if (j && shouldFocus(j->set->ranges, j->set->totalMs ? j->set->totalMs : s_.durMs, ms, s_.lastFocusMs, why)) {",
              "if (j) {"),
-            ("pre-analysis while the current file is still analysed", "app/TrPlayer.h",
-             "if (!shown_ || view_ != \"file\" || !loaded_ || !s_.set || !s_.set->complete) { cancelPre(); return; }",
-             "if (!shown_ || view_ != \"file\" || !loaded_ || !s_.set) { cancelPre(); return; }"),
+            # U1 (02/11/2026, the user: nothing analysed unless asked -- docs/PROGRESS_U1.md); the pre-analysis's mutant went
+            # with it ("pre-analysis while the current file is still analysed": there is no pre-analysis any more)
+            ("U1: a file loaded is analysed by itself (the old switch's rule)", "app/TrPlayer.h",
+             # (U3 re-point: the gate asks EITHER wish now -- analysisWanted)
+             "        if (!analysisWanted()) return;                       // U1: never by itself -- Translate, or \"Translate all\" (U3: or\n                                                             // the transcript's wish: Transcribe, \"Transcribe all\")\n",
+             ""),
+            ("U1: a pressed file goes on being analysed once it is left (only the batch analyses a file not playing)", "app/TrPlayer.h",
+             # (U3 re-point: kept for EITHER batch)
+             "                if ((batchQ_.count(s_.itemId) || tbatchQ_.count(s_.itemId)) && !j->cancelSent) j->pre = true;\n                else cancelJob(*j);",
+             "                j->pre = true;"),
+            ("U1: a QUEUED file left mid-analysis is cancelled (its job restarts later from its partial)", "app/TrPlayer.h",
+             "                if ((batchQ_.count(s_.itemId) || tbatchQ_.count(s_.itemId)) && !j->cancelSent) j->pre = true;",
+             "                if (false) j->pre = true;"),   # (U3 re-point)
+            ("U1: Translate all leaves the playing file out", "app/TrPlayer.h",
+             "            if (it.missing || knownComplete(it)) continue;",
+             "            if (it.missing || knownComplete(it) || (loaded_ && it.id == s_.itemId)) continue;"),
+            ("U1: Cancel all leaves the batch queued (it starts again by itself)", "app/TrPlayer.h",
+             "        for (uint64_t id : batchQ_) batchCancelled_.insert(id);\n        batchQ_.clear();",
+             "        for (uint64_t id : batchQ_) batchCancelled_.insert(id);"),
+            ("U1: a failed batch file retried at once (for ever)", "app/TrPlayer.h",
+             # (U2b re-point: the user's rule 02/11 -- a failure the batch REDOES once with the default model stays queued:
+             #  `failed && !redo`; the mutant keeps every failed file queued, as before)
+             "        if (d.result == \"ok\" || (failed && !redo)) batchFinished(j.set->key, failed);",
+             "        if (d.result == \"ok\") batchFinished(j.set->key, false);"),
+            ("U1: the batch runs while Live listens", "app/TrPlayer.h",
+             "        if (!helper_ || live_) { cancelPre(); return; }   // (SUVTITLE LIVE: the gate, setLive)",
+             "        if (!helper_) { cancelPre(); return; }   // (SUVTITLE LIVE: the gate, setLive)"),
+            ("U1: the press rebuilds the generation (the subtitles on screen re-sent)", "app/TrPlayer.h",
+             "        if (!force && !s_.wire && s_.set && !s_.set->complete && s_.set->key == heardKey()) {",
+             "        if (false) {"),
+            ("U1: a failure no longer asked for reads \"off\" (not the error)", "app/TrPlayer.h",
+             "        if (s_.failed) return \"error\";", "        (void)0;"),
+            ("U1: the queued / cancelled badges never said", "app/TrPlayer.h",
+             "        if (batchQ_.count(it.id)) state = \"queued\";\n        else if (batchCancelled_.count(it.id)) state = \"cancelled\";\n    }",
+             "    }"),
             ("a running pre-analysis is NOT adopted (restarted instead)", "app/TrPlayer.h",
              "if (pj) { n.set = pj->set; n.wire = pj->wire; pj->pre = false; }", "if (false) { n.set = pj->set; n.wire = pj->wire; pj->pre = false; }"),
             ("a folder the page has not committed is never reloaded for", "app/TrPlayer.h",
@@ -211,8 +246,10 @@ TARGETS = {
              "return false;\n        mapNow();"),
             ("the overlap guard is gone", "app/TrPlayer.h",
              "if (overlapsHeld(S, c.startMs, c.endMs)) return;", "if (false) return;"),
+            # (U2b re-point, 02/11/2026 -- U1's double-guard rule: ensureCurrentJob's `s_.userCancelled ||` went (it could never be
+            #  true behind its `!analysisWanted()` line: docs/PROGRESS_U2b.md, DECISIONS); the guard left is cancel()'s end of the wish)
             ("a job the USER cancelled restarts by itself", "app/TrPlayer.h",
-             "if (s_.userCancelled || s_.failed) return;", "if (s_.failed) return;"),
+             "        s_.wanted = false;\n", ""),
             ("the media URL loses its ?v=<mediaKey> (stale HTTP cache for a re-encoded file)", "app/TrPlayer.h",
              "+ L\"?v=\" + w16(n.mediaKey);", ";"),
             # WG (the user's first real test, 11/10): one .srt per language, written as the analysis goes
@@ -280,6 +317,50 @@ TARGETS = {
              "        // the set going away first writes an edit not saved yet (the 2 s rule had not come: review of WG #15)\n"
              "        if (s_.set && s_.set->editDirty) saveEdits(*s_.set);\n",
              "        // the set going away first writes an edit not saved yet (the 2 s rule had not come: review of WG #15)\n"),
+            # N2's fix round (02/11, PROGRESS_N2.md): the core's L2 (no sound copy while mpv plays) and L6 (mpv's sound
+            # tracks adopted) -- caught by the smoke's [N2] block (merged by the director)
+            ('N2 L2: mapNow asks the copy while mpv plays', "app/TrPlayer.h",
+             '            if (!host_.mpvPlays()) requestProxy();',
+             '            requestProxy();'),
+            ('N2 L2: a stale <video> failure asks the copy while mpv plays', "app/TrPlayer.h",
+             '        if (host_.mpvPlays()) return;                  // 1.1.0 (L2)',
+             '        // 1.1.0 (L2)'),
+            ('N2 L2: mpvDropped asks nothing', "app/TrPlayer.h",
+             '        if (s_.url.empty()) requestProxy();            // (asked once per item',
+             '        // (asked once per item'),
+            ('N2 L6: a MediaTracks list overridden', "app/TrPlayer.h",
+             '        if (s_.tracksState == "ready" && s_.tracks && !s_.tracksFromMpv) return;   // a MediaTracks list: NEVER overridden',
+             ''),
+            ('N2 L6: adopted while the probe runs', "app/TrPlayer.h",
+             '        if (s_.tracksState == "probing") return;                            // MediaTracks is reading it: its answer first',
+             ''),
+            ("N2 L6: mpv's own choice not waited for", "app/TrPlayer.h",
+             '        if (first && !picked && !mpvChose && !s_.mpvFinal) return;',
+             ''),
+            ("N2 L6: the job does not wait for mpv's list", "app/TrPlayer.h",
+             '        if (!worthy && !adoptedBefore && host_.mpvPlays()) s_.probeWait = true;',
+             ''),
+            ('N2 L6: an mpv list\'s ord 0 sent as "" (aid=auto)', "app/TrPlayer.h",
+             'w.audio = set->audio.ord > 0 || (set->audio.trackId != 0 && mpvListed(set->mediaKey)) ? tp::packAudioSel(set->audio)',
+             'w.audio = set->audio.ord > 0 ? tp::packAudioSel(set->audio)'),
+            ('N2 L6: the opening\'s set not named (a FILE sent again: "")', "app/TrPlayer.h",
+             '        if (a.ord == t.ord) { a.trackId = t.track; return; }',
+             '        if (a.ord == t.ord) { return; }'),
+            ("N2 L6: a job on aid=auto's late non-first choice kept under the first's key", "app/TrPlayer.h",
+             '        if (decodes >= 0 && static_cast<uint32_t>(decodes) != a.ord) {',
+             '        if (false) {'),
+            ("N2 L6: mpv's first choice not remembered (a later opening plays D3's)", "app/TrPlayer.h",
+             '            if (first && mpvChose && !picked) pe.autoOrd = s_.mpvOrd;',
+             ''),
+            ('N2 L6: the wait never released by an adopted list', "app/TrPlayer.h",
+             "        if (!s_.tracksFromMpv && s_.mpvTracks && !s_.mpvFinal) return;   // a list, mpv's own choice still to come",
+             "        if (s_.mpvTracks && !s_.mpvFinal) return;   // a list, mpv's own choice still to come"),
+            ('N2 L6: an offer of another opening taken', "app/TrPlayer.h",
+             '        if (!loaded_ || !seq || s_.seq != seq || !info) return;\n        s_.mpvOrd = mpvOrd;',
+             '        if (!loaded_ || !seq || !info) return;\n        s_.mpvOrd = mpvOrd;'),
+            ('N2 L6: mpvDropped does not release the wait', "app/TrPlayer.h",
+             '        s_.mpvFinal = true;\n        mpvWaitDone();\n        if (s_.url.empty())',
+             '        s_.mpvFinal = true;\n        if (s_.url.empty())'),
         ]),
     # WG: the new headers -- the editor's JSON reader, --play / WM_COPYDATA, the player registration (test key only)
     "wg": dict(
@@ -314,7 +395,8 @@ TARGETS = {
     # (D7), the director's pre-WH rule for multi-track ISO-BMFF records. Same smoke as "player" (its section [17]).
     "playerwh": dict(
         smoke='tests/cpp/player_smoke.cpp', sources=[],
-        files=['app/TrPlayer.h', 'app/TrWindowState.h', 'app/TrFileStore.h', 'app/JsonW.h', 'common/TrPipe.h', 'tests/web/we_vectors.txt', 'app/MediaTracks.h', 'app/SubtitleReader.h'],
+        files=['app/TrPlayer.h', 'app/TrWindowState.h', 'app/TrFileStore.h', 'app/JsonW.h', 'common/TrPipe.h', 'tests/web/we_vectors.txt', 'app/MediaTracks.h', 'app/SubtitleReader.h',
+               'app/TrTranscript.h', 'app/SourceTimecode.h'],   # (U3: TrPlayer.h includes them)
         inc=['common'], libs=['user32.lib', 'shlwapi.lib', 'ole32.lib'], helper=None,
         copies=[('tests/web/we_vectors.txt', 'tests/cpp/we_vectors.txt')],
         mutants=[
@@ -330,21 +412,24 @@ TARGETS = {
             ('WH: a probe that never answers holds the job for ever (no timeout)', 'app/TrPlayer.h',
              'if (loaded_ && s_.probeWait && now - s_.probeAt >= kProbeWaitMs) {',
              'if (false) {'),
+            # (U2b re-point, 02/11/2026: fix round L6 added a track of a list MPV gave to startJob's line -- the only line of its text
+            #  since U3 -- same intent: ord 0 always named)
             ("WH: FILE's audio not empty for ord 0 (the wire before WH changed)", 'app/TrPlayer.h',
-             'w.audio = set->audio.ord > 0 ? tp::packAudioSel(set->audio) : std::string();',
-             'w.audio = tp::packAudioSel(set->audio);'),
+             'w.audio = set->audio.ord > 0 || (set->audio.trackId != 0 && mpvListed(set->mediaKey)) ? tp::packAudioSel(set->audio)',
+             'w.audio = true ? tp::packAudioSel(set->audio)'),
             ("WH D6: ord 0's cache key changed too (every record before WH lost)", 'app/TrFileStore.h',
              'if (audioOrd > 0) k += "\\ta" + std::to_string(audioOrd);',
              'k += "\\ta" + std::to_string(audioOrd);'),
             ("WH D5: a user's switch with translation ON does not re-track", 'app/TrPlayer.h',
-             'if (translate_ && s_.set && s_.set->audio.ord != t.ord) retrack(heardSel());',
+             'if (s_.set && s_.set->audio.ord != t.ord && followsSound(heardSel())) retrack(heardSel());',   # (U1 re-point)
              'if (false) retrack(heardSel());'),
             ("WH D5: an AUTO choice persisted as the user's", 'app/TrPlayer.h',
              'if (!autoPick) {',
              'if (true) {'),
-            ('WH D5: translation back ON does not follow the track HEARD', 'app/TrPlayer.h',
-             'if (s_.set && heardSel().ord != s_.set->audio.ord) retrack(heardSel());',
-             'if (false) retrack(heardSel());'),
+            # (U1 re-point: "translation back ON" is the press -- analyse() builds its set on the track HEARD)
+            ('WH D5: Translate does not follow the track HEARD', 'app/TrPlayer.h',
+             '        auto set = makeSet(s_.path, s_.name, s_.folder, s_.size, s_.mtime, heardSel());   // WH: the track HEARD now',
+             '        auto set = makeSet(s_.path, s_.name, s_.folder, s_.size, s_.mtime, s_.set ? s_.set->audio : heardSel());'),
             ("WH: the probe's choice not applied when it differs from the provisional track", 'app/TrPlayer.h',
              'if (s_.set && (want.ord != s_.set->audio.ord || unsure)) { retrack(want, unsure); return; }',
              'if (false) { retrack(want, unsure); return; }'),

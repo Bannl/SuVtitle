@@ -53,6 +53,7 @@
 #include <deque>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "TrEngine.h"
@@ -223,7 +224,10 @@ bool tokenContinuesWord(const std::string& cur, const std::string& tok);
 //    anywhere. creditsHallucination says 1 for a credits line in any context, 2 for one a person could
 //    also say as a whole line ("Thank you for watching.", "U+041F,0440,043E,0434,043E,043B,0436,0435,043D,0438,0435 U+0441,043B,0435,0434,0443,0435,0442...", "U+3054,8996,8074,3042,308A,304C,3068,3046
 //    U+3054,3056,3044,307E,3057,305F"): commitWindow drops those only when they stand ALONE in their window or the window's
-//    language detection is unsure (< 0.8) -- whisper's credits come over music, with nothing else said.
+//    language detection is unsure (< kUnsureLangProb) -- whisper's credits come over music, with nothing else said.
+//    SuVtitle 1.1.0 (RESUME 11): the line and the phrases are compared FOLDED to Simplified (hanFoldSimplified: one
+//    row per Chinese phrase, both scripts), and a CHAIN of phrases is one line ("Thank you for watching. Please
+//    subscribe.": the last phrase's few extra words close it; a credits phrase anywhere makes it kind 1).
 //    The rest of a tag / credits line carried on MID-WORD into the next segment ("...visit www.fema." |
 //    "org, visit www.fema.org", measured on the film) is the same line: dropped with it, and never what
 //    makes it "not alone". The quiet-gated caption list of the live path does not see them: a film plays
@@ -232,6 +236,39 @@ bool tokenContinuesWord(const std::string& cur, const std::string& tok);
 bool isSoundTag(const std::string& text);
 int  creditsHallucination(const std::string& text);
 inline bool isCreditsHallucination(const std::string& text) { return creditsHallucination(text) != 0; }
+// The detection probability under which a decode is UNSURE of its language (the credits rule above; the live
+// phantom net below): over music and room tone, whisper's language detection is a guess.
+inline constexpr double kUnsureLangProb = 0.8;
+// SuVtitle 1.1.0 (RESUME 11) -- WHISPER'S LOOP INSIDE ONE LINE: a sentence said twice or more in a row, and nothing
+// else ("I don't know what I'm saying. I don't know what I'm saying.", U+6211,4E0D,77E5,9053,6211,5728,8AAA,4EC0,9EBC twice). Returns ONE repeat, as
+// written (its punctuation kept), or "" when `text` is not that: its atoms (normWords) must repeat with a SHORTEST
+// period of kRepeatMinAtoms or more, at least twice over (the last repeat may be cut short) -- so "non non", "no, no,
+// no" and U+597D,597D,597D,597D, a person insisting, are never one. kRepeatMinAtoms is commitWindow's own rule ("a segment of four
+// tokens or more that says exactly what an earlier one said"), inside one line.
+inline constexpr size_t kRepeatMinAtoms = 4;
+std::string wholeLineRepeat(const std::string& text);
+// ... and THE LIVE PHANTOM NET: this section's vocabulary on a LIVE line, which has no window around it to lend it a
+// context -- what the live final knows of how its words were HEARD stands in for one. The user's first live session
+// (26/10/2026, French <-> Taiwanese) put two lines nobody said on screen: "Thank you for watching. Please subscribe."
+// off a mic and "I don't know what I'm saying." twice off a browser -- English, outside the pair, at a normal level.
+struct HeardHow {
+    double peakDbfs    = 0.0;     // the level the hallucination filter judged (hop RMS, dBFS)
+    double confidence  = 0.0;     // asrConfidence (0 = no segment, no verdict)
+    double langProb    = -1.0;    // whisper's language detection probability (< 0 = not reported)
+    bool   outsidePair = false;   // the line's language is neither half of the session's pair
+};
+// Why a line was heard with DOUBT, "" when it was not: a language OUTSIDE the pair, the detection unsure (under
+// kUnsureLangProb), quiet (under kQuietGateDbfs) or whisper's own confidence failed (under kLowConfidenceLogp).
+std::string heardWithDoubt(const HeardHow& h);
+struct PhantomVerdict {
+    bool        junk = false;     // not a line
+    bool        loop = false;     // whisper's loop: `text` is ONE of its repeats
+    std::string text;             // what to show: the line as given, unless `loop`
+    std::string why;              // for the log, when junk
+};
+// A CREDITS line (creditsHallucination 1) is never speech; a STOCK OUTRO a person could also say (2) is junk when
+// heard with doubt; so is a LOOP -- and a loop heard cleanly is said ONCE. Anything else comes back as it was.
+PhantomVerdict livePhantomNet(const std::string& text, const HeardHow& h);
 bool foreignScript(const std::string& text, const std::string& langA, const std::string& langB,
                    const std::string& langC = std::string());
 // Is `lang` (whisper's code) written in the Latin alphabet alone? (review P1: a forced decode that
@@ -256,6 +293,14 @@ struct CommitVerdict {
     // segments, or a whole window whose word trigrams are less than half unique. The caller
     // decodes the window again -- unprompted, then on a shorter window -- before accepting it.
     bool                  degenerate = false;
+    // F-RESUME: where whisper WROTE something it is judged to have said (hearCheck). heardReal = the media-second
+    // spans of every word holding a letter or a digit, in a segment that is neither dropped as whisper's FAILURE
+    // (junk, a repeated segment, a credits line) nor a sound tag: the kept words, a line in another script, the
+    // words a join gives to the stretch on its other side, words a de-dup net later drops as heard twice.
+    // heardNonSpeech = the OWN span of every segment that SAYS "not speech": a sound tag, punctuation alone.
+    // heardTags = the same for an EXPLICIT sound tag only -- bracketed, parenthesised or starred ("[Applause]",
+    // "(rires)"), or a music note -- never punctuation alone (F-RESUME round 3, review LOW 4 / F6).
+    std::vector<std::pair<double, double>> heardReal, heardNonSpeech, heardTags;
 };
 CommitVerdict commitWindow(const CommitInput& in);
 
@@ -274,9 +319,89 @@ bool fileSegmentIsJunk(const std::string& text, double peakDb, double floorDb,
                        double avgLogprob, const std::string& prompt);
 bool isRepetitionLoop(const std::string& text);
 
-// After a HARD cut the next window re-hears the end of the last one: drop its first words when
-// their tokens repeat the last committed ones (normalised the live engine's way, <= 8 tokens).
-void dropRepeatedHead(std::vector<FileWord>& next, const std::vector<FileWord>& committedTail);
+// After a HARD cut (F-RESUME: or an early stop's cut) the next window re-hears the end of the last one: drop
+// its first words when their tokens repeat the last committed ones (normalised the live engine's way, <= 8
+// tokens). F-RESUME: at an EARLY STOP's seam (`seamSec` = where the window after it starts; < 0 = not one) a
+// SINGLE repeated word goes too, but only a copy starting within kSeamCopySec of the seam -- the same audio
+// heard twice (the last word's DTW end placed early, the window after the seam starting inside it). Further
+// away it may be said twice ("...I said no." | "No, I won't" 0.3 s apart -- review LOW 3): it stays.
+void dropRepeatedHead(std::vector<FileWord>& next, const std::vector<FileWord>& committedTail, double seamSec = -1.0);
+
+// ---------------------------------------------------------------------------
+// F-RESUME (2026-10-26; redesigned after its adversarial review) -- AUDIO WHISPER STOPPED WRITING IN IS NOT
+// VOUCHED FOR.
+//
+// A window's verdict vouches for a stretch of the film: everything before its next cursor is "analysed"
+// (the run's frontier follows the cursor, FPROG's ranges follow the frontier, FDONE ok makes the tray
+// record the whole file DONE). Until this wave a PAUSE-ended (or the last, or a limit's) window vouched
+// for all of itself, whatever whisper wrote. MEASURED (meeting.wav, whisper base, a FILE cancelled at
+// 31.41 s then resumed): the window 68.80-98.64 s came back as two segments ending 9.00 s into it; the
+// 20.8 s of speech after them (five utterances) were never transcribed, and the record said DONE over
+// them. The same request sent again answered them all: whisper-server's answer depends on its HISTORY
+// (the context and the temperature fallback carried from one request to the next -- replayed byte for
+// byte), so the early stop is a sampling accident of that decode, not a property of the audio. The
+// uninterrupted run lost the file's last line the same way (its EOF window stopped after "...the second
+// topic of the day").
+//
+// THE RULES (hearCheck) -- the measured failures, and nothing else. A HEARING is one request for a stretch; the
+// rules only ever give a stretch its SECOND hearing, never a third, and never drop a word a hearing produced:
+//   * AN EARLY STOP: this request COMMITS a word (after the de-dup nets -- a request whose words were all heard
+//     twice commits nothing, and never cuts: review round 3, F12c's crawl), and kUnheardTailSec of ACTIVE audio
+//     or more follows the window's LAST heard word (CommitVerdict::heardReal, from kUnheardPadPost after its end),
+//     no explicit sound tag of whisper's covering it (heardTags: "[Applause]" over an applause is heard -- review
+//     LOW 4; punctuation alone never covers it: a " ." whose end runs to the window's end would hide the stop --
+//     review F6). EVERYTHING heard is kept; the next window starts right after that last word, and its own fresh
+//     request is the second hearing of the rest -- up to the end of this window (HearContext::secondUpTo).
+//     In a request that already IS a second hearing a new cut needs its last kept word kUnheardTailSec past the
+//     cut it follows (progress); otherwise it is accepted -- up to secondUpTo, or to its last kept word when
+//     that lies further. At most kMaxCutChain cuts in a row: the next request is vouched for as before F-RESUME.
+//   * NOTHING COMMITTED: no committed word, and kUnheardTailSec or more of active audio after the last heard
+//     word -- or, no word heard at all, that no "not speech" statement covers (heardNonSpeech: a music intro
+//     whisper answered " ." or "[Music]" over) -> a FIRST hearing: the SAME window once more, nothing committed;
+//     a SECOND hearing: accepted, but only up to secondUpTo (review round 3, F9 / F9b: after a cut the window
+//     reaches past what was heard before; the audio beyond is on its first hearing and gets its own once more).
+//   * NEVER ACTED ON: a gap between two heard words, the head of a window before its first word, a short
+//     tail -- music, effects, laughter between lines (review F3: a 1.5 s effect after each of 12 lines made
+//     13 requests out of 3 when every such gap was sent back); and a HARD cut that kept words (its own rule
+//     already starts the next window at its last committed word).
+// BOUNDED: every request commits a word -- the cursor moves past it -- or is a stretch's one second hearing. While
+// a second hearing waits, the cursor stays before the unheard audio: a job cancelled meanwhile never reports
+// it analysed (review F7).
+// KNOWN LIMIT (review LOW 5): the tail is measured from the LAST heard word; a last word DTW places far too late
+// (over music after the stop) hides the stop before it.
+// ---------------------------------------------------------------------------
+// T, MEASURED (docs\PROGRESS_F-RESUME.md; whisper base, meeting.wav): the real early stops left 12.1 s (the
+// measured hole), 4.1 s and 2.7 s (the file's last line, "Perfect, thank you very much everyone.") of active
+// audio after the last heard word; the ordinary windows 0.0-0.5 s (base, turbo and large-v3: 31 windows); review
+// F3's sound effects 1.5 s. 3 s would miss the 2.7 s line.
+constexpr double kUnheardTailSec    = 2.5;
+constexpr double kUnheardPadPre     = 0.3;   // a DTW-timed span covers from this much before its start ...
+constexpr double kUnheardPadPost    = 0.5;   // ... to this much after its end
+constexpr double kUnheardPadUntimed = 1.0;   // ... either side, with whisper's token times (no DTW)
+constexpr double kSeamCopySec       = 0.2;   // dropRepeatedHead: a single word repeated this close to an early stop's seam
+constexpr int    kMaxCutChain       = 2;     // early-stop cuts in a row, at most
+// The ACTIVE seconds of [from, to) (media seconds) outside every span of `cover`, each widened by pre / post.
+double activeSecOutside(const EnergyTrack& en, double from, double to,
+                        const std::vector<std::pair<double, double>>& cover, double pre, double post);
+// What the job knows about the request being judged.
+struct HearContext {
+    uint64_t secondUpTo = 0;    // this request is the SECOND hearing of the audio before this sample (0 = a first hearing)
+    uint64_t prevCut = 0;       // the early-stop cut it follows (0 = none): a new cut must pass it by kUnheardTailSec
+    int      cutChain = 0;      // early-stop cuts in a row before it
+    bool     hadWords = false;  // the verdict held a word BEFORE the de-dup nets (a hard cut's own rule then applies)
+};
+struct HearCheck {
+    bool     rehear = false;    // the verdict would vouch for audio whisper never wrote in: it does not
+    bool     same = false;      // ... NOTHING committed on a first hearing: the same window once more
+    uint64_t nextCursor = 0;    // an EARLY STOP: the next window starts here; an accepted second hearing: it stops here
+    bool     accepted = false;  // a second hearing accepted (nothing more, or no progress): vouched up to nextCursor
+    bool     capped = false;    // kMaxCutChain reached: no cut, vouched for as before F-RESUME
+    double   lastWord = -1.0;   // the last heard word's end (media seconds); -1 = no heard word in the window
+    double   activeSec = 0.0;   // the active audio after it -- or, no word, the active audio no statement covers
+};
+// `v` = the window's verdict with its words AFTER the de-dup nets (what this request commits) -- heardReal /
+// heardNonSpeech / heardTags are taken BEFORE them: words whisper wrote twice still say where it was writing.
+HearCheck hearCheck(const EnergyTrack& en, const WindowPlan& plan, const CommitVerdict& v, const HearContext& ctx);
 
 // ---------------------------------------------------------------------------
 // Words -> subtitles.

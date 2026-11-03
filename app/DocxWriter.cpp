@@ -395,7 +395,9 @@ std::wstring mediaStampOf(long long ms) {
 // THE PACKAGE, shared by both documents (WC factored it out of buildTranscript unchanged -- the
 // W5 smoke's parts hash the same before and after): the body closes on an A4 section, then the
 // five parts of an OPC package, [Content_Types].xml first.
-std::string packageDocx(std::string body, bool tradDefault) {
+// U3: `namedStyles` = w:style elements written after the docDefaults (buildSpeakerTranscript's); null = the two older
+// documents' styles part, byte for byte as before.
+std::string packageDocx(std::string body, bool tradDefault, const char* namedStyles = nullptr) {
     // A4 with 2 cm margins. Word invents a section when one is missing, but it
     // invents US Letter -- and the user prints A4.
     body += "<w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/>"
@@ -442,7 +444,9 @@ std::string packageDocx(std::string body, bool tradDefault) {
     styles += "\" w:cs=\"Calibri\"/><w:sz w:val=\"22\"/><w:szCs w:val=\"22\"/>"
         "</w:rPr></w:rPrDefault>"
         "<w:pPrDefault><w:pPr><w:spacing w:after=\"120\" w:line=\"259\" w:lineRule=\"auto\"/>"
-        "</w:pPr></w:pPrDefault></w:docDefaults></w:styles>";
+        "</w:pPr></w:pPrDefault></w:docDefaults>";
+    if (namedStyles) styles += namedStyles;
+    styles += "</w:styles>";
 
     // [Content_Types].xml FIRST: OPC requires it, and a reader that streams the
     // archive (Word does) gives up on a package whose types arrive last.
@@ -602,6 +606,76 @@ bool buildFileTranscript(const Doc& info, const std::vector<Line>& lines, std::s
     }
 
     out = packageDocx(std::move(body), tradDefault);
+    return true;
+}
+
+// ============================================================================
+// U3 (2026-11-02): THE SPEAKER TRANSCRIPT -- see DocxWriter.h. Word's NAMED styles: Normal (the default paragraph: every
+// turn), Title, Subtitle (Word's own built-in names -- Word lists and localises them) and two character styles a transcriber
+// restyles in one place, Speaker (bold) and Timecode (grey). A run's style comes FIRST in its rPr (CT_RPr is an ordered
+// sequence), the Traditional face after it (runXml's rule).
+// ============================================================================
+namespace {
+const char* const kTranscriptStyles =
+    "<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/><w:qFormat/></w:style>"
+    "<w:style w:type=\"character\" w:default=\"1\" w:styleId=\"DefaultParagraphFont\"><w:name w:val=\"Default Paragraph Font\"/>"
+    "<w:uiPriority w:val=\"1\"/><w:semiHidden/><w:unhideWhenUsed/></w:style>"
+    "<w:style w:type=\"paragraph\" w:styleId=\"Title\"><w:name w:val=\"Title\"/><w:basedOn w:val=\"Normal\"/>"
+    "<w:next w:val=\"Normal\"/><w:qFormat/><w:pPr><w:spacing w:after=\"60\"/></w:pPr>"
+    "<w:rPr><w:b/><w:sz w:val=\"32\"/><w:szCs w:val=\"32\"/></w:rPr></w:style>"
+    "<w:style w:type=\"paragraph\" w:styleId=\"Subtitle\"><w:name w:val=\"Subtitle\"/><w:basedOn w:val=\"Normal\"/>"
+    "<w:next w:val=\"Normal\"/><w:qFormat/><w:pPr><w:spacing w:after=\"200\"/></w:pPr>"
+    "<w:rPr><w:color w:val=\"595959\"/><w:sz w:val=\"22\"/><w:szCs w:val=\"22\"/></w:rPr></w:style>"
+    "<w:style w:type=\"character\" w:customStyle=\"1\" w:styleId=\"Speaker\"><w:name w:val=\"Speaker\"/>"
+    "<w:basedOn w:val=\"DefaultParagraphFont\"/><w:qFormat/><w:rPr><w:b/></w:rPr></w:style>"
+    "<w:style w:type=\"character\" w:customStyle=\"1\" w:styleId=\"Timecode\"><w:name w:val=\"Timecode\"/>"
+    "<w:basedOn w:val=\"DefaultParagraphFont\"/><w:qFormat/><w:rPr><w:color w:val=\"7F7F7F\"/></w:rPr></w:style>";
+
+// One run in a named character style ("" = none), Traditional or not.
+std::string styledRun(const char* styleId, const std::wstring& text, bool trad, bool italic = false) {
+    std::string x = "<w:r>";
+    if ((styleId && *styleId) || trad || italic) {
+        x += "<w:rPr>";
+        if (styleId && *styleId) { x += "<w:rStyle w:val=\""; x += styleId; x += "\"/>"; }
+        if (trad) { x += "<w:rFonts w:eastAsia=\""; x += kTradFace; x += "\"/>"; }
+        if (italic) x += "<w:i/>";
+        if (trad) x += "<w:lang w:eastAsia=\"zh-TW\"/>";
+        x += "</w:rPr>";
+    }
+    x += "<w:t xml:space=\"preserve\">";
+    x += xmlEscape(text);
+    x += "</w:t></w:r>";
+    return x;
+}
+std::string styledPara(const char* pStyle, const std::string& runs) {
+    std::string x = "<w:p>";
+    if (pStyle && *pStyle) { x += "<w:pPr><w:pStyle w:val=\""; x += pStyle; x += "\"/></w:pPr>"; }
+    x += runs;
+    x += "</w:p>";
+    return x;
+}
+}   // namespace
+
+bool buildSpeakerTranscript(const TranscriptDoc& info, const std::vector<TranscriptTurn>& turns, std::string& out) {
+    if (turns.empty()) return false;
+    bool hasTrad = false, hasSimp = false;
+    for (const auto& t : turns) {
+        if (isTradCode(t.lang)) hasTrad = true;
+        if (isSimpCode(t.lang)) hasSimp = true;
+    }
+    const bool tradDefault = hasTrad && !hasSimp;
+    std::string body;
+    body += styledPara("Title", styledRun(nullptr, info.title, false));
+    if (!info.subtitle.empty()) body += styledPara("Subtitle", styledRun(nullptr, info.subtitle, false));
+    for (const auto& h : info.header) body += styledPara(nullptr, styledRun(nullptr, h, false));
+    if (!info.note.empty()) body += styledPara(nullptr, styledRun(nullptr, info.note, false, /*italic=*/true));
+    for (const auto& t : turns) {
+        std::string runs = styledRun("Timecode", t.stamp + L" ", false);
+        if (!t.speaker.empty()) runs += styledRun("Speaker", t.speaker + L": ", false);
+        runs += styledRun(nullptr, t.text, !tradDefault && isTradCode(t.lang));
+        body += styledPara(nullptr, runs);
+    }
+    out = packageDocx(std::move(body), tradDefault, kTranscriptStyles);
     return true;
 }
 

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <set>
@@ -388,8 +389,12 @@ bool isSoundTag(const std::string& text) {
 // Review C2/C3: credits ANCHORED at the line's start (at most `maxExtra` more atoms), per pair language;
 // kind 1 = a credits line whatever the context, 2 = a line a person could also say (the caller decides by
 // context). Atoms = normWords (CJK / kana / Hangul one per character, punctuation dropped inside a word).
+// SuVtitle 1.1.0 (RESUME 11): the line AND the phrases are folded to Simplified first (hanFoldSimplified), so each
+// Chinese phrase is written ONCE and matches either script -- the zh-tw rows that doubled four of them are gone,
+// and the phrases that had no Traditional row (U+4E2D,6587,5B57,5E55,5FD7,613F,8005...) now match a Traditional line too. (Kanji fold
+// as well -- a Japanese row and a Japanese line alike, so they still meet.)
 int creditsHallucination(const std::string& text) {
-    std::vector<std::string> at = normWords(text);
+    std::vector<std::string> at = normWords(hanFoldSimplified(text));
     if (at.empty()) return 0;
     for (auto& a : at) {                                   // normWords leaves accented capitals: "REALISES"
         std::string f;
@@ -466,25 +471,115 @@ int creditsHallucination(const std::string& text) {
         { "\xe5\xad\x97\xe5\xb9\x95\xe5\xbf\x97\xe6\x84\xbf\xe8\x80\x85", 6, 1 },   // zh
         { "\xe8\xb0\xa2\xe8\xb0\xa2\xe8\xa7\x82\xe7\x9c\x8b", 2, 2 },   // zh
         { "\xe6\x84\x9f\xe8\xb0\xa2\xe8\xa7\x82\xe7\x9c\x8b", 2, 2 },   // zh
-        { "\xe8\xab\x8b\xe4\xb8\x8d\xe5\x90\x9d\xe9\xbb\x9e\xe8\xb4\x8a", 20, 1 },   // zh-tw
-        { "\xe5\xad\x97\xe5\xb9\x95\xe5\xbf\x97\xe9\xa1\x98\xe8\x80\x85", 6, 1 },   // zh-tw
-        { "\xe8\xac\x9d\xe8\xac\x9d\xe8\xa7\x80\xe7\x9c\x8b", 2, 2 },   // zh-tw
-        { "\xe6\x84\x9f\xe8\xac\x9d\xe8\xa7\x80\xe7\x9c\x8b", 2, 2 },   // zh-tw
+        // RESUME 11: "please subscribe" (+ "to my channel"), and the broadcast "thanks for watching" -- in both
+        // scripts, through the fold, like every row of this list. (U+8BF7,8BA2,9605 / U+8C22,8C22,6536,770B / U+611F,8C22,6536,770B)
+        { "\xe8\xaf\xb7\xe8\xae\xa2\xe9\x98\x85", 4, 2 },   // zh
+        { "\xe8\xb0\xa2\xe8\xb0\xa2\xe6\x94\xb6\xe7\x9c\x8b", 2, 2 },   // zh
+        { "\xe6\x84\x9f\xe8\xb0\xa2\xe6\x94\xb6\xe7\x9c\x8b", 2, 2 },   // zh
     };
     struct Q { std::vector<std::string> atoms; int maxExtra; int kind; };
     static const std::vector<Q> kQ = [] {
         std::vector<Q> q;
-        for (const auto& p : kP) q.push_back(Q{ normWords(p.phrase), p.maxExtra, p.kind });
+        for (const auto& p : kP) q.push_back(Q{ normWords(hanFoldSimplified(p.phrase)), p.maxExtra, p.kind });
         return q;
     }();
-    int best = 0;
-    for (const auto& q : kQ) {
-        if (q.atoms.empty() || at.size() < q.atoms.size() || (int)(at.size() - q.atoms.size()) > q.maxExtra) continue;
-        if (!std::equal(q.atoms.begin(), q.atoms.end(), at.begin())) continue;
-        if (q.kind == 1) return 1;
-        best = 2;
+    // RESUME 11: a CHAIN of them is one stock line too -- whisper strings its captions ("Thank you for watching.
+    // Please subscribe.", U+8B1D,8B1D,89C0,770B U+8ACB,8A02,95B1), which a single phrase and its few extra atoms never covered. A phrase may follow a
+    // phrase; the LAST one's extra atoms close the line; a credits phrase (kind 1) anywhere in the chain makes the whole
+    // line a credits line. best[i] = the verdict on at[i..] read that way (0 = not one), from the line's end back to its
+    // start -- so best[0] with no chain is exactly the single-phrase rule this was.
+    const size_t n = at.size();
+    std::vector<int> best(n + 1, 0);
+    for (size_t i = n; i-- > 0;) {
+        int b = 0;
+        for (const auto& q : kQ) {
+            if (q.atoms.empty() || n - i < q.atoms.size()) continue;
+            if (!std::equal(q.atoms.begin(), q.atoms.end(), at.begin() + (std::ptrdiff_t)i)) continue;
+            const size_t j = i + q.atoms.size();
+            int k = (int)(n - j) <= q.maxExtra ? q.kind : 0;                      // this phrase closes the line
+            if (j < n && best[j]) k = (k == 1 || q.kind == 1 || best[j] == 1) ? 1 : 2;   // ... or the next one goes on
+            b = (b == 1 || k == 1) ? 1 : std::max(b, k);
+        }
+        best[i] = b;
     }
-    return best;
+    return best[0];
+}
+
+// SuVtitle 1.1.0 (RESUME 11) -- whisper's LOOP inside one line, and the LIVE phantom net (TrFileJob.h).
+std::string wholeLineRepeat(const std::string& text) {
+    const std::vector<std::string> a = normWords(text);
+    const size_t n = a.size();
+    // the SHORTEST period, so a line that repeats one word ("non non", "no, no, no") has period 1 -- never a sentence
+    size_t p = 1;
+    for (; p <= n / 2; ++p) {
+        bool periodic = true;
+        for (size_t i = p; i < n && periodic; ++i) periodic = (a[i] == a[i - p]);
+        if (periodic) break;
+    }
+    if (p > n / 2 || p < kRepeatMinAtoms) return std::string();
+    // ONE repeat, as written: the shortest head of `text` that holds exactly its p atoms, then whatever closes it
+    // (its punctuation) up to the blank -- or the character -- that begins the next repeat.
+    const std::vector<std::string> one(a.begin(), a.begin() + (std::ptrdiff_t)p);
+    size_t cut = 0;
+    for (size_t i = 0; i < text.size() && !cut;) {
+        nextCp(text, i);
+        if (normWords(text.substr(0, i)) == one) cut = i;
+    }
+    if (!cut) return std::string();
+    for (size_t i = cut; i < text.size();) {
+        const uint32_t cp = nextCp(text, i);
+        if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == 0x3000) break;
+        if (normWords(text.substr(0, i)).size() > p) break;          // the next repeat has begun
+        cut = i;
+    }
+    size_t b = 0;
+    while (b < cut && (text[b] == ' ' || text[b] == '\t')) ++b;
+    return text.substr(b, cut - b);
+}
+
+std::string heardWithDoubt(const HeardHow& h) {
+    char b[80];
+    if (h.outsidePair) return "a language outside the pair";
+    if (h.langProb >= 0.0 && h.langProb < kUnsureLangProb) {
+        std::snprintf(b, sizeof(b), "its language unsure (%.2f)", h.langProb);
+        return b;
+    }
+    if (h.peakDbfs < kQuietGateDbfs) {
+        std::snprintf(b, sizeof(b), "quiet (%d dBFS)", (int)h.peakDbfs);
+        return b;
+    }
+    if (h.confidence < kLowConfidenceLogp) {
+        std::snprintf(b, sizeof(b), "whisper unsure of its words (%.2f)", h.confidence);
+        return b;
+    }
+    return std::string();
+}
+
+PhantomVerdict livePhantomNet(const std::string& text, const HeardHow& h) {
+    PhantomVerdict v;
+    v.text = text;
+    const std::string doubt = heardWithDoubt(h);
+    const int credits = creditsHallucination(text);
+    if (credits == 1) {
+        v.junk = true;
+        v.why = "a credits line";
+        return v;
+    }
+    if (credits == 2 && !doubt.empty()) {
+        v.junk = true;
+        v.why = "a stock outro, heard with doubt: " + doubt;
+        return v;
+    }
+    const std::string one = wholeLineRepeat(text);
+    if (one.empty()) return v;
+    if (!doubt.empty()) {
+        v.junk = true;
+        v.why = "whisper's loop, heard with doubt: " + doubt;
+        return v;
+    }
+    v.loop = true;
+    v.text = one;
+    return v;
 }
 
 void dropEdgeAnnotations(std::vector<FileWord>& ws) {
@@ -859,6 +954,10 @@ CommitVerdict commitWindow(const CommitInput& in) {
     for (const auto& x : ww) v.timed = v.timed || x.w.timed;
     std::vector<char> keep(segs.size(), 1);
     std::vector<char> tagged(segs.size(), 0);              // dropped as a sound tag / a credits line
+    // F-RESUME: dropped as whisper's FAILURE -- junk, a repeat, a credits line -- so the audio under it was
+    // not heard (CommitVerdict::heard); a sound tag (whisper's own "music") or another script was
+    std::vector<char> unsaid(segs.size(), 0);
+    std::vector<char> nonSpeech(segs.size(), 0);           // ... a sound tag: whisper SAYS what it heard is not speech
     std::vector<size_t> sayable;                           // review C2: credits a person could also say
     // A segment that goes on with the line before it, mid-word: no leading space, a lowercase letter first
     // ("...visit www.fema." | "org, visit www.fema.org", measured on the film's end credits). It is the
@@ -880,9 +979,12 @@ CommitVerdict commitWindow(const CommitInput& in) {
         if (isRepetitionLoop(s.text)) ++loopSegs;          // (WF: still junk below; counted for the retry)
         // WF: never dialogue, at any level -- a sound tag, a credits line, another script
         const int credits = creditsHallucination(s.text);
-        if (isSoundTag(s.text) || credits == 1) {
+        const bool soundTag = isSoundTag(s.text);
+        if (soundTag || credits == 1) {
             keep[i] = 0;
             tagged[i] = 1;
+            if (!soundTag) unsaid[i] = 1;
+            else nonSpeech[i] = 1;
             ++v.tags;
             ++v.junkSegments;
             v.sawJunk = true;
@@ -910,6 +1012,7 @@ CommitVerdict commitWindow(const CommitInput& in) {
         const double pk = in.en ? in.en->peakDb(a0, a1) : 0.0;
         if (fileSegmentIsJunk(s.text, pk, floorDb, s.lp, in.prompt)) {
             keep[i] = 0;
+            unsaid[i] = 1;
             ++v.junkSegments;
             v.sawJunk = true;
         }
@@ -924,9 +1027,10 @@ CommitVerdict commitWindow(const CommitInput& in) {
         bool alone = true;
         for (size_t k = 0; k < segs.size() && alone; ++k)
             if ((k < i || k >= lineEnd) && keep[k] && hasLetterOrDigit(segs[k].text)) alone = false;
-        if (alone || (a.langProb >= 0.0 && a.langProb < 0.8)) {
+        if (alone || (a.langProb >= 0.0 && a.langProb < kUnsureLangProb)) {
             keep[i] = 0;
             tagged[i] = 1;
+            unsaid[i] = 1;
             ++v.tags;
             ++v.junkSegments;
             v.sawJunk = true;
@@ -937,6 +1041,7 @@ CommitVerdict commitWindow(const CommitInput& in) {
         if (keep[k] && tagged[k - 1] && continues(k) && hasLetterOrDigit(segs[k].text)) {
             keep[k] = 0;
             tagged[k] = 1;
+            unsaid[k] = unsaid[k - 1];                     // (F-RESUME: the same line, the same verdict)
             ++v.tags;
             ++v.junkSegments;
             v.sawJunk = true;
@@ -955,9 +1060,10 @@ CommitVerdict commitWindow(const CommitInput& in) {
             for (const auto& t : at) { key += t; key += '\x1f'; }
             all += segs[i].text;
             all += ' ';
-            if (at.size() < 4) continue;
+            if (at.size() < kRepeatMinAtoms) continue;
             if (std::find(seen.begin(), seen.end(), key) != seen.end()) {
                 keep[i] = 0;
+                unsaid[i] = 1;
                 ++v.repeats;
                 v.sawJunk = true;
                 continue;
@@ -1090,9 +1196,113 @@ CommitVerdict commitWindow(const CommitInput& in) {
         c = std::min<uint64_t>(c, in.plan.e);
         v.nextCursor = c;
     } else {
-        v.nextCursor = in.plan.e;        // whisper heard nothing usable: do not ask again
+        v.nextCursor = in.plan.e;        // whisper heard nothing usable (F-RESUME: hearCheck may send it back once)
+    }
+    // F-RESUME: where whisper WROTE what it is judged to have SAID (TrFileJob.h, hearCheck) -- each real word where
+    // it is (a word with a letter or a digit; never a sound tag's, never one of a segment dropped as whisper's
+    // failure); and a segment that SAYS "not speech" -- a sound tag, or punctuation alone (" .", ". . . ." over
+    // the end credits' music) -- over its own span: the alignment of such tokens says nothing, the segment's
+    // times are whisper's statement about that stretch. (A segment of TEXT is never taken at its own times:
+    // measured, "0.00-30.00" for words that end 5.6 s into a 10.7 s window.)
+    for (const auto& x : ww)
+        if (x.seg < unsaid.size() && !unsaid[x.seg] && !nonSpeech[x.seg] && hasLetterOrDigit(x.w.text))
+            v.heardReal.push_back({ x.w.start, x.w.end });
+    auto hasNote = [](const std::string& t) {
+        for (size_t k = 0; k < t.size();) { const uint32_t c = nextCp(t, k); if (c >= 0x2669 && c <= 0x266C) return true; }
+        return false;
+    };
+    for (size_t i = 0; i < segs.size(); ++i) {
+        const bool said = segs[i].text.find_first_not_of(' ') != std::string::npos;
+        if (!said || unsaid[i] || (!nonSpeech[i] && hasLetterOrDigit(segs[i].text))) continue;   // (a line of text: above)
+        const std::pair<double, double> span{ s0 + segs[i].start, s0 + std::max(segs[i].start, segs[i].end) };
+        v.heardNonSpeech.push_back(span);
+        // ... and an EXPLICIT sound tag -- wrapped ("[Applause]", "(rires)", "*music*") or a music note -- also says
+        // what follows a line's last word (round 3, review LOW 4); punctuation alone never does (review F6)
+        if ((nonSpeech[i] && isAnnotationOnly(segs[i].text)) || hasNote(segs[i].text)) v.heardTags.push_back(span);
     }
     return v;
+}
+
+// =============================================================================
+// F-RESUME: audio whisper stopped writing in (TrFileJob.h)
+// =============================================================================
+double activeSecOutside(const EnergyTrack& en, double from, double to,
+                        const std::vector<std::pair<double, double>>& cover, double pre, double post) {
+    if (!(to > from) || en.hops() == 0) return 0.0;
+    const double hopSec = (double)kFileHop / kFileRate;
+    const double thr = en.activeDb();
+    double sec = 0.0;
+    const size_t h0 = EnergyTrack::hopAt(from), h1 = std::min(en.hops(), EnergyTrack::hopAt(to));
+    for (size_t h = h0; h < h1; ++h) {
+        const double t = EnergyTrack::timeOf(h);
+        if (t < from - 1e-9 || !(en.db(h) > thr)) continue;   // (a hop never decoded is never active)
+        const double c = t + hopSec * 0.5;
+        bool in = false;
+        for (const auto& s : cover) if (c >= s.first - pre && c < s.second + post) { in = true; break; }
+        if (!in) sec += hopSec;
+    }
+    return sec;
+}
+
+HearCheck hearCheck(const EnergyTrack& en, const WindowPlan& plan, const CommitVerdict& v, const HearContext& ctx) {
+    HearCheck hc;
+    // a HARD cut that kept words is left to its own rule (it already starts the next window at its last word)
+    if (plan.why == WindowPlan::kHard && (ctx.hadWords || v.heldBack)) return hc;
+    const uint64_t hop = (uint64_t)kFileHop;
+    // the stretch the verdict vouches for: from the window's own start (a pre-roll is the stretch before's) to its
+    // next cursor -- and the last word whisper wrote that STARTS in it (a post-roll's words are the next stretch's)
+    const uint64_t s0 = std::max<uint64_t>(plan.s, plan.rolled ? plan.keepFrom : 0);
+    const double from = (double)s0 / kFileRate;
+    const double to   = std::max(from, (double)v.nextCursor / kFileRate);
+    const double pre  = v.timed ? kUnheardPadPre : kUnheardPadUntimed;
+    const double post = v.timed ? kUnheardPadPost : kUnheardPadUntimed;
+    for (const auto& w : v.heardReal)
+        if (w.first >= from - 1e-9 && w.first < to) hc.lastWord = std::max(hc.lastWord, w.second);
+    double lastKept = -1.0;                                    // what this request COMMITS (after the de-dup nets)
+    for (const auto& w : v.words)
+        if (hasLetterOrDigit(w.text) && w.start >= from - 1e-9 && w.start < to) lastKept = std::max(lastKept, w.end);
+    // where an accepted second hearing stops: the end of what was heard before -- or its own last kept word, when
+    // that lies further (round 3, review F9 / F9b: the audio beyond is on its FIRST hearing)
+    auto acceptTo = [&](double kept) {
+        uint64_t c = ctx.secondUpTo;
+        if (kept >= 0.0) c = std::max<uint64_t>(c, (uint64_t)std::llround((kept + 0.02) * kFileRate));
+        c = std::max<uint64_t>(c, plan.s + hop);
+        return std::min<uint64_t>(c, v.nextCursor);
+    };
+    if (lastKept >= 0.0) {
+        // AN EARLY STOP? the active audio after the last heard word, but for what an explicit sound tag covers
+        const double last = std::max(hc.lastWord, lastKept);
+        hc.activeSec = activeSecOutside(en, last + post, to, v.heardTags, pre, post);
+        if (hc.activeSec < kUnheardTailSec - 1e-9) return hc;
+        uint64_t c = (uint64_t)std::llround((last + 0.02) * kFileRate);
+        c = std::max<uint64_t>(c, plan.s + hop);
+        if (c >= v.nextCursor) return hc;                       // (nothing after it to send back)
+        if (ctx.prevCut && lastKept < (double)ctx.prevCut / kFileRate + kUnheardTailSec) {
+            // a second hearing that wrote little past the cut it follows (music with one hallucinated word, review
+            // F12c): heard twice -- accepted, never cut again (no crawl)
+            hc.accepted = true;
+            hc.nextCursor = acceptTo(lastKept);
+            return hc;
+        }
+        if (ctx.cutChain >= kMaxCutChain) { hc.capped = true; return hc; }   // the safety net: vouched as before
+        hc.rehear = true;
+        hc.nextCursor = c;
+        return hc;
+    }
+    // NOTHING COMMITTED: the active audio after the last heard word (an explicit tag covering) -- or, no word heard
+    // at all, the active audio no "not speech" statement of whisper's covers
+    hc.activeSec = hc.lastWord >= 0.0 ? activeSecOutside(en, hc.lastWord + post, to, v.heardTags, pre, post)
+                                      : activeSecOutside(en, from, to, v.heardNonSpeech, pre, post);
+    if (hc.activeSec < kUnheardTailSec - 1e-9) return hc;
+    if (ctx.secondUpTo > s0) {
+        hc.accepted = true;                                    // heard twice, nothing either time: nothing to lose ...
+        hc.nextCursor = acceptTo(-1.0);                        // ... but only what WAS heard twice
+        return hc;
+    }
+    hc.rehear = true;
+    hc.same = true;
+    hc.nextCursor = plan.s;
+    return hc;
 }
 
 bool shrinkToInnerPause(const EnergyTrack& en, WindowPlan& plan) {
@@ -1118,7 +1328,7 @@ bool shrinkToInnerPause(const EnergyTrack& en, WindowPlan& plan) {
     return true;
 }
 
-void dropRepeatedHead(std::vector<FileWord>& next, const std::vector<FileWord>& committedTail) {
+void dropRepeatedHead(std::vector<FileWord>& next, const std::vector<FileWord>& committedTail, double seamSec) {
     if (next.empty() || committedTail.empty()) return;
     std::vector<AsrWord> tw, hw;
     const size_t t0 = committedTail.size() > 12 ? committedTail.size() - 12 : 0;
@@ -1132,7 +1342,21 @@ void dropRepeatedHead(std::vector<FileWord>& next, const std::vector<FileWord>& 
     for (size_t k = std::min<size_t>(8, std::min(ta.size(), ha.size())); k >= 2; --k) {
         if (std::equal(ta.end() - (std::ptrdiff_t)k, ta.end(), ha.begin())) { best = k; break; }
     }
-    if (!best) return;
+    if (!best) {
+        // F-RESUME: ONE word heard twice at an EARLY STOP's seam -- the last committed word written again as the next
+        // window's first, starting within kSeamCopySec of the seam: the same audio (its DTW end placed early, the
+        // window after the seam starting inside it). The two atoms above and dropAlreadyCommitted's three never see
+        // it. Further away, or at a hard cut, a word may be said twice (round 3, review LOW 3): it stays.
+        if (seamSec < 0.0) return;
+        size_t lw = committedTail.size(), fw = 0;
+        while (lw > 0 && !hasLetterOrDigit(committedTail[lw - 1].text)) --lw;
+        while (fw < next.size() && !hasLetterOrDigit(next[fw].text)) ++fw;
+        if (lw == 0 || fw >= next.size()) return;
+        const std::vector<std::string> a = normWords(committedTail[lw - 1].text), b = normWords(next[fw].text);
+        if (!a.empty() && a == b && next[fw].start - seamSec <= kSeamCopySec)
+            next.erase(next.begin(), next.begin() + (std::ptrdiff_t)(fw + 1));
+        return;
+    }
     size_t drop = 0;
     while (drop < he.size() && he[drop] <= best) ++drop;
     next.erase(next.begin(), next.begin() + (std::ptrdiff_t)drop);

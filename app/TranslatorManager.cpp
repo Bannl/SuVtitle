@@ -6,6 +6,13 @@
 // Windows sees renamed). See TranslatorManager.h for what changed.
 // FIX ROUND 2026-10-23 (docs/REVIEW_RV2_App.md, proofs in tests/cpp/pipe_smoke.cpp): RV2-1 createEnginePipe +
 // the client check in spawnChild; RV2-2 quitEv_ + publishKill; RV2-5 failedStart().
+// SUVTITLE LIVE (1.1.0, 2026-10-25; proofs in tests/cpp/trmgr/trmgr_smoke.cpp [L1]-[L6]): setLive / setLiveMode /
+// setLivePair / requestSources / pollLevels / pollLiveDropped, and in the worker: the live CTL, LIVE and SRCLIST written
+// between the player's CTL and the file commands, re-armed at every spawn; SRC/SRCEND/INPUT/LEVELS dispatched; died()
+// counting a death soon after a LIVE 1 (liveDeath).
+// U3 (2026-11-02, the TRANSCRIPTION; proofs in tests/cpp/trmgr/trmgr_smoke.cpp [V1]-[V5]): startVoice (FVOICE) -- a job of
+// the FILE's slot (supersedes / is superseded while unsent, cancelFile, openJobs until its FDONE, a death answers it with
+// kVoiceEngineStopped); FSPK dispatched as Msg::Kind::FileSpk.
 // --- the original header follows; read "the tray" as SuVtitle.exe and "the helper" as SuVtitleEngine.exe ---
 // =============================================================================
 #include "TranslatorManager.h"
@@ -28,6 +35,7 @@ static const char* const kFileEngineStopped = "The SuVtitle engine stopped durin
 static const char* const kFileEngineAbsent  = "The SuVtitle engine is not running.";
 static const char* const kFileEngineFailing = "The SuVtitle engine keeps failing to start.";
 static const char* const kProxyEngineStopped = "The SuVtitle engine stopped.";
+static const char* const kVoiceEngineStopped = "The SuVtitle engine stopped while recognising the voices.";   // U3
 
 // Deadlines. The helper answers HELLO before it loads a single model (the pipe
 // connect happens first, the 1.6 GB load happens on its pipeline thread), so the
@@ -41,6 +49,15 @@ static constexpr DWORD kRespawnBackoffMs  = 4000;
 static constexpr uint64_t kRespawnBackoffCapMs = 60000;
 // RV2-1: names in a row that someone else created first, before a start counts as failed.
 static constexpr int kMaxTakenNames = 16;
+// SUVTITLE LIVE (fix round, RVB-8): deaths WHILE LISTENING later than RV2-5's 30 s -- kLiveLateMax of them within the
+// window drop the wish; the second one waits kLiveLateBackoffMs before the respawn (a crash that needs a long utterance
+// must not reload the models once a minute for the rest of the meeting).
+static constexpr uint64_t kLiveLateWindowMs  = 600000;
+static constexpr size_t   kLiveLateMax       = 3;
+static constexpr uint64_t kLiveLateBackoffMs = 8000;
+// SUVTITLE LIVE (fix round, RVB-7): a death this soon after a SRCLIST is counted against the list's ask (the engine was
+// enumerating); the third in a row drops the ask.
+static constexpr uint64_t kSrcDeathMs = 10000;
 // Rolling cap on the manager's own message queue. The Bridge is now woken the moment
 // anything lands in it (setWake) and drains from uiTick as well, so this only ever fills
 // if the UI thread is wedged, in which case the OLDEST subtitles are the useless ones.
@@ -129,6 +146,10 @@ void TranslatorManager::stop() {
         // FILE MODE: commands nobody will ever send. The bridge ends its own file session when it
         // stops the manager (the card was removed), so no synthesized answer is owed here.
         fileCmds_.clear();
+        // SUVTITLE LIVE: a meter with no engine behind it shows nothing (the wanted LIVE itself stays: it is a wish)
+        levels_ = Levels{};
+        levelsDirty_ = false;
+        srcListPending_ = false;
     }
 }
 
@@ -179,6 +200,112 @@ void TranslatorManager::askClear() {
         clearPending_ = true;
     }
     cv_.notify_all();
+}
+
+// ---- SUVTITLE LIVE (1.1.0) ------------------------------------------------------------------------------------------
+void TranslatorManager::setLive(bool on, const std::vector<LiveIn>& inputs) {
+    {
+        std::lock_guard<std::mutex> lk(mx_);
+        tp::WireLive want;
+        want.on = on;
+        if (on) want.inputs = inputs;
+        // the user's gesture -- a NEW wish to listen -- forgives the engine its earlier live deaths; a set edited while
+        // listening (a trim dragged, a strip renamed) is not a new attempt (fix round, RVB-13)
+        if (on && !live_.on) { liveFailStreak_ = 0; liveLateDeaths_.clear(); }
+        const auto same = [](const LiveIn& x, const LiveIn& y) {
+            return x.key == y.key && x.label == y.label && x.chan == y.chan && x.gainDb == y.gainDb;
+        };
+        if (want.on == live_.on && want.inputs.size() == live_.inputs.size()
+            && std::equal(want.inputs.begin(), want.inputs.end(), live_.inputs.begin(), same)) return;
+        live_ = want;
+        livePending_ = true;
+    }
+    cv_.notify_all();
+}
+
+bool TranslatorManager::liveWanted() const {
+    std::lock_guard<std::mutex> lk(mx_);
+    return live_.on;
+}
+
+void TranslatorManager::setLiveMode(const std::string& m) {
+    std::string v = m;   // (setMode's defensive mapping: the old vocabulary still means what it meant)
+    if      (v == "en2zh") v = "a2b";
+    else if (v == "zh2en") v = "b2a";
+    {
+        std::lock_guard<std::mutex> lk(mx_);
+        if (liveMode_ == v) return;
+        liveMode_ = v;
+        liveCtlPending_ = true;
+    }
+    cv_.notify_all();
+}
+
+void TranslatorManager::setLivePair(const std::string& a, const std::string& b) {
+    {
+        std::lock_guard<std::mutex> lk(mx_);
+        if (liveLangA_ == a && liveLangB_ == b) return;
+        liveLangA_ = a;
+        liveLangB_ = b;
+        liveCtlPending_ = true;
+    }
+    cv_.notify_all();
+}
+
+std::string TranslatorManager::liveMode() const {
+    std::lock_guard<std::mutex> lk(mx_);
+    return liveMode_;
+}
+
+std::string TranslatorManager::liveLangA() const {
+    std::lock_guard<std::mutex> lk(mx_);
+    return liveLangA_;
+}
+
+std::string TranslatorManager::liveLangB() const {
+    std::lock_guard<std::mutex> lk(mx_);
+    return liveLangB_;
+}
+
+void TranslatorManager::requestSources() {
+    {
+        std::lock_guard<std::mutex> lk(mx_);
+        srcWanted_ = true;
+        srcListPending_ = true;
+        srcFailStreak_ = 0;      // (fix round, RVB-7: the user opening the picker again is his gesture to try again)
+    }
+    cv_.notify_all();
+}
+
+// Fix round (RVB-7): the picker closed -- no later engine is asked for lists it nobody reads (the watch behind them
+// enumerates every ~2 s); a SRCLIST not written yet is not written.
+void TranslatorManager::stopSources() {
+    std::lock_guard<std::mutex> lk(mx_);
+    srcWanted_ = false;
+    srcListPending_ = false;
+}
+
+bool TranslatorManager::pollLiveRefused(std::string& why) {
+    std::lock_guard<std::mutex> lk(mx_);
+    if (liveRefused_.empty()) return false;
+    why.swap(liveRefused_);
+    liveRefused_.clear();
+    return true;
+}
+
+bool TranslatorManager::pollLevels(Levels& out) {
+    std::lock_guard<std::mutex> lk(mx_);
+    if (!levelsDirty_) return false;
+    levelsDirty_ = false;
+    out = levels_;
+    return true;
+}
+
+bool TranslatorManager::pollLiveDropped() {
+    std::lock_guard<std::mutex> lk(mx_);
+    const bool d = liveDropped_;
+    liveDropped_ = false;
+    return d;
 }
 
 bool TranslatorManager::pollState(State& out) {
@@ -245,8 +372,9 @@ void TranslatorManager::startFile(const tp::WireFile& f) {
         // An UNSENT older FILE is superseded right here: the helper would cancel it the moment
         // the new one arrived ("a FILE while a job is running CANCELS that job first"), so
         // sending it at all would only cost a model load. Its one FDONE is owed all the same.
+        // U3: an unsent FVOICE too -- the same slot, the same rule (TrPipe.h FVOICE).
         for (auto it = fileCmds_.begin(); it != fileCmds_.end(); ) {
-            if (it->kind == FileCmd::Kind::File) {
+            if (it->kind == FileCmd::Kind::File || it->kind == FileCmd::Kind::Voice) {
                 pushDoneLocked(it->id, "cancelled", std::string());
                 it = fileCmds_.erase(it);
                 answered = true;
@@ -273,6 +401,38 @@ void TranslatorManager::startFile(const tp::WireFile& f) {
     if (answered) wake();
 }
 
+// U3: the voice pass -- startFile's twin (the engine runs it in the same job slot).
+void TranslatorManager::startVoice(const tp::WireVoice& v) {
+    if (v.jobId == 0 || v.path.empty() || v.spans.empty()) return;   // unpackVoice would refuse it on the other side
+    bool answered = false;
+    {
+        std::lock_guard<std::mutex> lk(mx_);
+        for (auto it = fileCmds_.begin(); it != fileCmds_.end(); ) {
+            if (it->kind == FileCmd::Kind::File || it->kind == FileCmd::Kind::Voice) {
+                pushDoneLocked(it->id, "cancelled", std::string());
+                it = fileCmds_.erase(it);
+                answered = true;
+            } else if (it->kind == FileCmd::Kind::Focus) {
+                it = fileCmds_.erase(it);          // aimed at an analysis that will not run now
+            } else {
+                ++it;
+            }
+        }
+        if (!active_.load(std::memory_order_relaxed)) {
+            pushDoneLocked(v.jobId, "error", kFileEngineAbsent);
+            answered = true;
+        } else {
+            FileCmd c;
+            c.kind = FileCmd::Kind::Voice;
+            c.id   = v.jobId;
+            c.wire = tp::packVoice(v);
+            fileCmds_.push_back(std::move(c));
+        }
+    }
+    cv_.notify_all();
+    if (answered) wake();
+}
+
 void TranslatorManager::cancelFile(uint64_t jobId) {
     if (jobId == 0) return;
     bool answered = false;
@@ -281,7 +441,7 @@ void TranslatorManager::cancelFile(uint64_t jobId) {
         // FILE and FPROXY ids come from the bridge's ONE counter, so an id names exactly one of
         // them, and FCANCEL on a proxy's id cancels that proxy (TrPipe.h).
         for (auto it = fileCmds_.begin(); it != fileCmds_.end(); ++it) {
-            if (it->kind == FileCmd::Kind::File && it->id == jobId) {
+            if ((it->kind == FileCmd::Kind::File || it->kind == FileCmd::Kind::Voice) && it->id == jobId) {
                 // Never sent: there is nothing to stop on the other side, only an answer to give.
                 fileCmds_.erase(it);
                 pushDoneLocked(jobId, "cancelled", std::string());
@@ -583,6 +743,7 @@ void TranslatorManager::workerMain() {
     // FILE MODE: what THIS helper incarnation was given and has not answered yet. Worker-local on
     // purpose -- only this thread writes to the pipe and reads from it, so only it can know.
     std::set<uint64_t> openJobs, openProxies;
+    std::set<uint64_t> openVoices;     // U3: the open jobs that are FVOICEs (a subset of openJobs: their own sentence)
 
     // A helper that went away owes an answer for everything it held. It is given one here, and
     // the sets are emptied: the next incarnation starts with NOTHING (see startFile -- a file
@@ -591,11 +752,12 @@ void TranslatorManager::workerMain() {
         if (openJobs.empty() && openProxies.empty()) return;
         {
             std::lock_guard<std::mutex> lk(mx_);
-            for (uint64_t id : openJobs)    pushDoneLocked(id, "error", kFileEngineStopped);
+            for (uint64_t id : openJobs)    pushDoneLocked(id, "error", openVoices.count(id) ? kVoiceEngineStopped : kFileEngineStopped);
             for (uint64_t id : openProxies) pushProxyDoneLocked(id, kProxyEngineStopped);
         }
         openJobs.clear();
         openProxies.clear();
+        openVoices.clear();
         wake();
     };
 
@@ -607,6 +769,10 @@ void TranslatorManager::workerMain() {
             std::lock_guard<std::mutex> lk(mx_);
             for (const FileCmd& c : cmds) {
                 if (c.kind == FileCmd::Kind::File)       { pushDoneLocked(c.id, "error", why); any = true; }
+                else if (c.kind == FileCmd::Kind::Voice) {
+                    pushDoneLocked(c.id, "error", why == kFileEngineStopped ? kVoiceEngineStopped : why);
+                    any = true;
+                }
                 else if (c.kind == FileCmd::Kind::Proxy) { pushProxyDoneLocked(c.id, why);     any = true; }
             }
         }
@@ -628,15 +794,94 @@ void TranslatorManager::workerMain() {
         const int shift = failStreak < 3 ? 0 : std::min(failStreak - 2, 4);
         nextSpawn = ::GetTickCount64() + std::min<uint64_t>(kRespawnBackoffCapMs, static_cast<uint64_t>(kRespawnBackoffMs) << shift);
     };
+    // SUVTITLE LIVE (1.1.0): when THIS incarnation was last written a LIVE 1 (0 = not listening, or a LIVE 0 since, or
+    // listening for 30 s already -- the loop clears it then: a later death is not "right after a LIVE").
+    uint64_t lastLiveAt = 0;
+    // Fix round: whether THIS incarnation was told to listen (a LIVE 1 written, no LIVE 0 since -- RVB-8 counts its later
+    // deaths), the devices of that LIVE 1 (RVB-13: RV2-5's clock restarts only when they change: a trim or a name opens no
+    // new capture), when it was last asked for the list (RVB-7), and which incarnation this is (RVB-6: Msg::gen).
+    bool        listening = false;
+    std::string liveDevs;
+    uint64_t    lastSrcAt = 0;
+    uint32_t    incarnation = 0;
+    // RV2-5 on the live path. A capture driver that brings the engine down at LIVE 1 would otherwise do it again at
+    // every respawn -- the wanted LIVE is re-sent -- and the player's analyses with it. The THIRD such death in a row
+    // drops the wish (the engine comes back idle, the bridge says why); setLive(true) -- the user trying again -- forgives.
+    auto liveDeath = [&] {
+        bool dropped = false;
+        {
+            std::lock_guard<std::mutex> lk(mx_);
+            if (++liveFailStreak_ >= 3 && live_.on) {
+                live_ = tp::WireLive{};
+                livePending_ = false;
+                liveDropped_ = true;
+                dropped = true;
+            }
+        }
+        if (dropped) warn(L"Live translation stopped: the SuVtitle engine kept stopping when it started listening.");
+    };
+    // Fix round (RVB-8): a death WHILE LISTENING, later than RV2-5's 30 s (a crash that needs the first long utterance, a
+    // device event): counted in a sliding window -- the number of them in it is returned; the kLiveLateMax-th drops the
+    // wish (the engine comes back for the player, idle), said once.
+    auto liveLateDeath = [&](uint64_t now) -> size_t {
+        bool dropped = false;
+        size_t n = 0;
+        {
+            std::lock_guard<std::mutex> lk(mx_);
+            while (!liveLateDeaths_.empty() && now - liveLateDeaths_.front() >= kLiveLateWindowMs) liveLateDeaths_.pop_front();
+            liveLateDeaths_.push_back(now);
+            n = liveLateDeaths_.size();
+            if (n >= kLiveLateMax && live_.on) {
+                live_ = tp::WireLive{};
+                livePending_ = false;
+                liveDropped_ = true;
+                liveLateDeaths_.clear();
+                dropped = true;
+            }
+        }
+        if (dropped) warn(L"Live translation stopped: the SuVtitle engine kept stopping while it listened.");
+        return n;
+    };
+    // Fix round (RVB-7): a death right after a SRCLIST (the engine was enumerating the devices, the sessions, the
+    // processes): the third in a row drops the list's ask -- a respawn must not walk into the same crash for ever.
+    auto srcDeath = [&] {
+        bool dropped = false;
+        {
+            std::lock_guard<std::mutex> lk(mx_);
+            if (++srcFailStreak_ >= 3 && srcWanted_) {
+                srcWanted_ = false;
+                srcListPending_ = false;
+                dropped = true;
+            }
+        }
+        if (dropped) warn(L"The list of sources could not be made: the SuVtitle engine stopped while making it.");
+    };
+
     // A death, from whichever path saw it FIRST -- the loop top (the process gone), a broken read, a failed write: a
     // crash is usually seen by the read (pipe_smoke P5). Within 30 s of its HELLO it is a FAILED START (failedStart);
     // after a life the streak is over and the path's own respawn time stands (`respawnAt`, as before the fix).
+    // SUVTITLE LIVE: within 30 s of a LIVE 1 it is a failed start too, whatever the engine's age (liveDeath counts it).
+    // Fix round: right after a SRCLIST it counts against the list's ask (RVB-7); later in a listen, in RVB-8's window.
     auto died = [&](uint64_t respawnAt) {
-        if (::GetTickCount64() - lastSpawn < 30000) {
+        const uint64_t now = ::GetTickCount64();
+        if (lastSrcAt != 0 && now - lastSrcAt < kSrcDeathMs) srcDeath();
+        lastSrcAt = 0;
+        const bool wasListening = listening;
+        listening = false;
+        liveDevs.clear();
+        if (lastLiveAt != 0 && now - lastLiveAt < 30000) {
+            lastLiveAt = 0;
+            liveDeath();
+            failedStart();
+            return;
+        }
+        lastLiveAt = 0;
+        if (now - lastSpawn < 30000) {
             failedStart();
         } else {
             failStreak = 0;
             nextSpawn = respawnAt;
+            if (wasListening && liveLateDeath(now) == 2) nextSpawn = std::max<uint64_t>(respawnAt, now + kLiveLateBackoffMs);
         }
     };
 
@@ -647,11 +892,20 @@ void TranslatorManager::workerMain() {
             slotName_.clear();
             hProcKill_ = nullptr;
             state_.status = "loading";    // the UI shows "starting", not a stale "listening"
+            state_.live = false;          // SUVTITLE LIVE: a dead engine listens to nothing (the WISH stays: live_)
             stateDirty_ = true;
         }
         wake();
         failOpen();                       // FILE MODE: every death path goes through here
     };
+
+    // SUVTITLE LIVE: the picker's list being assembled (SRC lines of gen `srcGen`, until its SRCEND), and how many times
+    // in a row a short one was asked again. Worker-local like openJobs; reset at each spawn (gens restart with an engine).
+    constexpr size_t kSrcMax = 512;    // sources in one list: a machine has tens (a bound, not a guess at the count)
+    uint32_t         srcGen = 0;
+    std::vector<Src> srcPend;
+    bool             srcOverflow = false;
+    int              srcAsks = 0;
 
     // One message from the helper, routed onto the ordered queue. A lambda because it is called
     // from TWO places: the normal read below, and the last-words drain when the helper has died
@@ -666,11 +920,20 @@ void TranslatorManager::workerMain() {
                     std::lock_guard<std::mutex> lk(mx_);
                     state_ = s;
                     stateDirty_ = true;
+                    // Fix round (RVB-5): a LIVE the engine REFUSED -- TrPipe.h: one STATE whose err says why, the live state
+                    // unchanged (so not listening), the status not "error" (that one is the engine's own trouble, retried
+                    // by it) -- while the wish is to listen and no newer LIVE is on its way: the wish is DROPPED here (a
+                    // respawned engine is never asked again) and the bridge is told why, once.
+                    if (!s.err.empty() && !s.live && s.status != "error" && live_.on && !livePending_) {
+                        live_ = tp::WireLive{};
+                        liveRefused_ = s.err;
+                    }
                 }
                 wake();
             }
         } else if (t[0] == "LINE") {
             Msg m;
+            m.gen = incarnation;   // (fix round, RVB-6: this engine's voices are its own)
             if (tp::unpackLine(t, m.line)) {
                 {
                     std::lock_guard<std::mutex> lk(mx_);
@@ -678,7 +941,7 @@ void TranslatorManager::workerMain() {
                 }
                 wake();
             }
-        } else if (t[0] == "FPROG" || t[0] == "FCUE" || t[0] == "FDONE" || t[0] == "FPROXYDONE") {
+        } else if (t[0] == "FPROG" || t[0] == "FCUE" || t[0] == "FDONE" || t[0] == "FPROXYDONE" || t[0] == "FSPK") {
             // FILE MODE. Same ordered queue as the live lines (an FDONE must never overtake the
             // last FCUE it closes), but never capped -- see Msg in the header. A message whose
             // id this helper was never given is still forwarded: staleness is decided by the
@@ -694,7 +957,10 @@ void TranslatorManager::workerMain() {
             } else if (t[0] == "FDONE") {
                 m.kind = Msg::Kind::FileDone;
                 ok = tp::unpackFileDone(t, m.fdone);
-                if (ok) openJobs.erase(m.fdone.jobId);
+                if (ok) { openJobs.erase(m.fdone.jobId); openVoices.erase(m.fdone.jobId); }
+            } else if (t[0] == "FSPK") {         // U3: the voice pass' names, just before its FDONE
+                m.kind = Msg::Kind::FileSpk;
+                ok = tp::unpackSpk(t, m.spk);
             } else {
                 m.kind = Msg::Kind::ProxyDone;
                 ok = tp::unpackProxyDone(t, m.pdone);
@@ -736,6 +1002,73 @@ void TranslatorManager::workerMain() {
                 }
                 wake();   // the whole point of W1: a draft reaches the screen at the
                           // cadence the helper produced it, not in a 1 Hz burst
+            }
+        // ---- SUVTITLE LIVE (1.1.0): the picker's list, the inputs' states, the meters ---------------------------
+        } else if (t[0] == "SRC") {
+            // One line of list `gen`: a newer gen starts a new list (it supersedes every older one, whole -- TrPipe.h),
+            // an older one is dropped. Bounded: past kSrcMax the list is marked short.
+            Src s;
+            if (tp::unpackSrc(t, s)) {
+                if (s.gen > srcGen) { srcGen = s.gen; srcPend.clear(); srcOverflow = false; }
+                if (s.gen == srcGen) {
+                    if (srcPend.size() < kSrcMax) srcPend.push_back(std::move(s));
+                    else srcOverflow = true;
+                }
+            }
+        } else if (t[0] == "SRCEND") {
+            // The list closes: delivered WHOLE, as one message. A count that does not match what arrived means lines
+            // were lost (TrPipe.h: "a reader that counted fewer lost some and asks again") -- asked again, twice at
+            // most in a row; a third short list is delivered as it is (a picker with most of the sources beats an
+            // empty one, and a newer list replaces it whole).
+            tp::WireSrcEnd e;
+            if (tp::unpackSrcEnd(t, e) && e.gen >= srcGen) {
+                if (e.gen > srcGen) { srcGen = e.gen; srcPend.clear(); srcOverflow = false; }
+                const bool whole = !srcOverflow && srcPend.size() == e.n;
+                if (!whole && srcAsks < 2) {
+                    ++srcAsks;
+                    {
+                        std::lock_guard<std::mutex> lk(mx_);
+                        srcListPending_ = true;
+                    }
+                    cv_.notify_all();
+                } else {
+                    srcAsks = 0;
+                    lastSrcAt = 0;               // (fix round, RVB-7: the list was made -- this engine survives making one)
+                    Msg m;
+                    m.kind = Msg::Kind::Sources;
+                    m.srcGen = e.gen;
+                    m.srcs = std::move(srcPend);
+                    {
+                        std::lock_guard<std::mutex> lk(mx_);
+                        srcFailStreak_ = 0;
+                        pushMsgLocked(std::move(m));
+                    }
+                    wake();
+                }
+                srcPend.clear();
+                srcOverflow = false;
+            }
+        } else if (t[0] == "INPUT") {
+            // A state CHANGE (sent once each): on the ordered queue, never capped -- a lamp must not keep lying.
+            Msg m;
+            m.kind = Msg::Kind::Input;
+            if (tp::unpackInput(t, m.input)) {
+                {
+                    std::lock_guard<std::mutex> lk(mx_);
+                    pushMsgLocked(std::move(m));
+                }
+                wake();
+            }
+        } else if (t[0] == "LEVELS") {
+            // ~5 Hz, droppable by design: the newest REPLACES the slot, nothing queues behind a wedged UI thread.
+            Levels l;
+            if (tp::unpackLevels(t, l)) {
+                {
+                    std::lock_guard<std::mutex> lk(mx_);
+                    levels_ = std::move(l);
+                    levelsDirty_ = true;
+                }
+                wake();
             }
         }
         // Anything else is ignored on purpose: an unknown message must never be a fault
@@ -808,29 +1141,92 @@ void TranslatorManager::workerMain() {
                 // at all, so this CTL is the ONLY way a respawned helper learns it back.
                 ctlPending_ = !mode_.empty() || !preset_.empty()
                               || !langA_.empty() || !langB_.empty();
+                // SUVTITLE LIVE (1.1.0): the live pair, the wanted LIVE and the list's ask come back the same way -- a
+                // new engine knows none of them (it starts idle, on engine.txt's live pair, with no picker open). The
+                // FILE is still never re-sent (above: "one crash into a crash loop").
+                liveCtlPending_ = !liveMode_.empty() || !liveLangA_.empty() || !liveLangB_.empty();
+                livePending_ = live_.on;
+                srcListPending_ = srcWanted_;
                 stateDirty_ = true;
             }
+            lastLiveAt = 0;                   // (this incarnation has not been asked to listen yet)
+            listening = false;
+            liveDevs.clear();
+            lastSrcAt = 0;
+            ++incarnation;                    // (fix round, RVB-6: its LINEs say they are this engine's)
+            srcGen = 0;                       // its list gens start again
+            srcPend.clear();
+            srcOverflow = false;
+            srcAsks = 0;
             wake();   // the card must go live NOW, not at the next tick of a 1 Hz timer
+        }
+        // SUVTITLE LIVE: 30 s of listening = that LIVE 1 did not kill the engine; a later death is not "right after" it.
+        if (lastLiveAt != 0 && ::GetTickCount64() - lastLiveAt >= 30000) {
+            lastLiveAt = 0;
+            std::lock_guard<std::mutex> lk(mx_);
+            liveFailStreak_ = 0;
         }
 
         // ---- push any pending control ------------------------------------------
+        // SUVTITLE LIVE (1.1.0): up to four messages, in THIS order and all before the file commands below -- the
+        // player's CTL, the LIVE CTL (the live pair, and the Clear: it acts on the live path), LIVE, SRCLIST. So the live
+        // pair reaches the engine before the LIVE 1 that starts listening with it, and a LIVE 0 before the FILE that
+        // resumes the player's analysis (the player's gate opens on the engine's echo, but the order holds anyway).
         {
-            tp::WireCtl c;
-            bool send = false;
+            std::vector<std::string> out;
+            std::string wantDevs;             // (fix round, RVB-13: the devices of the LIVE 1 below, if one goes out)
             {
                 std::lock_guard<std::mutex> lk(mx_);
-                if (ctlPending_ || clearPending_) {
+                if (ctlPending_) {
+                    tp::WireCtl c;
                     c.mode   = mode_;
                     c.preset = preset_;
                     c.langA  = langA_;   // "" each = "leave that half alone" (TrPipe.h)
                     c.langB  = langB_;
-                    c.clear  = clearPending_;
                     ctlPending_ = false;
+                    out.push_back(tp::packCtl(c));
+                }
+                if (liveCtlPending_ || clearPending_) {
+                    tp::WireCtl c;
+                    c.mode   = liveMode_;
+                    c.preset = preset_;  // ONE preset whatever the scope (TrPipe.h)
+                    c.langA  = liveLangA_;
+                    c.langB  = liveLangB_;
+                    c.clear  = clearPending_;
+                    c.scope  = tp::kCtlScopeLive;
+                    liveCtlPending_ = false;
                     clearPending_ = false;
-                    send = true;
+                    out.push_back(tp::packCtl(c));
+                }
+                if (livePending_) {
+                    out.push_back(tp::packLive(live_));
+                    livePending_ = false;
+                    for (const LiveIn& in : live_.inputs) wantDevs += tp::liveLaneId(in.key, in.chan) + "\n";
+                }
+                if (srcListPending_) {
+                    out.push_back(tp::packSrcList());
+                    srcListPending_ = false;
                 }
             }
-            if (send && !tp::writeMessage(child.pipe, tp::packCtl(c), 2000)) {
+            bool sent = true;
+            for (const std::string& w : out) {
+                if (!tp::writeMessage(child.pipe, w, 2000)) { sent = false; break; }
+                if (w.rfind("LIVE\t", 0) == 0) {
+                    // RV2-5's clock: a LIVE 1 that opens NEW devices (the first, or another set of lanes) starts it; one
+                    // that only re-trims or renames the same lanes does not (fix round, RVB-13); a LIVE 0 stops it.
+                    if (w.rfind("LIVE\t1", 0) == 0) {
+                        if (!listening || wantDevs != liveDevs) lastLiveAt = ::GetTickCount64();
+                        listening = true;
+                        liveDevs = wantDevs;
+                    } else {
+                        lastLiveAt = 0;
+                        listening = false;
+                        liveDevs.clear();
+                    }
+                }
+                if (w == tp::packSrcList()) lastSrcAt = ::GetTickCount64();   // (fix round, RVB-7)
+            }
+            if (!sent) {
                 warn(L"The SuVtitle engine stopped responding; restarting it.");
                 // Its last words FIRST (review of WC): a helper that finished a job and then
                 // closed the pipe under this write must be reported as having finished it.
@@ -864,6 +1260,7 @@ void TranslatorManager::workerMain() {
                     break;
                 }
                 if (c.kind == FileCmd::Kind::File)       openJobs.insert(c.id);
+                else if (c.kind == FileCmd::Kind::Voice) { openJobs.insert(c.id); openVoices.insert(c.id); }
                 else if (c.kind == FileCmd::Kind::Proxy) openProxies.insert(c.id);
             }
             if (broke) {

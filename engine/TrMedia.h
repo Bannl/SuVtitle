@@ -69,6 +69,24 @@
 // evidence measured container by container (TrMedia.cpp, "WHICH SOUND TRACK"), keeps it across every
 // re-open a seek makes, and refuses -- one sentence naming the format -- a track it cannot find or decode:
 // the subtitles of a dialogue nobody hears are worse than none.
+//
+// THE DECODER (SuVtitle 1.1.0, wave N3). The player now plays every file through libmpv (app/MpvPlayer.cpp), so the
+// analysis must hear what IT plays, where IT plays it. With setAnalysisDecoder(MpvFirst) a Mono16k reader decodes
+// through LIBMPV, headless (TrMpvAudio.h): every format the player reads (FLV, DTS, TrueHD... that Media Foundation
+// cannot), and frame N of the stream IS the player's time-pos N / 16000 -- its own edit lists, start times and track
+// order, measured on files built with offsets (tests/cpp/mpvaudio). The sound track: `ord` mapped exactly as the player
+// maps it; "" (not chosen) = mpv's OWN default choice, which is what the player plays when the page names no track.
+// A seek opens a new libmpv session exactly there (1 s of decoder warm-up decoded and dropped). Every decode is within
+// HALF a 16 kHz sample of the player's clock (mpv's resampler grid, rounded to a frame), so a seek and the linear decode
+// agree within ONE sample (62.5 us; measured: lag 0 on FLAC, 0 or 1 on AAC / MP3) -- NOT bit-identical (each session's
+// resampler starts on its own grid).
+// Mid-stream (02/11), the same rules as Media Foundation's reader above: a forward gap in the stamps of 0.1 to 30 s is
+// filled with silence (the player's clock jumps it), a reset -- back, or forward by more than 30 s -- is counted on; and a
+// change of the decoded format (a broadcast .ts going stereo <-> 5.1) no longer ends the decode (TrMpvAudio.cpp).
+// Media Foundation stays as the FALLBACK: libmpv missing or unloadable, or unable to open THE FILE (a file-level
+// failure); a track-level refusal from libmpv (no such track, none decodable) is final -- the player has no other
+// decoder either. The FPROXY copy (Pcm16Native, the <video> fallback's sound) is Media Foundation's, as before.
+// The default is MediaFoundation (what the selftests were written for); the engine's FILE job switches it on.
 // =============================================================================
 #pragma once
 
@@ -103,9 +121,18 @@ struct MediaInfo {
     std::string trackLang;            // MF_SD_LANGUAGE, ISO 639-1 ("en", "fr"; "" = none)
     std::string trackName;            // MF_SD_STREAM_NAME (the Matroska Name; "" = none)
     // "first" (MF_SOURCE_READER_FIRST_AUDIO_STREAM, the pre-WH reader), "mkv-first", "mkv-id", "mkv-ord",
-    // "iso-stsd", "iso-order", "aiff"
+    // "iso-stsd", "iso-order", "aiff" -- N3: "mpv" (the ord asked) and "mpv-default" (mpv's own choice)
     std::string trackHow;
+    // N3: who decodes -- "mpv" (libmpv, the player's decoder), "mf" (Media Foundation), "aiff" (our parser) -- and,
+    // when libmpv was asked for and is not the one, why ("" otherwise): the FILE job's log line.
+    std::string decoder;
+    std::string decoderNote;
 };
+
+// N3: which decoder a Mono16k reader tries first (TrMedia.h, "THE DECODER"). Process-wide, set once at start-up.
+enum class AnalysisDecoder { MediaFoundation, MpvFirst };
+void setAnalysisDecoder(AnalysisDecoder d);
+AnalysisDecoder analysisDecoder();
 
 // WH: which sound track a reader decodes. chosen = false: "the first sound track" -- FILE's "" and every
 // caller before WH (FPROXY included). chosen = true: ord = 0-based among the CONTAINER's sound tracks in
@@ -159,7 +186,8 @@ public:
     // How the last seek got there, for the log and the selftest: "none" (already there),
     // "pending" (inside what was decoded), "mf", "aiff", "forward" (decoded forward), "reopen"
     // (re-opened, decoded from the start), "start" (a target in the first seconds: from the start),
-    // "end" (the audio ends before the target: the reader is at its end, as a linear decode would be).
+    // "end" (the audio ends before the target: the reader is at its end, as a linear decode would be),
+    // "mpv" (N3: a new libmpv session, started exactly there).
     const char* lastSeekHow() const;
     // Native frames the last seek DECODED to get there (the cost; the selftest bounds it).
     uint64_t lastSeekDecoded() const;
@@ -167,6 +195,9 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> d_;
+    // N3: the Media Foundation / AIFF reader (open()'s pre-1.1.0 body); a decoded seek re-opens through it, never
+    // through open(), so a reader keeps the decoder it started with.
+    bool openMf(const std::wstring& path, Out out, const AudioTrack& track, std::string& err);
 };
 
 // FPROXY: a playable copy of `src`'s audio at `out` -- 16-bit PCM WAV, the source's rate, at

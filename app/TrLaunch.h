@@ -5,6 +5,10 @@
 // for the SuVtitle split (docs/SPLIT_PLAN.md: S3 = parity first, internal names kept, only what the user or
 // Windows sees renamed). Changed: --register-player (new: registers and quits, like
 // --unregister-player), --tray dropped (SuVtitle has no tray), the WM_COPYDATA tag "SVTP".
+// SUVTITLE LIVE (1.1.0, 2026-10-25 -- docs/LIVE_PLAN.md D-L1 / section 4.3): `--live` -- the "SuVtitle Live" shortcut --
+// opens the Live window ONLY (the player stays hidden: the taskbar shows the Live window alone); a SuVtitle already
+// running gets it through WM_COPYDATA (kCopyLive, an EMPTY payload: there is nothing to carry, so anything else is
+// refused) and opens or brings up its Live window, the same way --play hands over its paths.
 // --- the original header follows; read "the tray" as SuVtitle.exe and "the helper" as SuVtitleEngine.exe ---
 //
 // AudioPB AS A WINDOWS PLAYER (the user, 11/10: "je veux la possibilite de choisir le lecteur d'AudioPB comme
@@ -53,6 +57,7 @@ struct Args {
     bool badTag = false;                // --test-instance with a tag that is not [a-z0-9-]{1,24}
     bool unregister = false;            // --unregister-player
     bool registerPlayer = false;        // --register-player (SuVtitle: registers for this user, then quits)
+    bool live = false;                  // --live (SuVtitle 1.1.0): the Live window, alone
 };
 inline bool tagOk(const std::wstring& t) {
     if (t.empty() || t.size() > 24) return false;
@@ -73,6 +78,8 @@ inline Args parseArgs(const std::vector<std::wstring>& argv) {   // argv[0] = th
             a.unregister = true;
         } else if (x == L"--register-player") {
             a.registerPlayer = true;
+        } else if (x == L"--live") {
+            a.live = true;
         }
     }
     return a;
@@ -204,6 +211,15 @@ inline bool unpackPlay(const void* data, size_t bytes, std::vector<std::wstring>
         at = e + 1;
     }
     return false;                                             // no closing empty string
+}
+
+// ---- SUVTITLE LIVE (1.1.0): --live, from the process the shortcut started to the SuVtitle already running -----------
+// The request IS the tag: "open the Live window" carries nothing, so the payload must be EMPTY -- any byte is refused
+// (a message whose content would be ignored is a message nobody should be able to send with a content).
+constexpr ULONG_PTR kCopyLive = 0x4C545653;      // "SVTL": SuVtitle, Live
+inline bool isLiveCopy(ULONG_PTR tag, const void* data, size_t bytes) {
+    (void)data;
+    return tag == kCopyLive && bytes == 0;
 }
 
 }   // namespace pblaunch

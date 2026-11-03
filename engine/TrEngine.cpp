@@ -6,9 +6,13 @@
 // its own header, the FILE-relevant tags + DEVICE), the payload layout (<exe>\engine\whisper, <exe>\engine\llama,
 // <exe>\models; the dev fallback is the folder named by SUVTITLE_PAYLOAD, no built-in path), no diarization runtime, no `auto` probe, the HTTP
 // client's identity strings. The rest -- children, WinHTTP, ASR/MT drivers, languages, script nets -- is 641f1aa's.
+// SuVtitle 1.1.0 (2026-10-25), the LIVE path back (TrEngine.h): the live pair and the SPK* / PARTIAL* / COMMIT* tags in
+// engine.txt, the live pair's seed, the diarization runtime in the payload, the `auto` probe -- from AudioPB 50f79d6.
 // =============================================================================
 #include "TrEngine.h"
-// (TrAudio.h -- kAsrRate, now in TrEngine.h -- and TrSpeaker.h -- the diarization model's name -- stayed in AudioPB.)
+#include "TrSpeaker.h"   // kSpkModelFile: one definition of the diarization model's name
+#include "TrMpvAudio.h"  // 1.1.0 (N3): the child servers' Vulkan loader fallback (environmentWithVulkanFallback)
+// (kAsrRate: TrDecimator.h, through TrEngine.h.)
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -131,8 +135,11 @@ void TrConfig::load() {
     bool truncated = false;
     if (!readLinesBounded(p, kConfigCap, lines, truncated)) return;
     extra.clear();
+    liveInFile = false;
     // (SUVTITLE: '#' lines are the file's own header and notes -- written by save(), never read.
-    // AudioPB read its header for the v1 -> v2 PARTIALSEC migration, a live-line knob.)
+    // AudioPB read its header for the v1 -> v2 PARTIALSEC migration: the default its v1 helper had
+    // PERSISTED, 1.2, dropped from a "# AudioPB Translator config v1" file. No SuVtitle file was ever
+    // written by that helper, so the migration did not come back with the PARTIALSEC tag in 1.1.0.)
     for (const std::string& line : lines) {
         if (!line.empty() && line[0] == '#') continue;
         if (line.empty()) continue;
@@ -151,6 +158,29 @@ void TrConfig::load() {
         else if (tag == "LLAMABIN")   llamaBin   = utf8ToWide(val);
         else if (tag == "MODELS")     models     = utf8ToWide(val);
         else if (tag == "DEVICE")     device     = val;
+        else if (tag == "LIVEMODE")   { liveMode  = val; liveInFile = true; }   // SuVtitle 1.1.0: the live pair
+        else if (tag == "LIVELANGA")  { liveLangA = val; liveInFile = true; }
+        else if (tag == "LIVELANGB")  { liveLangB = val; liveInFile = true; }
+        else if (tag == "SPKON")        spkOn        = (val != "0");
+        else if (tag == "SPKMODEL")     spkModel     = utf8ToWide(val);
+        else if (tag == "SPKTHRESH")    spkThresh    = std::strtod(val.c_str(), nullptr);
+        else if (tag == "SPKMAX")       spkMax       = (int)std::strtol(val.c_str(), nullptr, 10);
+        else if (tag == "SPKMINSEC")    spkMinSec    = std::strtod(val.c_str(), nullptr);
+        else if (tag == "SPKRECLUSTER") spkRecluster = (int)std::strtol(val.c_str(), nullptr, 10);
+        else if (tag == "PARTIALMT")    partialMt    = (val != "0");
+        else if (tag == "COMMIT")          commit          = (val != "0");
+        else if (tag == "COMMITLOOKAHEAD") commitLookahead = std::strtod(val.c_str(), nullptr);
+        else if (tag == "COMMITPAUSE")     commitPause     = std::strtod(val.c_str(), nullptr);
+        else if (tag == "COMMITMAXSEC")    commitMaxSec    = std::strtod(val.c_str(), nullptr);
+        else if (tag == "PARTIALSEC") {
+            // Parsed with an END POINTER on purpose. strtod turns anything unparseable
+            // into 0.0, and 0.0 is a MEANINGFUL value here (it is "off") -- so a typo
+            // would silently switch the live line off and look like a missing feature.
+            // Nothing parsed = the line is noise = keep the default.
+            char* end = nullptr;
+            const double v = std::strtod(val.c_str(), &end);
+            if (end != val.c_str() && v == v) partialSec = v;
+        }
         else extra.push_back(line);   // a line this engine does not own -- keep it
     }
     // DEVICE: anything but the two words is the default -- a typo must never take the GPU away
@@ -176,7 +206,32 @@ void TrConfig::load() {
     if (!mtStyle.empty() && mtStyle != "qwen" && mtStyle != "hy") mtStyle.clear();
     if (mtContext < 0) mtContext = 0;
     if (mtContext > 4) mtContext = 4;   // four pairs is already ~600 tokens of prefix
-    // (SUVTITLE: the clamps of AudioPB's diarization and commit knobs went with them.)
+    // THE LIVE PAIR (1.1.0): the player's vocabulary and the player's fallbacks, rule for rule -- a direction or a
+    // code that does not read is the default, and a pair of one language is not a pair.
+    if      (liveMode == "en2zh") liveMode = "a2b";
+    else if (liveMode == "zh2en") liveMode = "b2a";
+    if (liveMode != "auto" && liveMode != "a2b" && liveMode != "b2a") liveMode = "auto";
+    liveLangA = normalizeLangCode(liveLangA);
+    liveLangB = normalizeLangCode(liveLangB);
+    if (liveLangA.empty()) liveLangA = TrConfig{}.liveLangA;
+    if (liveLangB.empty()) liveLangB = TrConfig{}.liveLangB;
+    if (liveLangA == liveLangB) { liveLangA = TrConfig{}.liveLangA; liveLangB = TrConfig{}.liveLangB; }
+    // Clamp the diarization knobs to the range the bench actually explored. A hand-edited
+    // 0.99 would put every utterance in its own cluster and read as a broken feature; a
+    // hand-edited 0.0 would put a whole meeting in one. Out of range = back to the default.
+    if (!(spkThresh > 0.05 && spkThresh < 0.99)) spkThresh = 0.50;
+    if (spkMax < 1 || spkMax > 32)               spkMax = 8;
+    if (!(spkMinSec >= 0.0 && spkMinSec <= 10.0)) spkMinSec = 1.2;
+    if (spkRecluster < 0 || spkRecluster > 100000) spkRecluster = 32;
+    // The commit knobs, clamped to ranges that keep the engine an engine. Out of range =
+    // back to the default, never to the edge: a lookahead of 0 would commit whisper's most
+    // revisable word (the last one it heard) and the text on screen would start changing
+    // AFTER being read, which is the one promise this wave makes.
+    if (!(commitLookahead >= 0.2 && commitLookahead <= 3.0)) commitLookahead = 0.7;
+    if (!(commitPause     >= 0.1 && commitPause     <= 2.0)) commitPause     = 0.35;
+    // Capped by the draft window itself (kPartialMaxMs): a pause rule that arms later than
+    // the longest snapshot we can ever take would never arm at all.
+    if (!(commitMaxSec    >= 1.0 && commitMaxSec    <= 10.0)) commitMaxSec    = 4.0;
 }
 
 void TrConfig::save() const {
@@ -192,12 +247,19 @@ void TrConfig::save() const {
         "# SuVtitle Engine config v1\n"
         "# Written by SuVtitleEngine.exe, which owns this file: SuVtitle.exe sends its choices\n"
         "# over the engine's pipe and never writes here. Lines this engine does not know are kept.\n"
-        "# PRESET  quality | balanced | light | auto. Read only when large-v3-turbo is NOT\n"
-        "#   installed: a file is then analysed on the best model installed AT OR BELOW\n"
+        "# PRESET  quality | balanced | light | auto. The LIVE translation's PAIR of speech\n"
+        "#   models {draft, final}, because a draft costs what a final costs on this hardware\n"
+        "#   and must therefore run on a cheaper model:\n"
+        "#     quality  = small -> large-v3-turbo      balanced = small -> small\n"
+        "#     light    = base  -> base                auto     = measured once, at the live start\n"
+        "#   (auto brings the servers up as quality, times ONE transcription and settles on\n"
+        "#   light, balanced or quality; the result is NOT written here). The best pair\n"
+        "#   installed at or below the chosen one runs. And, for a FILE, the model it is\n"
+        "#   analysed on when large-v3-turbo is NOT installed: the best installed AT OR BELOW\n"
         "#   this preset -- balanced = small, light = base (quality and auto: the best).\n"
-        "# MODE    auto (both ways) | a2b (LANGA into LANGB) | b2a\n"
+        "# MODE    auto (both ways) | a2b (LANGA into LANGB) | b2a -- the PLAYER's direction\n"
         "#   The old en2zh / zh2en are read and migrated to a2b / b2a.\n"
-        "# LANGA / LANGB  the language PAIR, ISO-639-1 (en zh fr de es it pt ja ko ru nl ar),\n"
+        "# LANGA / LANGB  the PLAYER's language PAIR, ISO-639-1 (en zh fr de es it pt ja ko ru nl ar),\n"
         "#   plus zh-tw: zh = Simplified Chinese, zh-tw = Traditional Chinese as written in\n"
         "#   Taiwan (zh-TW, zh-Hant, zh-HK and cht are read as zh-tw).\n"
         "#   Defaults en / zh. Two identical codes are refused (every line would pass\n"
@@ -221,7 +283,33 @@ void TrConfig::save() const {
         "# variable SUVTITLE_PAYLOAD: <it>\\whisper, <it>\\llama, <it>\\models.\n"
         "# DEVICE  auto = each model on the GPU (Vulkan) when it comes up there, else on the\n"
         "#   CPU | cpu = every model on the CPU, the GPU never opened (slower; for a GPU kept\n"
-        "#   for something else). Read when the engine starts.\n";
+        "#   for something else). Read when the engine starts.\n"
+        "# LIVEMODE / LIVELANGA / LIVELANGB  the LIVE window's direction and pair: the same\n"
+        "#   vocabulary as MODE / LANGA / LANGB, which stay the player's (one pair per mode).\n"
+        "# SPK* = speaker diarization (who is talking, by voice, inside ONE input).\n"
+        "#   SPKON 0 turns it off (back to naming the speaker by the loudest input).\n"
+        "#   SPKTHRESH 0.50 / SPKMAX 8 / SPKMINSEC 1.2 / SPKRECLUSTER 32 are BENCHED\n"
+        "#   values: 100 % clustering purity on the 4-voice bench across 0.40-0.70.\n"
+        "# PARTIAL* = the LIVE LINE, which is what makes the screen move DURING a sentence\n"
+        "#   instead of after it. A subtitle cannot exist before its segment closes, and a\n"
+        "#   segment closes 400 ms after the speaker stops (8 s in continuous speech).\n"
+        "#   PARTIALSEC 0.6 = seconds between draft transcriptions of the open segment\n"
+        "#     (clamped to 0.5-5.0; 0 turns the live line off entirely).\n"
+        "#   PARTIALMT 1   = also draft-translate each one. 0 keeps the live line in the\n"
+        "#     source language only, which costs half as much on a slow machine.\n"
+        "# COMMIT* = FINALISE BY SENTENCE instead of by VAD segment. Two consecutive drafts\n"
+        "#   of the open segment agree on a prefix; the last agreed word that ENDS a\n"
+        "#   sentence becomes a finished line while the speaker is still talking, and the\n"
+        "#   audio behind it is never transcribed again. Without it a sentence waits for\n"
+        "#   the segment to close -- 8 s in continuous speech, i.e. 2-3 sentences late.\n"
+        "#   COMMIT 1 = on. 0 = exactly the behaviour before this existed (one line per\n"
+        "#     VAD segment), which is the setting for a machine that cannot afford one\n"
+        "#     extra final transcription per sentence.\n"
+        "#   COMMITLOOKAHEAD 0.7 = seconds of audio that must follow a word before it may\n"
+        "#     close a sentence (whisper revises the last thing it heard; 0.2-3.0).\n"
+        "#   COMMITPAUSE 0.35 / COMMITMAXSEC 4.0 = the fallback for a speaker who never\n"
+        "#     punctuates: past COMMITMAXSEC of uncommitted speech, a gap of COMMITPAUSE\n"
+        "#     between two agreed words is taken as the end of a sentence.\n";
     body += "PRESET\t" + preset + "\n";
     body += "MODE\t"   + mode   + "\n";
     body += "LANGA\t"  + langA  + "\n";
@@ -237,6 +325,30 @@ void TrConfig::save() const {
     if (!llamaBin.empty())   body += "LLAMABIN\t"   + wideToUtf8(llamaBin)   + "\n";
     if (!models.empty())     body += "MODELS\t"     + wideToUtf8(models)     + "\n";
     body += "DEVICE\t" + device + "\n";
+    body += "LIVEMODE\t"  + liveMode  + "\n";
+    body += "LIVELANGA\t" + liveLangA + "\n";
+    body += "LIVELANGB\t" + liveLangB + "\n";
+    body += "SPKON\t" + std::string(spkOn ? "1" : "0") + "\n";
+    if (!spkModel.empty())   body += "SPKMODEL\t"   + wideToUtf8(spkModel)   + "\n";
+    {   // %g, not %f: "0.5" reads like a decision, "0.500000" reads like a leak.
+        char b[64];
+        std::snprintf(b, sizeof(b), "SPKTHRESH\t%g\nSPKMAX\t%d\nSPKMINSEC\t%g\nSPKRECLUSTER\t%d\n",
+                      spkThresh, spkMax, spkMinSec, spkRecluster);
+        body += b;
+    }
+    {
+        char b[64];
+        std::snprintf(b, sizeof(b), "PARTIALSEC\t%g\nPARTIALMT\t%d\n",
+                      partialSec, partialMt ? 1 : 0);
+        body += b;
+    }
+    {
+        char b[96];
+        std::snprintf(b, sizeof(b),
+                      "COMMIT\t%d\nCOMMITLOOKAHEAD\t%g\nCOMMITPAUSE\t%g\nCOMMITMAXSEC\t%g\n",
+                      commit ? 1 : 0, commitLookahead, commitPause, commitMaxSec);
+        body += b;
+    }
     for (const auto& e : extra) body += e + "\n";   // lines we do not own, back out untouched
 
     // AV-safe write, the house dance (PB.md / Vst3Catalog / publishRuntimeFacts): a rename
@@ -437,6 +549,30 @@ bool seedFromAudioPB(TrConfig& cfg, std::string& why) {
     return false;
 }
 
+// THE LIVE PAIR's seed (TrEngine.h): AudioPB's translator.txt pair -- the one its LIVE translator ran on -- all or
+// nothing through readAudioPBConfig, else the player's pair. Read only, never fatal.
+bool seedLivePair(TrConfig& cfg, std::string& why) {
+    wchar_t ad[MAX_PATH] = {};
+    const DWORD n = ::GetEnvironmentVariableW(L"APPDATA", ad, MAX_PATH);
+    ApbConfig t;
+    if (n == 0 || n >= MAX_PATH) t.why = "APPDATA is not set";
+    else                         t = readAudioPBConfig(ad);
+    if (t.ok && t.sawA && t.sawB) {
+        cfg.liveLangA = t.langA;
+        cfg.liveLangB = t.langB;
+        cfg.liveMode  = t.sawMode ? t.mode : TrConfig{}.liveMode;
+        why = "live pair seeded from AudioPB's translator.txt (read only): " + cfg.liveLangA + "/" + cfg.liveLangB
+            + ", LIVEMODE " + cfg.liveMode;
+        return true;
+    }
+    cfg.liveMode  = cfg.mode;
+    cfg.liveLangA = cfg.langA;
+    cfg.liveLangB = cfg.langB;
+    why = "live pair = the player's, " + cfg.liveLangA + "/" + cfg.liveLangB + " LIVEMODE " + cfg.liveMode + " ("
+        + t.why + ")";
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Payload resolution
 // ---------------------------------------------------------------------------
@@ -576,6 +712,10 @@ std::string normalizeLangCode(const std::string& s) {
 
 bool isHanLang(const std::string& code) { return code == "zh" || code == "zh-tw"; }
 
+// The speaker model under the name its publisher gave it (Hugging Face, csukuangfj/speaker-embedding-models): the
+// same bytes as kSpkModelFile (TrSpeaker.h), which is the name AudioPB's bundle shipped it under (measured, LIVE study 6.1).
+static const char* const kSpkModelFileHf = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx";
+
 TrPaths resolvePaths(const TrConfig& cfg) {
     // The dev payload: SUVTITLE_PAYLOAD, read here and nowhere else (resolvePathsAt takes it as an argument so the
     // checks can build every layout under %TEMP%). Unset or empty = none.
@@ -624,8 +764,27 @@ TrPaths resolvePathsAt(const TrConfig& cfg, const std::wstring& root, const std:
     if (!cfg.models.empty() && dirExists(cfg.models))          p.modelsDir = cfg.models;
     else if (bundle) { if (dirExists(bm))                      p.modelsDir = bm; }
     else if (devThere) { if (dirExists(dm))                    p.modelsDir = dm; }
-    // (SUVTITLE SPLIT: AudioPB resolved the diarization runtime here too -- sherpa + its speaker model.
-    // No speakers are told apart in a file job; it stayed in AudioPB.)
+
+    // ---- diarization: the sherpa runtime + the speaker model (SuVtitle 1.1.0, AudioPB 50f79d6's resolution) ----
+    // From the SAME source as the three parts above -- <exe>\engine\sherpa of the bundle, else <payload>\sherpa of the
+    // dev payload, never one part from each -- and resolved SEPARATELY: both are optional (TrPaths), so a source
+    // without them still runs, its lines named by input rather than by voice. The runtime is identified by its DLL
+    // rather than by the folder existing, because half a copy is worse than none. No built-in path: AudioPB's
+    // fallback for both (a folder of its author's machine) went the way of the others (the publication wave).
+    {
+        const std::wstring sd = bundle ? root + L"engine\\sherpa" : (devThere ? dev + L"\\sherpa" : std::wstring());
+        if (!sd.empty() && fileExists(sd + L"\\sherpa-onnx-c-api.dll")) p.sherpaDir = sd;
+        // SPKMODEL wins, path and all; else the models folder, under the name the bundle ships it with -- or under
+        // Hugging Face's own name for the same file (3D-Speaker's checkpoint, renamed by AudioPB's bundle script),
+        // so a model fetched by hand works as it is. A model that is not there keeps the bundle's name: the stage
+        // then says "speaker model not found: <that path>", which is the sentence a user can act on.
+        if (!cfg.spkModel.empty())      p.spkModel = cfg.spkModel;
+        else if (!p.modelsDir.empty()) {
+            p.spkModel = p.modelsDir + L"\\" + utf8ToWide(kSpkModelFile);
+            const std::wstring hf = p.modelsDir + L"\\" + utf8ToWide(kSpkModelFileHf);
+            if (!fileExists(p.spkModel) && fileExists(hf)) p.spkModel = hf;
+        }
+    }
 
     // The sentence a broken payload is reported with -- STATE's err at idle and the FDONE of any FILE -- NAMING the
     // missing part(s), so a part-staged install says which one. No path of the author's machine is ever in it: the
@@ -779,10 +938,16 @@ bool ChildServer::spawn(const std::wstring& exe, const std::wstring& workDir,
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> mut(cmd.begin(), cmd.end());
     mut.push_back(L'\0');
+    // SuVtitle 1.1.0 (N3, TrMpvAudio.h): the Vulkan builds of whisper.cpp / llama.cpp import vulkan-1.dll (whisper's HARD:
+    // without a loader it does not even start, its CPU fallback included). The bundle's own loader folder
+    // (<app>\mpv\vkfallback) is APPENDED to the child's PATH: PATH comes after System32 in the DLL search order, so a PC
+    // with a loader keeps its own, and one without gets ours -- which, with no driver behind it, lists no device (the
+    // servers then run on the CPU: measured with VK_LOADER_DRIVERS_DISABLE=*). No such folder: the environment as it is.
+    std::vector<wchar_t> env = environmentWithVulkanFallback();
     // SUSPENDED so the child is inside the job BEFORE it can fork anything of its own.
     if (!::CreateProcessW(nullptr, mut.data(), nullptr, nullptr, FALSE,
-                          CREATE_NO_WINDOW | CREATE_SUSPENDED,
-                          nullptr, workDir.empty() ? nullptr : workDir.c_str(), &si, &pi)) {
+                          CREATE_NO_WINDOW | CREATE_SUSPENDED | (env.empty() ? 0 : CREATE_UNICODE_ENVIRONMENT),
+                          env.empty() ? nullptr : env.data(), workDir.empty() ? nullptr : workDir.c_str(), &si, &pi)) {
         if (job_) { ::CloseHandle(job_); job_ = nullptr; }
         port_ = 0;
         return false;
@@ -1201,6 +1366,23 @@ std::string scriptNet(const std::string& utf8, const std::string& lang, bool* ch
     return utf8;
 }
 
+// SuVtitle 1.1.0 (RESUME 11): the COMPARISON fold (TrEngine.h). The character map alone, on purpose: its slips
+// (U+8457 / U+77AD, U+4EC0,9EBC -> U+4EC0,9EBD -- see toSimplified) are the same on both sides of a comparison, so they cannot make
+// two spellings of one phrase disagree; and nothing folded here is ever shown.
+std::string hanFoldSimplified(const std::string& utf8) {
+    if (utf8.empty()) return utf8;
+    const std::wstring w = utf8ToWide(utf8);
+    if (w.empty()) return utf8;
+    const int n = ::LCMapStringEx(L"zh-CN", LCMAP_SIMPLIFIED_CHINESE, w.c_str(), (int)w.size(),
+                                  nullptr, 0, nullptr, nullptr, 0);
+    if (n <= 0) return utf8;
+    std::wstring lc((size_t)n, L'\0');
+    if (::LCMapStringEx(L"zh-CN", LCMAP_SIMPLIFIED_CHINESE, w.c_str(), (int)w.size(),
+                        &lc[0], n, nullptr, nullptr, 0) != n)
+        return utf8;
+    return lc == w ? utf8 : wideToUtf8(lc);
+}
+
 static std::string normalizeForMatch(const std::string& s) {
     std::string o;
     size_t i = 0;
@@ -1333,23 +1515,37 @@ bool looksLikeHallucination(const std::string& text, double segPeakDbfs,
         "thanksforwatchingandsubscribe", "pleasesubscribe", "subscribe", "bye", "byebye",
         "you", "yeah", "okay", "ok", "uh", "um", "mm", "hmm", "oh", "so", "the",
         "silence", "music", "applause", "laughter", "outro", "intro",
-        // The Mandarin equivalents, which turn up on any quiet Chinese-tuned decode.
+        // The Mandarin equivalents, which turn up on any quiet Chinese-tuned decode. ONE spelling each, the
+        // Simplified one (SuVtitle 1.1.0, RESUME 11): the line is folded to Simplified before it is compared
+        // (hanFoldSimplified), so the TRADITIONAL junk the zh-tw prompt makes whisper write (WB, after the WA
+        // review: U+8B1D,8B1D / U+8B1D,8B1D,89C0,770B / U+8ACB,8A02,95B1 / U+4E0B,6B21,518D,898B, which had rows of their own here) is caught by these
+        // rows, and so is a line that mixes the two scripts. (U+5B57,5E55 is the same in both.)
         "\xe8\xb0\xa2\xe8\xb0\xa2", "\xe8\xb0\xa2\xe8\xb0\xa2\xe8\xa7\x82\xe7\x9c\x8b",
         "\xe8\xaf\xb7\xe8\xae\xa2\xe9\x98\x85", "\xe5\xad\x97\xe5\xb9\x95",
         "\xe4\xb8\x8b\xe6\xac\xa1\xe5\x86\x8d\xe8\xa7\x81",
-        // ...and the same four in TRADITIONAL (WB, after the WA review): the zh-tw prompt makes
-        // whisper write Traditional, junk included -- U+8B1D,8B1D / U+8B1D,8B1D,89C0,770B / U+8ACB,8A02,95B1 / U+4E0B,6B21,518D,898B.
-        // (U+5B57,5E55 is the same in both scripts and is already above.)
-        "\xe8\xac\x9d\xe8\xac\x9d", "\xe8\xac\x9d\xe8\xac\x9d\xe8\xa7\x80\xe7\x9c\x8b",
-        "\xe8\xab\x8b\xe8\xa8\x82\xe9\x96\xb1",
-        "\xe4\xb8\x8b\xe6\xac\xa1\xe5\x86\x8d\xe8\xa6\x8b",
     };
     // -32 dBFS of HOP RMS (not sample peak): 6 dB above the gate's own opening
     // threshold, and far below anything a person actually addressing the room produces
     // -- the selftest's real speech measured -9 to -13. So the shortlist can only fire
     // on a segment that barely tripped the gate at all.
     if (segPeakDbfs < kQuietGateDbfs) {
-        for (const char* k : kQuiet) if (n == k) return true;
+        // ONE ENTRY, OR SEVERAL GLUED TOGETHER (RESUME 11). Whisper strings its captions -- "Thank you for watching.
+        // Please subscribe.", U+8B1D,8B1D,89C0,770B U+8ACB,8A02,95B1 -- and an exact comparison let every such pair through: the line must be the
+        // list's entries end to end, nothing else (normalised, so spaces and punctuation between them do not count).
+        static const std::vector<std::string> kQuietFolded = [] {
+            std::vector<std::string> v;
+            for (const char* k : kQuiet) v.push_back(hanFoldSimplified(k));
+            return v;
+        }();
+        const std::string f = hanFoldSimplified(n);
+        std::vector<char> reach(f.size() + 1, 0);       // reach[i]: f[0, i) is entries end to end
+        reach[0] = 1;
+        for (size_t i = 0; i < f.size(); ++i) {
+            if (!reach[i]) continue;
+            for (const std::string& k : kQuietFolded)
+                if (!k.empty() && f.compare(i, k.size(), k) == 0) reach[i + k.size()] = 1;
+        }
+        if (reach[f.size()]) return true;
         // THE PROMPT'S OWN ECHO. Told what was said a moment ago and given nothing to
         // transcribe, whisper hands the prompt back -- so the instant W2 started prompting,
         // the shortlist above went blind: the junk on a quiet segment stopped being
@@ -2029,7 +2225,71 @@ bool mtTranslate(uint16_t port, const std::string& text,
     return true;
 }
 
-// (SUVTITLE SPLIT: AudioPB's `auto` preset probe -- buildProbeWav + probeAutoPreset, one timed decode of
-// room tone on the LIVE final server -- is not ported: SuVtitle runs no live pair for it to time.)
+// ---------------------------------------------------------------------------
+// The `auto` preset's probe (SuVtitle 1.1.0: back from AudioPB 50f79d6, with the live pair it times)
+// ---------------------------------------------------------------------------
+// Three seconds of QUIET ROOM TONE, written here rather than through buildWav16k because
+// that one peak-normalises to -3 dBFS -- correct for a user's segment, wrong for this:
+// a probe wants a noise FLOOR, not white noise at full level, or whisper starts inventing
+// captions and the decode time we are trying to measure becomes a hallucination's length.
+// Not digital silence either: several whisper builds short-circuit on an all-zero buffer,
+// and a probe that measures the short-circuit measures nothing.
+static std::string buildProbeWav(double seconds) {
+    const uint32_t n = (uint32_t)(kAsrRate * seconds);
+    const uint32_t bytes = n * 2u;
+    std::string w;
+    w.reserve(44 + bytes);
+    w += "RIFF"; put32(w, 36u + bytes); w += "WAVE";
+    w += "fmt "; put32(w, 16u);
+    put16(w, 1); put16(w, 1);
+    put32(w, (uint32_t)kAsrRate);
+    put32(w, (uint32_t)kAsrRate * 2u);
+    put16(w, 2); put16(w, 16);
+    w += "data"; put32(w, bytes);
+    uint32_t rng = 22695477u;                       // fixed seed: two runs are comparable
+    for (uint32_t i = 0; i < n; ++i) {
+        rng = rng * 1103515245u + 12345u;
+        const int16_t s = (int16_t)((int32_t)((rng >> 16) & 0x1ff) - 256);   // ~ -42 dBFS
+        put16(w, (uint16_t)s);
+    }
+    return w;
+}
+
+ProbeVerdict probeAutoPreset(uint16_t finalPort, bool gpu, DWORD timeoutMs) {
+    ProbeVerdict v;
+    if (!gpu) {
+        // A machine that fell back to the CPU has already answered the question, and the
+        // one thing it cannot afford is a three-second turbo transcription to confirm it.
+        v.preset = "light";
+        v.ms = 0;
+        v.why = "the speech recogniser came up on the CPU fallback -> light";
+        return v;
+    }
+    AsrOptions o;
+    o.draft    = true;      // the cheap decode: we are timing the ENCODER, which is the cost
+    o.language = "en";      // fixed, so language auto-detection cannot vary the measurement
+    AsrResult r;
+    std::string err;
+    const std::string wav = buildProbeWav(3.0);
+    const uint64_t t0 = ::GetTickCount64();
+    const bool ok = asrTranscribe(finalPort, wav, r, timeoutMs, err, o);
+    v.ms = (uint32_t)(::GetTickCount64() - t0);
+    if (!ok) {
+        // A probe that could not run is not evidence that the machine is slow. Balanced is
+        // the answer that is wrong by the least on either side of the truth.
+        v.preset = "balanced";
+        v.why = "the probe call failed (" + err + ") -> balanced";
+        return v;
+    }
+    if (v.ms > kProbeSlowMs) {
+        v.preset = "balanced";
+        v.why = "3 s on the final model took " + std::to_string(v.ms) + " ms (> "
+              + std::to_string((unsigned)kProbeSlowMs) + ") -> balanced";
+    } else {
+        v.preset = "quality";
+        v.why = "3 s on the final model took " + std::to_string(v.ms) + " ms -> quality";
+    }
+    return v;
+}
 
 } // namespace pbt

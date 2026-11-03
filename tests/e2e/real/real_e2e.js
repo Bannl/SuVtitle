@@ -619,6 +619,8 @@ async function main() {
       s = await waitFor((x) => /E03\.mp4/.test(x.vsrc), 20000, "R16 E03 plays");
       await cdp.eval(HOOK);
       await cdp.eval("(() => { const v = document.getElementById('fileVideo'); v.pause(); return 1; })()");
+      // U1 (02/11/2026): a file opened is played, not analysed -- the viewer's Translate starts it (this file only)
+      await cdp.eval("(() => { document.getElementById('fileTranslate').click(); return 1; })()");
       const t0 = Date.now();
       let done = null, sawAnalyzing = false, kidsSeen = [];
       while (Date.now() - t0 < ANALYSIS_MS) {
@@ -761,7 +763,7 @@ async function main() {
                               + "2\r\n00:00:03,000 --> 00:00:05,500\r\nZweite Zeile.\r\n");
       await cdp.eval(HOOK);
       await cdp.eval(OUTHOOK);
-      await cdp.eval("(() => { chrome.webview.postMessage({ type: 'playerSet', translate: false }); return 1; })()");
+      // (U1, 02/11/2026: no switch to turn off any more -- a file opened is not analysed unless asked, its default stands)
       await sleep(1000);
       const nSubs = (await bridgeSays("playerSubs")).length;
       const r20 = cp.spawnSync(EXE, ["--test-instance", TAG, "--play", E01, SRT_PLAIN], { env: ENV, timeout: 30000 });
@@ -781,7 +783,6 @@ async function main() {
           + plain.length + " lines are the list",
           { exit: r20.status, asked, files: [...files], extSubId: st20.extSubId, sidecars: st20.sidecars, rows: s.rows, plain, toast: s.toast });
       await shot("R20_viewer_file_wins");
-      await cdp.eval("(() => { chrome.webview.postMessage({ type: 'playerSet', translate: true }); return 1; })()");   // (R18 analyses)
       await sleep(1000);
       try { fs.unlinkSync(SIDECAR); } catch { /* (the test's own file) */ }
       focusCheck("R20");
@@ -792,6 +793,9 @@ async function main() {
     // ---- R18: the window will be closed (R9) WHILE AN ANALYSIS RUNS: E04.mp3 has no record -> a FILE job -------------
     {
       const r18 = cp.spawnSync(EXE, ["--test-instance", TAG, "--play", path.join(SEASON, "E04.mp3")], { env: ENV, timeout: 30000 });
+      // U1 (02/11/2026): opened = played; Translate (the press, this file) is what starts its analysis
+      await waitFor((x) => /E04\.mp3/.test(x.statusTitle || ""), 20000, "R18 E04 opens").catch(() => null);   // (the strip's tooltip names it)
+      await cdp.eval("(() => { document.getElementById('fileTranslate').click(); return 1; })()");
       let servers = [];
       for (let t0 = Date.now(); Date.now() - t0 < 90000 && !servers.length; await sleep(500)) {
         servers = enginePid ? (tool(["kids", String(enginePid)]).kids || []).filter((k) => /server/i.test(k.exe)) : [];

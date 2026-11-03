@@ -8,6 +8,10 @@
 // kAsrRate moved in from TrAudio.h (the fabric front end did not come along); the `auto` preset's live probe
 // (probeAutoPreset) is gone with the live pair it timed. Everything else is 641f1aa's, comments included
 // ("the live line", "a draft"... describe AudioPB, where those paths still run).
+// SuVtitle 1.1.0 (2026-10-25) brings the LIVE path back (docs/LIVE_PLAN.md), and with it what the split took out of
+// here, from AudioPB 50f79d6 (AudioPB Translator 1.1.0): TrPaths' diarization runtime (sherpaDir / spkModel), TrConfig's
+// SPK* / PARTIAL* / COMMIT* tags, the `auto` probe -- plus the LIVE PAIR (LIVEMODE / LIVELANGA / LIVELANGB: one pair per
+// mode, the user's decision of 25/10) and its seed. kAsrRate lives in TrDecimator.h now, with the decimator.
 //
 // The ASR and the MT are OTHER PEOPLE'S BINARIES (whisper.cpp's whisper-server and
 // llama.cpp's llama-server). We DRIVE them, we do not vendor them: nothing of
@@ -38,11 +42,9 @@
 #include <string>
 #include <vector>
 
-namespace pbt {
+#include "TrDecimator.h"   // kAsrRate: "one definition of 16 kHz, shared with the front end" (SuVtitle 1.1.0)
 
-// Every ASR model we drive wants exactly this. (SUVTITLE SPLIT: was TrAudio.h's -- "one
-// definition of 16 kHz, shared with the front end" -- and the live front end stayed in AudioPB.)
-constexpr int kAsrRate = 16000;
+namespace pbt {
 
 // ---------------------------------------------------------------------------
 // Where the binaries and models live. The DEPLOYED layout wins; a dev payload named by the environment variable
@@ -66,26 +68,33 @@ constexpr int kAsrRate = 16000;
 struct TrPaths {
     std::wstring whisperExe;    // ...\whisper-server.exe
     std::wstring llamaExe;      // ...\llama-server.exe
-    std::wstring modelsDir;     // holds ggml-*.bin + the Qwen .gguf
+    std::wstring modelsDir;     // holds ggml-*.bin + the Qwen .gguf + the speaker .onnx
+    // The DIARIZATION stage's runtime (SuVtitle 1.1.0, from AudioPB 50f79d6), resolved from the same source as the
+    // three parts above -- the bundle (<exe dir>\engine\sherpa\) or the dev payload (<SUVTITLE_PAYLOAD>\sherpa\),
+    // never a mix -- and INDEPENDENTLY: an absent sherpa folder or speaker model must cost speaker colours, never the
+    // subtitles, so neither is part of ok(), and "" is a legal answer (the stage then turns itself OFF and says why).
+    std::wstring sherpaDir;     // holds sherpa-onnx-c-api.dll + onnxruntime.dll
+    std::wstring spkModel;      // ...\3dspeaker_campplus_zh_en_advanced.onnx (or Hugging Face's own name for it)
     bool         devPayload = false;    // nothing of the bundle next to the exe: the SUVTITLE_PAYLOAD tree was used
     std::string  missing;               // "" when ok(); else the user-visible sentence naming what is missing
     bool ok() const { return !whisperExe.empty() && !llamaExe.empty() && !modelsDir.empty(); }
 };
 
 // Config file %APPDATA%\SuVtitle\engine.txt (S11). Tags: PRESET, MODE, LANGA, LANGB,
-// WHISPERBIN, LLAMABIN, MODELS, MTMODEL, MTSTYLE, ASRPROMPT, MTCONTEXT, DEVICE. Written with
-// the house's AV-safe temp+rename+retry dance.
+// WHISPERBIN, LLAMABIN, MODELS, MTMODEL, MTSTYLE, ASRPROMPT, MTCONTEXT, DEVICE -- and since
+// 1.1.0 LIVEMODE, LIVELANGA, LIVELANGB and the SPK*, PARTIAL* and COMMIT* families. Written
+// with the house's AV-safe temp+rename+retry dance.
 //
 // THE ENGINE OWNS THIS FILE (S11): the app never writes it -- it sends CTL, and the engine
-// persists -- and reads it only for the pair. In AudioPB the tray wrote its window geometry
+// persists -- and reads it only for the pairs. In AudioPB the tray wrote its window geometry
 // (WINPOS) into the same file, which is why `extra` exists: it carries every line this struct
-// does not understand, verbatim, straight back out on save. Kept, so a hand-edited line (or
-// one of AudioPB's live tags, SPK* / PARTIAL* / COMMIT*, in a file copied over) is never lost.
+// does not understand, verbatim, straight back out on save. Kept, so a hand-edited line is
+// never lost.
 struct TrConfig {
-    // SUVTITLE: no live pair runs any more, so the preset no longer chooses what is loaded at idle.
-    // It is kept because a FILE job still reads it when turbo is NOT installed: the job then runs on
-    // this preset's FINAL model (Servers::presetFinalModel), exactly as it ran on the live preset's
-    // in AudioPB. auto = the best preset whose models are installed.
+    // TWO MEANINGS, both AudioPB's (641f1aa had both): the LIVE path's pair of speech models
+    // {draft, final} (Servers::ensureUp; auto = measured once, probeAutoPreset), and, for a FILE
+    // job, the model it runs on when turbo is NOT installed: this preset's FINAL model
+    // (Servers::presetFinalModel), the best installed at or below it.
     std::string  preset = "balanced";   // auto | quality | balanced | light
     std::string  mode   = "auto";       // auto | a2b | b2a  (en2zh/zh2en migrate on load)
     // ---- the PAIR (W2). The mode is a DIRECTION over these two, which is what turns a
@@ -111,9 +120,51 @@ struct TrConfig {
     // in main_translator.cpp, measured 0 MB of VRAM), for a user who keeps his GPU for something
     // else. Read at start: a change takes effect at the engine's next start.
     std::string  device = "auto";       // DEVICE    auto | cpu
-    // (SUVTITLE: AudioPB's live tags SPK* (diarization), PARTIAL* (the live line) and COMMIT*
-    // (commit as you go) are gone with the live path; a file that holds them keeps them in
-    // `extra`, untouched.)
+    // ---- THE LIVE PAIR (SuVtitle 1.1.0). ONE PAIR PER MODE (the user, 25/10: his player runs
+    // es/fr while his live meetings ran fr/zh-tw): mode/langA/langB above are the PLAYER's -- what a
+    // FILE job is analysed in, and what the analyses are filed under -- and these three are the
+    // Live window's (CTL scope=live moves them). Validated exactly like the player's.
+    std::string  liveMode  = "auto";    // LIVEMODE   auto | a2b | b2a
+    std::string  liveLangA = "en";      // LIVELANGA
+    std::string  liveLangB = "zh";      // LIVELANGB
+    // Did the file hold ANY of the three? false = a first start or a 1.0.0 engine.txt: the caller
+    // seeds the live pair (seedLivePair) rather than run on the defaults.
+    bool         liveInFile = false;
+    // ---- diarization (D2). The DEFAULTS ARE THE BENCHED CONSTANTS (see TrSpeaker.h);
+    // these tags exist so a real room can be re-seated on the 0.40-0.70 plateau without
+    // a rebuild, not because the numbers are undecided.
+    bool         spkOn        = true;       // SPKON        0 disables the stage entirely
+    std::wstring spkModel;                  // SPKMODEL     "" = <models>\3dspeaker_campplus...
+    double       spkThresh    = 0.50;       // SPKTHRESH    cosine vs the winning centroid
+    int          spkMax       = 8;          // SPKMAX       cap on simultaneous speakers
+    double       spkMinSec    = 1.2;        // SPKMINSEC    shorter -> attach to the previous
+    int          spkRecluster = 32;         // SPKRECLUSTER segments between re-cluster passes
+    // ---- progressive display (the live line). The CLAMP lives in TrAudio::setPartialSec
+    // and nowhere else: duplicating 0.5/5.0 here would give the project two answers to
+    // the same question, and one of them would go stale.
+    // The MASTER COPY of this default is kPartialSecDefault in TrAudio.h; keep the two equal.
+    double       partialSec = 0.6;          // PARTIALSEC   seconds between snapshots; 0 = off
+                                            // (0.6 since the fluidity pass: a draft costs a
+                                            // near-flat ~120 ms at audio_ctx=768, and the
+                                            // consumer self-paces, so weak machines degrade
+                                            // gracefully instead of drowning)
+    bool         partialMt  = true;         // PARTIALMT    0 = live line stays untranslated
+    // ---- COMMIT AS YOU GO (W3). The unit of a final is the SENTENCE, not the VAD
+    // segment, so a sentence reaches the screen ~1 s after it ends instead of when the
+    // speaker eventually stops (up to 8 s later, in continuous speech). 0 puts the engine
+    // back to exactly what it did before this wave -- which is the honest escape hatch for
+    // a machine too slow to afford one extra final per sentence.
+    bool         commit          = true;    // COMMIT
+    // How far a word's end must be from the end of the draft window before that word may
+    // close a sentence. Whisper must have HEARD what follows: the last word of a window is
+    // the one it most often revises, and committing it is the one mistake this engine
+    // cannot take back.
+    double       commitLookahead = 0.7;     // COMMITLOOKAHEAD  seconds
+    // The pause that stands in for a full stop when there is none -- speakers who never
+    // punctuate still breathe, and 4 s of uncommitted speech is already the delay this
+    // wave exists to remove.
+    double       commitPause     = 0.35;    // COMMITPAUSE      seconds
+    double       commitMaxSec    = 4.0;     // COMMITMAXSEC     when the pause rule arms
     std::vector<std::string> extra;     // lines this struct does not own, written back verbatim
 
     static std::wstring path();
@@ -138,6 +189,15 @@ struct TrConfig {
 // 16 KB -- never more, whatever the file.
 // Returns true when `cfg` was seeded; `why` = one line for the log, either way.
 bool seedFromAudioPB(TrConfig& cfg, std::string& why);
+// THE LIVE PAIR'S SEED (SuVtitle 1.1.0, E8 extended -- LIVE_PLAN section 4.1). An engine.txt that holds no live pair
+// (TrConfig::liveInFile false: a first start, or a 1.0.0 file) takes the pair AudioPB's LIVE translator ran on --
+// translator.txt's LANGA / LANGB, and its MODE when it has one -- READ ONLY and ALL OR NOTHING, by seedFromAudioPB's
+// own reader and vocabulary (a key that does not read, a one-language pair, a file over 64 KB = nothing from it); else
+// the PLAYER's pair (cfg.mode / langA / langB, as loaded or seeded). Never fatal. Nothing of AudioPB's live TUNING comes
+// along (SPK* / PARTIAL* / COMMIT*: the user's file held exactly their defaults, measured 25/10). The CALLER decides it
+// is needed, and that this is not a test engine (a test engine copies the player's pair and reads nothing).
+// Returns true when AudioPB's pair was taken; `why` = one line for the log, either way.
+bool seedLivePair(TrConfig& cfg, std::string& why);
 
 // Resolve the payload, honouring the config's overrides. Returns a TrPaths whose
 // ok() is false when nothing usable was found (the caller reports that as an error
@@ -210,6 +270,9 @@ public:
 
     bool     alive() const;
     uint16_t port()  const { return port_; }
+    // SuVtitle 1.1.0: the process itself (nullptr when down), for its scheduling class -- a FILE job's children run
+    // BELOW_NORMAL, CPU and GPU, while the job runs (main_translator.cpp: Servers::setBackground).
+    HANDLE   process() const { return proc_; }
 
 private:
     HANDLE   proc_ = nullptr;
@@ -512,6 +575,12 @@ std::string toSimplified(const std::string& utf8, bool* changed = nullptr);
 // text exactly as written for every other language -- a zh-tw line is NEVER simplified, and a
 // ja / ko / yue line is never rewritten at all.
 std::string scriptNet(const std::string& utf8, const std::string& lang, bool* changed = nullptr);
+// THE COMPARISON FOLD (SuVtitle 1.1.0, RESUME 11): every Traditional Han character to its Simplified form, by the
+// character map (LCMapStringEx zh-CN, LCMAP_SIMPLIFIED_CHINESE) -- so ONE list of stock phrases, written in
+// Simplified, recognises a line in either script, and one that mixes them (the quiet shortlist below, the file job's
+// credits list). For COMPARING only: both sides go through it, and nothing folded is ever shown (toSimplified is the
+// converter). Everything that is not Traditional Han comes back as written; no converter = `utf8` as is.
+std::string hanFoldSimplified(const std::string& utf8);
 // `prompt` = the initial prompt this transcript was produced WITH, when there was one.
 // Whisper's answer to silence is to repeat what you told it, so the one filter that
 // existed before -- a shortlist of training-set captions -- stops seeing the junk the
@@ -526,6 +595,9 @@ std::string scriptNet(const std::string& utf8, const std::string& lang, bool* ch
 // Same gate, same reason: two or more PHONETIC symbols (IPA, modifier letters, U+1D00-1DBF) --
 // what `small` writes when it decodes noise ("recognis U+1D09 U+02B0,02CB,1D17,1D17,1D33,1D17 U+02B0,1D3E,1D07 Cream", 10/10) -- and the
 // other alphabets (Cyrillic, Greek, Arabic...) now count as letters, so a Russian line is speech.
+// The QUIET shortlist (training-set captions: "Thank you.", U+8C22,8C22,89C2,770B...) takes a line that is one entry OR
+// several glued end to end, compared through hanFoldSimplified (SuVtitle 1.1.0, RESUME 11: whisper's
+// U+8B1D,8B1D,89C0,770B U+8ACB,8A02,95B1 is two entries in a row, in the script the list did not hold).
 bool    looksLikeHallucination(const std::string& text, double segPeakDbfs,
                                const std::string& prompt = std::string());
 // The structural half of the above on its own: true when `text` has no letter or digit at all,
@@ -534,9 +606,28 @@ bool    looksLikeHallucination(const std::string& text, double segPeakDbfs,
 bool    isAnnotationOnly(const std::string& text);
 std::string langNameToCode(const std::string& name);   // "english" -> "en"; "" if unknown
 
-// (SUVTITLE SPLIT: AudioPB's `auto` preset PROBE -- ProbeVerdict, kProbeSlowMs, probeAutoPreset: one timed
-// transcription on the LIVE final server, to settle `auto` on quality / balanced / light -- is not ported.
-// It timed the live pair, which SuVtitle does not run; a FILE job is analysed ahead of the picture and
-// chooses its own models.)
+// ---------------------------------------------------------------------------
+// The `auto` preset's PROBE (T3, finally done). `auto` cannot be answered by asking
+// Windows what GPU this is -- the honest question is "how long does THIS machine take to
+// transcribe on the model we would like to use", and the only way to know is to do it once.
+//
+// Call it with the FINAL server's port, after the servers have come up as `quality`:
+// it times one draft-style transcription of three seconds of synthetic room tone and
+// returns the preset that timing justifies. NOT PERSISTED: a laptop that was on battery
+// when the tray started must be allowed to answer differently tomorrow.
+// (SuVtitle 1.1.0: back from AudioPB 50f79d6, with the live pair it times. A FILE job still chooses its own models.)
+// ---------------------------------------------------------------------------
+struct ProbeVerdict {
+    std::string preset = "balanced";   // quality | balanced | light
+    uint32_t    ms = 0;                // what the one timed call cost (0 = not timed)
+    std::string why;                   // one line, for the log and the selftest
+};
+// Above this, large-v3-turbo is not a subtitle engine on this machine -- it is a delay.
+// The bench floor for turbo is ~1.15 s a call and the segments that feed it arrive every
+// few seconds, so 2.5 s is "twice as slow as the machine this was designed on", not a
+// guess: past it, the finals queue up behind each other and the wait the user reads grows
+// without bound. Balanced (small/small, ~0.3 s) is then the honest answer.
+inline constexpr uint32_t kProbeSlowMs = 2500;
+ProbeVerdict probeAutoPreset(uint16_t finalPort, bool gpu, DWORD timeoutMs);
 
 } // namespace pbt

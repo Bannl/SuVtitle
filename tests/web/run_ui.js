@@ -67,6 +67,7 @@ function makeMedia() {
 // opts.ls: what this profile's localStorage already holds when the page boots.
 // opts.width / opts.height: the window's size (layoutClasses reads it).
 // opts.blockPlay: play() is REFUSED (no autoplay switch). opts.noWebView: the page in a plain BROWSER (its design mock).
+// opts.location (03/11/2026, the update banner's design mock): window.location -- e.g. { search: "?update=1.2.0" }; absent = none.
 function runTranslatorWindow(opts = {}) {
   // (LF whatever the checkout -- RV4-9: the sentinels' mutations are written against LF)
   const html = lf(typeof opts.html === "string" ? opts.html : fs.readFileSync(PAGE, "utf8"));
@@ -168,6 +169,7 @@ function runTranslatorWindow(opts = {}) {
     });
   }
   if (opts.noWebView) win.chrome = undefined;
+  if (opts.location) win.location = opts.location;
   const URLstub = { createObjectURL: (f) => "blob:mock/" + encodeURIComponent(String((f && f.name) || "")), revokeObjectURL() {} };
   const sandbox = {
     window: win, document: doc, console, localStorage, performance, URL: URLstub,
@@ -178,6 +180,18 @@ function runTranslatorWindow(opts = {}) {
     // SEEN doing so (the checks assert there is none).
     VTTCue: VTTCueStub,
   };
+  // opts.resizeObserver (1.1.0, THE NATIVE VIDEO ENGINE -- test_native.js): a ResizeObserver the TEST drives -- what the
+  // page observes is recorded, resizeFire() runs every callback (a browser's "the box changed size"). Absent by default:
+  // every other check runs the page as before (it guards on typeof ResizeObserver).
+  const roList = [];
+  if (opts.resizeObserver) {
+    sandbox.ResizeObserver = class {
+      constructor(cb) { this.cb = cb; this.els = []; roList.push(this); }
+      observe(e) { this.els.push(e); }
+      unobserve(e) { this.els = this.els.filter((x) => x !== e); }
+      disconnect() { this.els = []; }
+    };
+  }
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(script, sandbox, { filename: "index.html" });
@@ -187,7 +201,9 @@ function runTranslatorWindow(opts = {}) {
   return { doc, ids, outbox, objs, send, win, lsStore, dispatchDoc, pumpTimers: (ms) => clock.pump(ms),
            now: () => clock.now(), pumpRaf, rafPending: () => rafQ.length,
            setReduceMotion: (on) => { media.box.reduceMotion = !!on; },
-           pendingTimers: () => clock.pending(), script };
+           pendingTimers: () => clock.pending(), script,
+           resizeFire: () => roList.forEach((o) => { if (o.els.length) o.cb(o.els.map((target) => ({ target }))); }),
+           resizeObserved: () => roList.reduce((a, o) => a.concat(o.els), []) };
 }
 
 module.exports = { runTranslatorWindow, makeClock, makeMedia };

@@ -424,10 +424,10 @@ module.exports = function whChecks(ctx) {
   const d10NotWhenOn = (w) => {
     pair(w, "en", "fr");
     offOpen(w, { state: "probing" }, { audioOrd: -1 });
-    w.ids.fileTranslate.click();                               // the viewer turns translation ON
+    w.ids.fileTranslate.click();                               // the viewer presses Translate (U1: it was the switch)
     w.send(tMsg({ jobId: 3, phase: "loading", translate: true, tracks: tFr, audioOrd: 1 }));
     w.send(tMsg({ jobId: 3, phase: "loading", translate: true, tracks: tFr, audioOrd: 1, fresh: false }));
-    return subGets(w).length === 0;
+    return subGets(w).length === 0 && /^a:/.test(onSrc(w));   // (U1: and what is shown is the analysis being made)
   };
   // WHP-7 (R5): the forced fallback prefers the language that WILL be heard -- the app's audioOrd, not what Chromium plays
   // before the enforcement (the metadata came before the tracks); two forced tracks, nothing in B (Japanese)
@@ -1248,7 +1248,11 @@ module.exports = function whChecks(ctx) {
       R("      if (F.tracks.state === \"ready\") applyEmbeddedDefault(); else subDefaultArmed = \"\";", "      subDefaultArmed = \"\";"), d10Later);
     judge("D10: the viewer's own choice overridden",
       R("if (subPicked === itemKey() || subSrc !== \"off\" || wantExt || F.extSubId) return;", "if (wantExt || F.extSubId) return;"), d10UserFirst);
-    judge("D10: applied with translation on", R("if (F.translate || F.tracks.state !== \"ready\") return null;", "if (F.tracks.state !== \"ready\") return null;"), d10NotWhenOn);
+    // (U1: what keeps D10 away once the file is translated is now the PRESS itself -- Translate puts SuVtitle's subtitles on
+    //  screen (useOwnSubs: the source switched, the armed default dropped); embeddedDefault's own `F.translate` test stays as
+    //  a second wall, unreachable behind it: its old mutant could no longer fail)
+    judge("D10: applied with translation on (U1: the press leaves the screen to the default rule)",
+      R("    if (subSrc === \"audiopb\") return;\n    subPicked = itemKey();", "    return;\n    subPicked = itemKey();"), d10NotWhenOn);
     judge("WHP-12d: a \"chi\" track whose NAME says Traditional not preferred for a 繁體中文 B",
       R(" || subs.find((s) => named(s) && !s.forced)", ""), d10TradNamed);
     judge("D10: the exact code not before the family (review M12)",

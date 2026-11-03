@@ -1,0 +1,74 @@
+{
+  "_about": [
+    "SuVtitle - installer/models.json: THE list of the AI models SuVtitle installs in {app}\\models (one entry per file).",
+    "The LIGHT installer (the default of installer/SuVtitle_Setup.iss) embeds none of them: at install time it downloads from",
+    "`url` every model that {app}\\models lacks (or holds with another size), Inno Setup checks its `sha256`, and the file is",
+    "saved as `file`. The FULL installer (ISCC /DFull) embeds them, and refuses a bundle whose manifest has other bytes.",
+    "Every `url` is pinned to a COMMIT of the publisher's own Hugging Face repository, and the file at that commit is",
+    "byte-identical to ours: its Git LFS oid (the SHA-256 of the content, read from",
+    "https://huggingface.co/api/models/<repo>/tree/<commit>) equals `sha256`, and its size equals `size`. Never put another",
+    "quantization or another host here: find the byte-identical file, or keep the old entry.",
+    "After an edit: `node installer\\gen_iss_registry.js --write` (rewrites the generated models block of the .iss), then",
+    "`node installer\\gen_iss_registry.js --check`. deploy/make_bundle.js reads this file too (the models of a full bundle).",
+    "`license` is what the source page declares (checked 03/11/2026); `license_note` says what is not settled."
+  ],
+  "schema": 1,
+  "models": [
+    {
+      "file": "ggml-large-v3-turbo.bin",
+      "size": 1624555275,
+      "sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo.bin",
+      "source": { "repo": "ggerganov/whisper.cpp", "commit": "5359861c739e955e79d9a303bcbc70fb988958b1", "path": "ggml-large-v3-turbo.bin" },
+      "license": "MIT",
+      "why": "transcription (FILE quality auto / fast; the final model of the live quality preset)"
+    },
+    {
+      "file": "ggml-small.bin",
+      "size": 487601967,
+      "sha256": "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small.bin",
+      "source": { "repo": "ggerganov/whisper.cpp", "commit": "5359861c739e955e79d9a303bcbc70fb988958b1", "path": "ggml-small.bin" },
+      "license": "MIT",
+      "why": "LIVE transcription (the balanced preset, the draft of quality; a FILE job when turbo is absent)"
+    },
+    {
+      "file": "ggml-base.bin",
+      "size": 147951465,
+      "sha256": "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.bin",
+      "source": { "repo": "ggerganov/whisper.cpp", "commit": "5359861c739e955e79d9a303bcbc70fb988958b1", "path": "ggml-base.bin" },
+      "license": "MIT",
+      "why": "LIVE transcription (the light preset, for a PC without a fast GPU; a FILE job when turbo is absent)"
+    },
+    {
+      "file": "Qwen3-4B-Instruct-2507-Q5_K_M.gguf",
+      "size": 2889514080,
+      "sha256": "5bde5e9d883622acb02bf77fe7dcbc56a8b9a9ad4be78a72ca23a532658b4ecb",
+      "url": "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q5_K_M.gguf",
+      "source": { "repo": "unsloth/Qwen3-4B-Instruct-2507-GGUF", "commit": "a06e946bb6b655725eafa393f4a9745d460374c9", "path": "Qwen3-4B-Instruct-2507-Q5_K_M.gguf" },
+      "license": "Apache-2.0",
+      "license_note": "GGUF quantization by Unsloth of Qwen/Qwen3-4B-Instruct-2507 (Apache-2.0); both pages declare apache-2.0.",
+      "why": "translation (the engine default)"
+    },
+    {
+      "file": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+      "size": 1117320736,
+      "sha256": "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
+      "url": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/91cad51170dc346986eccefdc2dd33a9da36ead9/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+      "source": { "repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF", "commit": "91cad51170dc346986eccefdc2dd33a9da36ead9", "path": "qwen2.5-1.5b-instruct-q4_k_m.gguf" },
+      "license": "Apache-2.0",
+      "why": "translation fallback (preset light; used when the 4B is absent)"
+    },
+    {
+      "file": "3dspeaker_campplus_zh_en_advanced.onnx",
+      "size": 28281164,
+      "sha256": "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2",
+      "url": "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/0743f301363dec56491a490f6d6cbc9d67f9a3bf/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+      "source": { "repo": "csukuangfj/speaker-embedding-models", "commit": "0743f301363dec56491a490f6d6cbc9d67f9a3bf", "path": "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx" },
+      "license": "Apache-2.0 (source model)",
+      "license_note": "ONNX build of the 3D-Speaker CAM++ model iic/speech_campplus_sv_zh_en_16k-common_advanced, whose ModelScope metadata declares Apache License 2.0; the Hugging Face repository of this ONNX build has no model card and states no license (THIRD_PARTY_NOTICES.md).",
+      "why": "LIVE speaker model (CAM++ through sherpa-onnx): tells the voices on one strip apart"
+    }
+  ]
+}

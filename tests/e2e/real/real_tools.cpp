@@ -23,6 +23,9 @@
 //   real_tools ident <path>                size + write time (the player.txt / resume lines)
 //   real_tools kids <pid>                  that process's child processes (pid, exe)
 //   real_tools alive <pid>                 is that process still running
+//   real_tools idle                        ms since the user's last keyboard / mouse input + the foreground-lock timeout
+//   real_tools savedlg <pid> <path> [ms]   (LIVE, 25/10) that process's common Save dialog: the file name set to <path>, OK clicked,
+//                                          by messages only (no focus); waits <= ms (default 8000) for the dialog to appear
 //   a copy named canary.exe, started at all: writes canary_ran.txt next to itself (the refusal test hands its path to
 //                                          --play: it must never run)
 // Every answer is one JSON line on stdout (non-ASCII as \uXXXX).
@@ -118,7 +121,7 @@ static int mkrecord(const std::wstring& media, const std::string& a, const std::
     return ok ? 0 : 1;
 }
 
-struct Win { HWND h; std::wstring cls, title; RECT r; bool visible, noact, caption, sysmenu, minbox, maxbox, appwindow, owned, topmost; };
+struct Win { HWND h; std::wstring cls, title; RECT r; bool visible, noact, caption, sysmenu, minbox, maxbox, appwindow, owned, topmost, iconic; };
 static BOOL CALLBACK collect(HWND h, LPARAM lp) {
     auto* p = reinterpret_cast<std::pair<DWORD, std::vector<Win>*>*>(lp);
     DWORD pid = 0;
@@ -140,7 +143,23 @@ static BOOL CALLBACK collect(HWND h, LPARAM lp) {
     w.appwindow = (ex & WS_EX_APPWINDOW) != 0;
     w.owned = ::GetWindow(h, GW_OWNER) != nullptr;
     w.topmost = (ex & WS_EX_TOPMOST) != 0;
+    w.iconic = ::IsIconic(h) != FALSE;          // (fix round: a recovery must leave a minimized window minimized, RVB-3)
     p->second->push_back(w);
+    return TRUE;
+}
+
+// savedlg's search: the file-name Edit (a child of the dialog's ComboBox) and the OK button (id 1) of a common Save dialog
+struct FindKids { HWND edit = nullptr, ok = nullptr; };
+static BOOL CALLBACK findKids(HWND h, LPARAM lp) {
+    auto* k = reinterpret_cast<FindKids*>(lp);
+    wchar_t cls[64] = {};
+    ::GetClassNameW(h, cls, 64);
+    if (!k->edit && !::_wcsicmp(cls, L"Edit")) {
+        wchar_t pc[64] = {};
+        if (::GetParent(h)) ::GetClassNameW(::GetParent(h), pc, 64);
+        if (!::_wcsicmp(pc, L"ComboBox") || !::_wcsicmp(pc, L"ComboBoxEx32")) k->edit = h;
+    }
+    if (!k->ok && !::_wcsicmp(cls, L"Button") && ::GetDlgCtrlID(h) == IDOK) k->ok = h;
     return TRUE;
 }
 
@@ -175,6 +194,18 @@ int wmain(int argc, wchar_t** argv) {
                     static_cast<unsigned long>(pid), js(c).c_str());
         return 0;
     }
+    // idle: how long the USER has not touched the keyboard / mouse, and Windows' foreground-lock timeout (SPI_GETFOREGROUNDLOCKTIMEOUT):
+    // once the user has been idle longer than that, ANY process may take the foreground (an OS Save dialog included) -- a test that
+    // asserts "this process never took the foreground" is only meaningful while the user is not idle.
+    if (cmd == L"idle") {
+        LASTINPUTINFO li{}; li.cbSize = sizeof li;
+        DWORD lock = 0;
+        ::SystemParametersInfoW(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, &lock, 0);
+        const bool got = ::GetLastInputInfo(&li) != FALSE;
+        std::printf("{\"ok\":%s,\"idleMs\":%lu,\"lockTimeoutMs\":%lu}\n", got ? "true" : "false",
+                    got ? static_cast<unsigned long>(::GetTickCount() - li.dwTime) : 0ul, static_cast<unsigned long>(lock));
+        return 0;
+    }
     if (cmd == L"wins" && argc >= 3) {
         std::vector<Win> v;
         std::pair<DWORD, std::vector<Win>*> p{ static_cast<DWORD>(_wtoi(argv[2])), &v };
@@ -183,15 +214,49 @@ int wmain(int argc, wchar_t** argv) {
         for (size_t i = 0; i < v.size(); ++i) {
             char b[512];
             std::snprintf(b, sizeof b, ",\"x\":%ld,\"y\":%ld,\"w\":%ld,\"h\":%ld,\"visible\":%s,\"noactivate\":%s,\"caption\":%s,"
-                          "\"sysmenu\":%s,\"minbox\":%s,\"maxbox\":%s,\"appwindow\":%s,\"owned\":%s,\"topmost\":%s}",
+                          "\"sysmenu\":%s,\"minbox\":%s,\"maxbox\":%s,\"appwindow\":%s,\"owned\":%s,\"topmost\":%s,\"iconic\":%s}",
                           v[i].r.left, v[i].r.top, v[i].r.right - v[i].r.left, v[i].r.bottom - v[i].r.top,
                           v[i].visible ? "true" : "false", v[i].noact ? "true" : "false", v[i].caption ? "true" : "false",
                           v[i].sysmenu ? "true" : "false", v[i].minbox ? "true" : "false", v[i].maxbox ? "true" : "false",
-                          v[i].appwindow ? "true" : "false", v[i].owned ? "true" : "false", v[i].topmost ? "true" : "false");
+                          v[i].appwindow ? "true" : "false", v[i].owned ? "true" : "false", v[i].topmost ? "true" : "false",
+                          v[i].iconic ? "true" : "false");
             o += (i ? "," : "") + std::string("{\"cls\":") + js(v[i].cls) + ",\"title\":" + js(v[i].title) + b;
         }
         std::printf("%s]}\n", o.c_str());
         return 0;
+    }
+    // savedlg <pid> <full path> [wait ms]: the common Save dialog of that process (class #32770, a top-level window of the pid --
+    // the Live window's Export), driven by MESSAGES only: its file-name Edit gets the path (WM_SETTEXT), its OK button (id 1) a
+    // BM_CLICK. No activation, no focus, no input injected. Waits up to <wait ms> (default 8000) for the dialog to exist.
+    if (cmd == L"savedlg" && argc >= 4) {
+        const DWORD want = static_cast<DWORD>(_wtoi(argv[2]));
+        const ULONGLONG until = ::GetTickCount64() + (argc >= 5 ? static_cast<ULONGLONG>(_wtoi(argv[4])) : 8000ULL);
+        for (;;) {
+            std::vector<Win> v;
+            std::pair<DWORD, std::vector<Win>*> p{ want, &v };
+            ::EnumWindows(collect, reinterpret_cast<LPARAM>(&p));
+            for (const auto& w : v) {
+                if (w.cls != L"#32770" || !w.visible) continue;
+                FindKids k;
+                ::EnumChildWindows(w.h, findKids, reinterpret_cast<LPARAM>(&k));
+                if (!k.edit || !k.ok) continue;
+                const std::wstring path = argv[3];
+                const LRESULT set = ::SendMessageW(k.edit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(path.c_str()));
+                wchar_t got[1024] = {};
+                ::SendMessageW(k.edit, WM_GETTEXT, 1024, reinterpret_cast<LPARAM>(got));
+                // who has the foreground at this moment (before the click closes the dialog): the dialog itself, or someone else
+                DWORD fgPid = 0;
+                wchar_t fgCls[128] = {};
+                if (const HWND fg = ::GetForegroundWindow()) { ::GetWindowThreadProcessId(fg, &fgPid); ::GetClassNameW(fg, fgCls, 128); }
+                const BOOL clicked = (set && path == got) ? ::PostMessageW(k.ok, BM_CLICK, 0, 0) : FALSE;
+                std::printf("{\"ok\":%s,\"title\":%s,\"x\":%ld,\"y\":%ld,\"w\":%ld,\"h\":%ld,\"text\":%s,\"fgpid\":%lu,\"fgcls\":%s}\n", clicked ? "true" : "false",
+                            js(w.title).c_str(), w.r.left, w.r.top, w.r.right - w.r.left, w.r.bottom - w.r.top, js(got).c_str(),
+                            static_cast<unsigned long>(fgPid), js(fgCls).c_str());
+                return clicked ? 0 : 1;
+            }
+            if (::GetTickCount64() > until) { std::printf("{\"ok\":false,\"err\":\"no Save dialog for that pid\"}\n"); return 1; }
+            ::Sleep(100);
+        }
     }
     if (cmd == L"run" && argc >= 3) {
         std::wstring line = argv[2];
@@ -209,6 +274,21 @@ int wmain(int argc, wchar_t** argv) {
         std::printf("{\"ok\":true,\"pid\":%lu,\"exited\":%s,\"exit\":%lu}\n", pi.dwProcessId, w == WAIT_OBJECT_0 ? "true" : "false", code);
         ::CloseHandle(pi.hThread);
         ::CloseHandle(pi.hProcess);
+        return 0;
+    }
+    // minimize | restore <class> <pid> (fix round 26/10): ShowWindowAsync SW_SHOWMINNOACTIVE / SW_SHOWNOACTIVATE from THIS process --
+    // never an activation (the user's foreground is not ours): the RVB-3 check minimizes the Live window before a browser crash
+    if ((cmd == L"minimize" || cmd == L"restore") && argc >= 4) {
+        const DWORD want = static_cast<DWORD>(_wtoi(argv[3]));
+        std::vector<Win> v;
+        std::pair<DWORD, std::vector<Win>*> p{ want, &v };
+        ::EnumWindows(collect, reinterpret_cast<LPARAM>(&p));
+        HWND h = nullptr;
+        for (const auto& w : v) if (w.cls == argv[2]) { h = w.h; break; }
+        if (!h || !want) { std::printf("{\"ok\":false,\"err\":\"no such window for that pid\"}\n"); return 1; }
+        const BOOL ok = ::ShowWindowAsync(h, cmd == L"minimize" ? SW_SHOWMINNOACTIVE : SW_SHOWNOACTIVATE);
+        ::Sleep(300);
+        std::printf("{\"ok\":%s,\"iconic\":%s}\n", ok ? "true" : "false", ::IsIconic(h) ? "true" : "false");
         return 0;
     }
     if ((cmd == L"post-close" && argc >= 4) || (cmd == L"place" && argc >= 8)) {

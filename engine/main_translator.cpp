@@ -4,36 +4,50 @@
 // SUVTITLE SPLIT (2026-10-23): ported from AudioPB's PatchBus repo, translator/main_translator.cpp at commit
 // 641f1aa (APB_TRANSLATOR "v1.0.6"). AudioPBTranslator.exe was the Translator card as a process: a fabric
 // consumer, a live speech pipeline AND the FILE MODE that subtitles a recording. SuVtitle took the file half
-// (SPLIT_PLAN S5): this is AudioPB's helper MINUS ITS LIVE PATH -- no fabric consumer (TrAudio, and the
-// driver's shm / ring_buffer / async_src are not linked), no LINE / PART / END streaming, no diarization
-// (TrSpeaker, sherpa), no live preset machinery, no live selftest. Kept whole: the two child servers and their
+// (SPLIT_PLAN S5): this was AudioPB's helper MINUS ITS LIVE PATH. Kept whole: the two child servers and their
 // lifecycle (GPU Vulkan, the CPU fallback, --cpu), FILE MODE v1 / v2 / WF / WH, FPROXY, FFOCUS, the language
 // machinery (the pair, zh / zh-tw via Windows ELS), DTW, and every file selftest with its offline mode.
 // Internal names stay AudioPB's on purpose (S3: pbt::, trpipe::, TrConfig...); what the user or Windows sees
-// is SuVtitle's. Each removal leaves a "(SUVTITLE SPLIT: ...)" note where the code was, saying what and why;
+// is SuVtitle's. Each removal left a "(SUVTITLE SPLIT: ...)" note where the code was, saying what and why;
 // docs\PROGRESS_S-ENG.md has the list.
+// SuVtitle 1.1.0 (2026-10-25) brings the LIVE PATH back (docs\LIVE_PLAN.md), from AudioPB Translator 1.1.0 (commit
+// 50f79d6, the live translator alone): the VAD (TrAudio), the live line, the commit-as-you-go engine, the live
+// finals, diarization (TrSpeaker), LINE / PART / END streaming, the live preset machinery and the live selftests
+// (--selftest-live, --selftest-spk) -- re-inserted where the split's notes stood, the live functions verbatim. What
+// changed is the FRONT END: the audio comes from the engine's OWN capture (TrCaptureHub, TrCaptureApi.h: WASAPI
+// inputs, an output's loopback, one application's) instead of AudioPB's routing, which never enters this repository.
+// Live and a file analysis never run at the same time: the pipeline runs one of three modes (pipelineMain).
+// docs\PROGRESS_L1a.md has the port's record.
 //
-// Three things live in here:
+// Four things live in here:
 //
 //   * two CHILD SERVERS on 127.0.0.1 (whisper.cpp's ASR, llama.cpp's Qwen) that we
 //     spawn, watch, restart and kill -- never install, never expose (TrEngine.h);
+//   * the LIVE PATH: the capture hub feeds 16 kHz audio to the VAD (TrAudio.h), which cuts it into UTTERANCES
+//     and names the SPEAKER by the loudest input -- then the DIARIZATION stage (TrSpeaker.h) names him by VOICE,
+//     the only thing that works when several people share one microphone; drafts, commits and finals turn them
+//     into LINE / PART / END;
 //   * the FILE JOB, a state machine run one bounded step per lap on the pipeline thread
 //     (TrFileJob.h decides windows and cues, TrMedia.h reads the media), and the FPROXY worker;
-//   * a duplex pipe servant that streams the job's messages to SuVtitle.exe (TrPipe.h).
+//   * a duplex pipe servant that streams both paths' messages to SuVtitle.exe (TrPipe.h).
 //
 // Modes:
 //   SuVtitleEngine.exe --pipe <name> [--parent pid] [--preset quality|balanced|light|auto]
-//                      [--mode auto|a2b|b2a] [--cpu] [--nofabric]
+//                      [--mode auto|a2b|b2a] [--cpu] [--nofabric] [--test-clock virtual]
 //   SuVtitleEngine.exe --selftest [offline]             the engine's whole proof (see runSelftest)
+//   SuVtitleEngine.exe --selftest-live | --selftest-spk the live path's, on the real models (use --cpu)
+//   SuVtitleEngine.exe --selftest-gpuprobe              the start's GPU probe (wave GPU; NEVER with --cpu)
 //   SuVtitleEngine.exe --selftest-filemode | -v2 | -wh [offline], --selftest-wf, --selftest-file <media>
 //
 // Exits when: QUIT arrives, the pipe breaks, or the parent dies (an app crash must
 // not leave an orphan holding two child servers and their models).
 // =============================================================================
+#include <winsock2.h>       // fix round (RESUME 9): [C8c]'s stand-in live pair, a loopback socket (before windows.h)
 #include <windows.h>
 #include <shellapi.h>
 #include <crtdbg.h>        // WH: --selftest-wh routes CRT asserts to stderr (quietCrashes)
 #include <psapi.h>         // fix round RV3-2: [0s] bounds the bounded reads' memory (GetProcessMemoryInfo)
+#include <tlhelp32.h>      // the GPU wave: --selftest-gpuprobe's orphan check (a process snapshot: tasklist's own source)
 
 #include <algorithm>
 #include <atomic>
@@ -54,12 +68,15 @@
 #include <vector>
 
 #include "EngineVersion.h"   // SUVTITLE_ENGINE_VERSION_STR -- one number, shared with engine.rc
+#include "TrAudio.h"         // SuVtitle 1.1.0: the live path's VAD (AudioPB 50f79d6), fed by the capture hub
+#include "TrCaptureApi.h"    // ... and the hub itself (WASAPI: engine/TrCaptureHub.cpp)
 #include "TrEngine.h"
 #include "TrFileJob.h"
 #include "TrMedia.h"
+#include "TrMpvAudio.h"      // the GPU wave: environmentWithVulkanFallback -- the start's GPU probe runs in the children's environment
 #include "TrPipe.h"          // ..\common\ (the app <-> engine contract; director-owned)
+#include "TrSpeaker.h"       // SuVtitle 1.1.0: diarization (CAM++ through sherpa-onnx, loaded at run time)
 #include "TrText.h"
-// (SUVTITLE SPLIT: TrAudio.h -- the fabric consumer -- and TrSpeaker.h -- diarization -- stayed in AudioPB.)
 
 namespace {
 
@@ -68,10 +85,16 @@ using namespace pbt;
 // Deadlines. The ASR on a CPU-only machine with the quality preset is legitimately
 // slow (the bench measured 3.6 s on a GPU for 16 s of audio; CPU is several times
 // that), so the leash is long. Past it, the server is wedged and killing it is right.
-// (SUVTITLE SPLIT: the live final's kAsrTimeoutMs, the live pair's kRespawnBackoff and the `auto` probe's
-// kProbeTimeoutMs went with the live path; a FILE window has its own kFileAsrTimeoutMs, below.)
+// (A FILE window has its own kFileAsrTimeoutMs, below. The live final's, the live pair's backoff and the `auto`
+// probe's leash came back with the live path in 1.1.0.)
+constexpr DWORD kAsrTimeoutMs   = 120000;
 constexpr DWORD kMtTimeoutMs    = 60000;
 constexpr DWORD kReadyMs        = 180000;   // model load: large-v3-turbo is 1.6 GB off disk
+constexpr DWORD kRespawnBackoff = 4000;
+// The `auto` probe's own leash. It is deliberately NOT kAsrTimeoutMs: the probe exists to
+// find out whether this machine is too slow, so a probe that hangs for two minutes has
+// already answered the question and must not spend two minutes saying so.
+constexpr DWORD kProbeTimeoutMs = 30000;
 
 // THE SELFTEST'S STAND-IN MODEL (WB). "" = every translation comes from the MT server -- the
 // only value the helper ever runs with. The selftest sets it to a reply in the WRONG Chinese
@@ -79,6 +102,10 @@ constexpr DWORD kReadyMs        = 180000;   // model load: large-v3-turbo is 1.6
 // between the model and the screen on the live finals and on the file job alike: the real
 // models rarely misbehave on cue, so without a stand-in the nets are only ever proved by luck.
 std::string g_mtReplyForTest;
+// ... and its stand-in DECODE: "" = whisper's own words. Set, a live final's transcript is replaced
+// by this text, labelled Chinese, right after the (real) decode -- the only way to hand the
+// source net a Traditional line in a zh session on cue.
+std::string g_asrZhTextForTest;
 
 // TEST-ONLY: EVERY CHILD SERVER ON THE CPU, the GPU not even opened (WD, user 11/10: "utilise le cpu
 // pour les tests, j'utilise le gpu"). `--cpu` or AUDIOPB_TR_FORCE_CPU=1. The shipping default stays
@@ -139,10 +166,156 @@ bool g_fileNoDtwForTest = false;
 // server dying mid-job) -- the job must go on WITHOUT DTW. Never set by the helper itself.
 bool g_fileAsrFailOnceForTest = false;
 
-// (SUVTITLE SPLIT: AudioPB's live-line constants and helpers were here -- kPartialTimeoutMs, kPopDeadlineMs,
-// kPartialBackoffMs, kPartialMtDeltaBytes, kOutboxCap, waitMsFrom, textDistance -- then the W3 "commit as you
-// go" engine: CommitCfg, kCommitMinSec, CommitPick, commitPick. They cut a LIVE stream into lines; a FILE job
-// cuts its windows and cues in TrFileJob.*, which came along whole.)
+// A DRAFT gets a much shorter leash than a final, and the difference is the point: a
+// final is the product and is worth waiting two minutes for on a slow machine, while a
+// draft is a nicety that must never be able to sit in front of one. This number is the
+// hard ceiling on the only delay a final can suffer because of the live line.
+constexpr DWORD kPartialTimeoutMs = 12000;
+// How long the pipeline blocks waiting for a FINAL before it looks at the live line.
+// It is ALSO, and mostly, the age of a draft: a snapshot the audio thread published one
+// microsecond after this wait began sits there until the wait expires. At 250 ms that was
+// up to 250 ms of pure plumbing on top of a 600 ms cadence -- a sixth of the interval the
+// live line is supposed to fill -- so W1 cut it to 20.
+//
+// /!\ WHY NOT A CONDITION VARIABLE. The obvious fix is to notify qcv_ from the partial tap
+// and widen pop()'s predicate. It cannot be made race-free here: the predicate would read
+// pendHas_ (pmx_) while the waiter holds qmx_, and for the notification not to be LOST the
+// audio thread would have to signal while holding qmx_ -- which is precisely what TrAudio.h
+// forbids, because the audio thread must never wait on the final queue's lock. A missed
+// notify would silently cost a whole deadline, i.e. exactly the bug this is fixing. So the
+// deadline stays a poll and simply becomes short: 50 laps a second of "check two process
+// handles and sleep", against a cost of ~0.01 % of one core, is the honest trade.
+// (Windows rounds a wait up to the scheduler tick, so the real figure is 15-31 ms.)
+constexpr uint32_t kPopDeadlineMs = 20;
+// After a draft's transport fails, stop drafting for this long. A wedged ASR would
+// otherwise cost kPartialTimeoutMs on EVERY pass round this loop, starving the very
+// finals whose failure is what actually diagnoses the wedge and rebuilds the servers.
+constexpr uint64_t kPartialBackoffMs = 4000;
+// How much the transcript must move before a draft is worth a second model call. BYTES,
+// not codepoints, and deliberately: 8 bytes is about eight Latin characters or two to
+// three Han ideographs -- in both scripts, roughly "one more word", which is the unit at
+// which the eye notices that the translation has stopped tracking the source.
+constexpr size_t kPartialMtDeltaBytes = 8;
+// The servant's outbox. Bounded like everything else that crosses a thread here: a UI
+// that stopped draining costs the OLDEST messages, never memory.
+constexpr size_t kOutboxCap = 64;
+
+// waitMs, in ONE expression, so the selftest asserts on the same arithmetic the shipping
+// servant performs rather than on a copy of it that could drift. The origin is "when the
+// speech this line covers ended" -- the VAD cut for a closing line, the sentence's own end
+// for a committed one. The clamp is not decoration: a committed sentence's end is derived
+// from word timestamps against a segment's open, and a feed faster than real time (the
+// selftest) can legitimately place it in the future.
+uint32_t waitMsFrom(uint64_t endTickMs) {
+    const uint64_t now = ::GetTickCount64();
+    return (uint32_t)(now > endTickMs ? (now - endTickMs) : 0ull);
+}
+
+// How far apart two transcripts are, cheaply: everything after their common prefix, on
+// both sides. Catches BOTH ways a draft moves -- growing at the end (the usual case) and
+// whisper rewriting the tail once it has heard more (the case a length comparison alone
+// would miss entirely).
+size_t textDistance(const std::string& a, const std::string& b) {
+    size_t i = 0;
+    while (i < a.size() && i < b.size() && a[i] == b[i]) ++i;
+    return (a.size() - i) + (b.size() - i);
+}
+
+// ===========================================================================
+// COMMIT AS YOU GO (wave W3) -- the text half of the engine.
+//
+// WHAT IT FIXES. Until this wave a sentence could not be finalised before its VAD
+// segment closed, and in continuous speech a segment closes at the 8 s force-cut -- so
+// the user read a sentence two or three sentences after saying it ("1-2 phrases
+// derriere", 17/09). Nothing in the ASR could fix that: it is the segmentation.
+//
+// THE MECHANISM (LocalAgreement-2, as in whisper_streaming). Every draft transcribes the
+// open segment from the last commit to now, and whisper-server hands back TIMESTAMPED
+// WORDS. Two consecutive drafts of the same window agree on a prefix; the words in that
+// prefix are STABLE -- whisper has stopped changing its mind about them. The last stable
+// word that ends a sentence, and that is far enough from the end of the window for
+// whisper to have HEARD what follows it, becomes a finished line then and there, and the
+// audio behind it is cut off the front of the open segment (TrAudio::commitUpTo) so it is
+// never transcribed, translated, or displayed again.
+//
+// THE THREE NUMBERS, and why none of them is a taste:
+//   * LOOKAHEAD (0.7 s): the last word of a window is the one whisper most often revises.
+//     Committing it is the one mistake this engine cannot take back, because committed
+//     text is text the user has already read.
+//   * PAUSE / MAXSEC (0.35 s / 4 s): a speaker who never punctuates would otherwise never
+//     commit, and 4 s of uncommitted speech is already most of the delay this wave exists
+//     to remove. Past it, a breath is accepted as a full stop.
+//   * one draft of LATENCY after every commit: the agreement restarts from zero, because
+//     the previous draft describes a window that no longer exists. That is the price of
+//     never committing on a single decode's word, and it is the right price.
+// ===========================================================================
+struct CommitCfg {
+    bool   on        = true;
+    double lookahead = 0.7;
+    double pause     = 0.35;
+    double maxSec    = 4.0;
+};
+
+// A committed sentence shorter than this is not a sentence -- it is a server that gave us
+// zeroed timestamps, and the guard is here because that failure would otherwise commit an
+// empty prefix over and over.
+constexpr double kCommitMinSec = 0.20;
+
+// WHERE TO CUT, given the stable prefix. Returns the last stable word that may close a
+// sentence, and the sample count of the audio that sentence owns.
+struct CommitPick {
+    bool   has = false;
+    size_t k = 0;               // last word of the sentence (index into `words`)
+    size_t cutSamples = 0;      // the sentence is snapshot[0, cutSamples)
+    double endSec = 0.0;        // ... and it ENDED here, inside the snapshot
+    bool   byPause = false;     // true = the fallback rule fired, not a punctuation mark
+};
+CommitPick commitPick(const std::vector<AsrWord>& words, size_t stableWords,
+                      double snapSec, const CommitCfg& cfg) {
+    CommitPick out;
+    if (!stableWords || words.empty()) return out;
+    // "Whisper must have heard what follows": a word may only close a sentence if the
+    // window still holds `lookahead` seconds of audio after it.
+    const double latest = snapSec - cfg.lookahead;
+    if (latest <= 0.0) return out;
+
+    size_t pick = (size_t)-1;
+    bool   byPause = false;
+    for (size_t k = 0; k < stableWords; ++k) {
+        if (words[k].end <= 0.0 || words[k].end > latest) continue;
+        if (endsSentence(words[k].text)) pick = k;      // the LAST one wins: a sentence is
+    }                                                   // as long as the speaker made it
+    if (pick == (size_t)-1) {
+        // THE PAUSE RULE, armed only when the wait is already the problem. `stable` here is
+        // how much uncommitted speech whisper has settled on -- if it is under MAXSEC the
+        // user is not waiting long enough for a guess to be worth its risk.
+        const double stable = words[stableWords - 1].end;
+        if (stable >= cfg.maxSec) {
+            for (size_t k = 0; k + 1 < words.size() && k < stableWords; ++k) {
+                if (words[k].end <= 0.0 || words[k].end > latest) continue;
+                if (words[k + 1].start - words[k].end >= cfg.pause) { pick = k; byPause = true; }
+            }
+        }
+    }
+    if (pick == (size_t)-1) return out;
+
+    // The cut: a shade past the word's end, but never into the next word's attack. Both
+    // margins are small on purpose -- 100 ms of trailing air keeps the final's decoder from
+    // clipping the last consonant, 50 ms of clearance keeps the next word out of a sentence
+    // it does not belong to.
+    double hi = words[pick].end + 0.10;
+    if (pick + 1 < words.size()) hi = std::min(hi, words[pick + 1].start - 0.05);
+    if (hi < words[pick].end) hi = words[pick].end;
+    if (hi > snapSec)         hi = snapSec;
+    if (hi < kCommitMinSec)   return out;         // zeroed timestamps, not a sentence
+
+    out.has        = true;
+    out.k          = pick;
+    out.endSec     = hi;
+    out.byPause    = byPause;
+    out.cutSamples = (size_t)(hi * (double)kAsrRate + 0.5);
+    return out;
+}
 
 std::wstring utf8ToWideL(const std::string& s) {
     if (s.empty()) return {};
@@ -235,6 +408,314 @@ void openEngineLog() {
 }
 
 // ---------------------------------------------------------------------------
+// A FILE JOB MUST NEVER FREEZE THE FILM IT ANALYSES (SuVtitle 1.1.0, the user's decision of 25/10; the recipe measured
+// on his RX 7700 XT). While a job runs, its two children -- the FILE whisper and the MT -- run BELOW_NORMAL, on the CPU
+// (SetPriorityClass) AND on the GPU (the scheduling class of the process's GPU work); NORMAL again when the live path
+// starts and at idle. Servers::setBackground says when; this says how. The GPU half is gdi32's
+// D3DKMTSetProcessSchedulingPriorityClass, looked up at run time (no WDK header or import library for one call). It
+// only takes on a process that has ALREADY opened its GPU device -- before that it answers STATUS_INVALID_PARAMETER
+// (0xC000000D) -- so it is applied once the server has answered its health check (its model loaded), and a failure is
+// one line of the engine log, never an error: the CPU half stands. Every change writes ONE engine-log line -- which
+// child, which class, both results -- because the user's machine is where this gets read.
+// ---------------------------------------------------------------------------
+typedef LONG (APIENTRY* PfnKmtPrio)(HANDLE, int);   // D3DKMT_SCHEDULINGPRIORITYCLASS: 1 = BELOW_NORMAL, 2 = NORMAL
+PfnKmtPrio kmtSetPrio() {
+    static const PfnKmtPrio f = [] {
+        const HMODULE m = ::LoadLibraryExW(L"gdi32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return m ? reinterpret_cast<PfnKmtPrio>(reinterpret_cast<void*>(
+                       ::GetProcAddress(m, "D3DKMTSetProcessSchedulingPriorityClass")))
+                 : nullptr;
+    }();
+    return f;
+}
+
+struct PrioResult {
+    bool  cpuOk     = false;
+    DWORD cpuErr    = 0;        // GetLastError, when the CPU half failed
+    bool  gpuCalled = false;    // false: this gdi32 has no such export -- the CPU half alone
+    LONG  gpuStatus = 0;        // the GPU half's NTSTATUS: 0 = applied
+};
+
+// TEST-ONLY ([0r], [C8]): every line setProcessPriority writes is also handed here, and Servers::setBackground treats
+// this process like a server of a FILE job ([C8]'s stand-in jobs bring no server up). Both empty in the product.
+std::function<void(const std::string&)> g_prioLogForTest;
+HANDLE g_prioStandInForTest = nullptr;
+
+PrioResult setProcessPriority(HANDLE proc, bool low, const std::string& who) {
+    PrioResult r;
+    r.cpuOk = ::SetPriorityClass(proc, low ? BELOW_NORMAL_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS) != FALSE;
+    if (!r.cpuOk) r.cpuErr = ::GetLastError();
+    if (const PfnKmtPrio f = kmtSetPrio()) {
+        r.gpuCalled = true;
+        r.gpuStatus = f(proc, low ? 1 : 2);
+    }
+    char gpu[64];
+    if (!r.gpuCalled)          std::snprintf(gpu, sizeof(gpu), "not available (gdi32)");
+    else if (r.gpuStatus == 0) std::snprintf(gpu, sizeof(gpu), "ok");
+    else                       std::snprintf(gpu, sizeof(gpu), "status 0x%08lX, left as it was", (unsigned long)r.gpuStatus);
+    const std::string line = "[SuVtitleEngine] priority: " + who + " (pid " + std::to_string(::GetProcessId(proc))
+                           + ") -> " + (low ? "BELOW_NORMAL" : "NORMAL") + " -- CPU "
+                           + (r.cpuOk ? std::string("ok") : "failed (error " + std::to_string(r.cpuErr) + ")")
+                           + ", GPU " + gpu + "\n";
+    engineLog(line);
+    if (g_prioLogForTest) g_prioLogForTest(line);
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// THE START'S GPU PROBE (SuVtitle 1.1.0, wave GPU -- docs\PROGRESS_GPU.md, NATIVE_CONTRACT section 11).
+// A PC whose Vulkan loader has no driver behind it -- no GPU, or a graphics driver that never installed Vulkan -- lets a
+// child server started with the Vulkan flags COME UP: whisper-server says "no GPU found", llama-server registers no
+// Vulkan device, and both run on their CPU back-ends. Servers (below) took that for the GPU: STATE gpu 1, "(GPU)" on
+// screen, and `auto` timed three seconds of turbo ON THE CPU (-> balanced, even quality) where probeAutoPreset's own CPU
+// branch answers light at once. So ONCE per engine (runHost: after the HELLO, before the pipeline thread) the payload's
+// llama-server is asked what it sees -- `--list-devices`: no model, ~0.2 s -- and ONLY a positive "none" puts every
+// child on the CPU: the "(none)" line under "Available devices:", and exit code 0. Then forceCpuChildren() -- DEVICE
+// cpu's own mechanism, 0 MB of VRAM -- IN MEMORY ONLY: engine.txt keeps DEVICE auto, so a driver installed later is used
+// at the next start. Anything else -- a device listed, an exit code, no output, a shape this code does not know, a
+// timeout, no exe -- is the GPU path exactly as before: the probe makes an engine more honest, never worse. Not run at
+// all when every child is on the CPU already (DEVICE cpu, --cpu): the GPU is never even opened.
+// Measured (02/11/2026, payload b10825, RX 7700 XT): "Available devices:" / "  Vulkan0: AMD Radeon RX 7700 XT (12272 MiB,
+// 11312 MiB free)", exit 0, ~0.2 s; with VK_LOADER_DRIVERS_DISABLE=*: "Available devices:" / "  (none)", exit 0, 0.17-0.19 s
+// -- stdout only, CRLF. llama.cpp lists every device that is not the CPU (an integrated GPU too: "listed", the GPU path).
+// NOT covered: a device llama.cpp lists that whisper.cpp's own Vulkan cannot use (the GPU path, as before).
+// ---------------------------------------------------------------------------
+constexpr DWORD  kGpuProbeBoundMs    = 10000;       // a cold Vulkan start after a boot can pass 1 s (a model load has 180 s)
+constexpr size_t kGpuProbeKeepBytes  = 64 * 1024;   // what is KEPT of its output; the rest is read and dropped
+constexpr UINT   kGpuProbeKilledExit = 0x6B11;      // the exit code of a probe killed at its bound (the selftest reads it)
+
+struct GpuProbe {
+    enum Verdict { kUnknown = 0, kListed, kNone };
+    Verdict     verdict = kUnknown;
+    bool        ran = false;                 // a child was started (false: not run, or it could not be started)
+    std::vector<std::string> devices;        // kListed: the lines under the header, as printed ("Vulkan0: AMD ... free)")
+    std::string why;                         // kUnknown: why that is no answer; "not run" when it was skipped
+    bool        exited = false;              // it ended by itself (false: killed at the bound, or never started)
+    DWORD       exitCode = 0;
+    bool        timedOut = false;
+    uint32_t    ms = 0;                      // from its start to the end of its output
+    DWORD       pid = 0;                     // the child's (the selftest's orphan check)
+    std::string out;                         // its stdout and stderr as one, the first kGpuProbeKeepBytes
+};
+// TEST ONLY (--selftest-gpuprobe): the probe children started so far -- "not run" means none. Never read by the engine.
+int g_gpuProbeSpawnsForTest = 0;
+
+// THE ANSWER, read (pure: the selftest feeds it every shape). kNone ONLY when the child ended by itself with exit code 0
+// and its output holds exactly ONE "Available devices:" line whose block -- the INDENTED lines right under it -- is
+// exactly one line, "(none)". A block of "<name>: <description>" lines = kListed (the lines kept). Anything else =
+// kUnknown, `why` saying what. CRLF or LF; log lines before the header and after the block are allowed (stderr shares
+// the pipe).
+GpuProbe::Verdict parseListDevices(const std::string& out, bool exited, DWORD exitCode,
+                                   std::vector<std::string>& devices, std::string& why) {
+    devices.clear();
+    why.clear();
+    if (!exited) { why = "it did not end by itself"; return GpuProbe::kUnknown; }
+    if (exitCode != 0) { why = "exit code " + std::to_string((unsigned long)exitCode); return GpuProbe::kUnknown; }
+    auto trim = [](const std::string& s) {
+        size_t a = 0, b = s.size();
+        while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r')) ++a;
+        while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r')) --b;
+        return s.substr(a, b - a);
+    };
+    std::vector<std::string> lines;
+    for (size_t at = 0; at < out.size();) {
+        size_t nl = out.find('\n', at);
+        if (nl == std::string::npos) nl = out.size();
+        lines.push_back(out.substr(at, nl - at));
+        at = nl + 1;
+    }
+    size_t header = 0;
+    int headers = 0;
+    for (size_t i = 0; i < lines.size(); ++i)
+        if (trim(lines[i]) == "Available devices:") { header = i; ++headers; }
+    if (headers == 0) { why = "no \"Available devices:\" line"; return GpuProbe::kUnknown; }
+    if (headers > 1)  { why = "\"Available devices:\" more than once"; return GpuProbe::kUnknown; }
+    std::vector<std::string> block;
+    for (size_t i = header + 1; i < lines.size(); ++i) {
+        const std::string& l = lines[i];
+        if (l.empty() || (l[0] != ' ' && l[0] != '\t')) break;      // the block ends at the first unindented line
+        const std::string t = trim(l);
+        if (t.empty()) break;
+        block.push_back(t);
+    }
+    if (block.empty()) { why = "\"Available devices:\" with no line under it"; return GpuProbe::kUnknown; }
+    if (block.size() == 1 && block[0] == "(none)") return GpuProbe::kNone;
+    for (const std::string& b : block) {
+        const size_t colon = b.find(": ");
+        if (b == "(none)" || colon == std::string::npos || colon == 0) {
+            why = "a line under \"Available devices:\" that is no device: \"" + b.substr(0, 80) + "\"";
+            devices.clear();
+            return GpuProbe::kUnknown;
+        }
+        devices.push_back(b);
+    }
+    return GpuProbe::kListed;
+}
+
+// CreateProcessW for a child that inherits ONE handle of ours -- its stdout and stderr -- and nothing else
+// (PROC_THREAD_ATTRIBUTE_HANDLE_LIST: a copy of the pipe's write end held anywhere else would keep the pipe open past
+// its exit), no window, SUSPENDED: the caller puts it in its job, then resumes it. `env` empty = this environment.
+bool spawnWithOneHandle(const std::wstring& cmd, const std::wstring& dir, std::vector<wchar_t>& env, HANDLE out,
+                        PROCESS_INFORMATION& pi, DWORD& err) {
+    SIZE_T attrBytes = 0;
+    ::InitializeProcThreadAttributeList(nullptr, 1, 0, &attrBytes);      // (asks the size: "fails" by design)
+    std::vector<unsigned char> attrMem(attrBytes ? attrBytes : 1);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrMem.data());
+    HANDLE inherit[1] = { out };
+    bool handleList = attrBytes != 0 && ::InitializeProcThreadAttributeList(attrs, 1, 0, &attrBytes) != FALSE;
+    if (handleList && !::UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, sizeof(inherit),
+                                                   nullptr, nullptr)) {
+        ::DeleteProcThreadAttributeList(attrs);
+        handleList = false;              // (never seen) plain inheritance then: this engine makes no other handle inheritable
+    }
+    STARTUPINFOEXW si{};
+    si.StartupInfo.cb = handleList ? sizeof(si) : sizeof(si.StartupInfo);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdOutput = out;
+    si.StartupInfo.hStdError = out;
+    si.lpAttributeList = handleList ? attrs : nullptr;
+    std::vector<wchar_t> mut(cmd.begin(), cmd.end());
+    mut.push_back(L'\0');
+    const BOOL made = ::CreateProcessW(nullptr, mut.data(), nullptr, nullptr, TRUE,
+                                       CREATE_NO_WINDOW | CREATE_SUSPENDED
+                                       | (env.empty() ? 0 : CREATE_UNICODE_ENVIRONMENT)
+                                       | (handleList ? EXTENDED_STARTUPINFO_PRESENT : 0),
+                                       env.empty() ? nullptr : env.data(), dir.empty() ? nullptr : dir.c_str(),
+                                       &si.StartupInfo, &pi);
+    err = made ? 0 : ::GetLastError();
+    if (handleList) ::DeleteProcThreadAttributeList(attrs);
+    return made != FALSE;
+}
+
+// THE LAUNCH: `exe args` the way ChildServer::spawn starts a server (TrEngine.cpp) -- no window, inside a kill-on-close
+// job before it runs one instruction (SUSPENDED until then), in the children's environment (environmentWithVulkanFallback,
+// TrMpvAudio.h: the bundled Vulkan loader appended to PATH; an empty block = inherit), its own folder as the current
+// directory -- plus its stdout AND stderr on ONE pipe (spawnWithOneHandle). Read to the end WITHOUT a read that can
+// block: PeekNamedPipe says what is there, ReadFile takes that much. BOUNDED: past `boundMs` the child is killed FIRST,
+// then waited for -- no llama-server outlives its probe -- and the job's close takes anything it started. The first
+// kGpuProbeKeepBytes are kept, the rest read and dropped: a talkative child never blocks on a full pipe.
+GpuProbe runListDevices(const std::wstring& exe, const std::wstring& args, DWORD boundMs) {
+    GpuProbe p;
+    const ULONGLONG t0 = ::GetTickCount64();
+    auto done = [&p, t0](GpuProbe::Verdict v, const std::string& why) {
+        p.verdict = v;
+        p.why = why;
+        p.ms = (uint32_t)(::GetTickCount64() - t0);
+        return p;
+    };
+    const DWORD attr = exe.empty() ? INVALID_FILE_ATTRIBUTES : ::GetFileAttributesW(exe.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY))
+        return done(GpuProbe::kUnknown, exe.empty() ? "no llama-server in the payload" : "llama-server not found");
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!::CreatePipe(&rd, &wr, &sa, 0))
+        return done(GpuProbe::kUnknown, "no pipe (Windows error " + std::to_string(::GetLastError()) + ")");
+    ::SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);          // our end stays ours
+    HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        ::SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof(li));
+    }
+    std::vector<wchar_t> env = environmentWithVulkanFallback();
+    const size_t cut = exe.find_last_of(L"\\/");
+    const std::wstring dir = cut == std::wstring::npos ? std::wstring() : exe.substr(0, cut);
+    PROCESS_INFORMATION pi{};
+    DWORD err = 0;
+    const bool made = spawnWithOneHandle(L"\"" + exe + L"\" " + args, dir, env, wr, pi, err);
+    ::CloseHandle(wr);                           // the child's copy is the only one now: its exit ends the pipe
+    if (!made) {
+        ::CloseHandle(rd);
+        if (job) ::CloseHandle(job);
+        return done(GpuProbe::kUnknown, "llama-server could not be started (Windows error " + std::to_string(err) + ")");
+    }
+    if (job) ::AssignProcessToJobObject(job, pi.hProcess);
+    ++g_gpuProbeSpawnsForTest;
+    ::ResumeThread(pi.hThread);
+    ::CloseHandle(pi.hThread);
+    p.ran = true;
+    p.pid = pi.dwProcessId;
+
+    const ULONGLONG deadline = t0 + boundMs;
+    bool ended = false;                          // the pipe's end: every writer closed it
+    char buf[4096];
+    for (;;) {
+        // the bound, on EVERY lap: a child that never stops writing must not hold the start either
+        if (::GetTickCount64() >= deadline) break;
+        DWORD avail = 0;
+        if (!::PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr)) { ended = true; break; }
+        if (avail) {
+            DWORD got = 0;
+            if (!::ReadFile(rd, buf, avail < (DWORD)sizeof(buf) ? avail : (DWORD)sizeof(buf), &got, nullptr)) {
+                ended = true;
+                break;
+            }
+            if (p.out.size() < kGpuProbeKeepBytes)
+                p.out.append(buf, std::min<size_t>(got, kGpuProbeKeepBytes - p.out.size()));
+            continue;
+        }
+        // nothing there yet: a nap that the child's exit cuts short (the next peek drains the rest, or sees the end)
+        if (::WaitForSingleObject(pi.hProcess, 10) == WAIT_OBJECT_0) ::Sleep(2);
+    }
+    // the child itself, within what is left of the bound (its output can end a moment before it does)
+    const ULONGLONG now = ::GetTickCount64();
+    p.exited = ::WaitForSingleObject(pi.hProcess, ended && now < deadline ? (DWORD)(deadline - now) : 0) == WAIT_OBJECT_0;
+    if (!p.exited) {
+        // THE BOUND: killed FIRST, then waited for -- gone before anything else happens. (The job's close below would take
+        // it too; this makes it a fact here, and the selftest proves it.)
+        p.timedOut = true;
+        ::TerminateProcess(pi.hProcess, kGpuProbeKilledExit);
+        ::WaitForSingleObject(pi.hProcess, 5000);
+    }
+    DWORD code = STILL_ACTIVE;
+    ::GetExitCodeProcess(pi.hProcess, &code);
+    p.exitCode = code;
+    ::CloseHandle(pi.hProcess);
+    ::CloseHandle(rd);
+    if (job) ::CloseHandle(job);                 // KILL_ON_JOB_CLOSE: whatever it may have started goes with it
+    std::string why;
+    const GpuProbe::Verdict v = parseListDevices(p.out, p.exited, p.exitCode, p.devices, why);
+    if (p.timedOut) why = "no answer within " + std::to_string((unsigned long)boundMs) + " ms -- killed";
+    return done(v, why);
+}
+
+// The probe's ONE line (engine.log and stdout): the verdict, the devices when listed, the time.
+std::string gpuProbeSentence(const GpuProbe& p) {
+    const std::string ms = std::to_string(p.ms) + " ms";
+    if (p.verdict == GpuProbe::kNone)
+        return "no GPU device (llama-server --list-devices: \"(none)\", exit 0, " + ms + ") -> every child on the CPU for this "
+               "run (in memory only: engine.txt keeps DEVICE auto)";
+    if (p.verdict == GpuProbe::kListed) {
+        std::string d;
+        for (const std::string& s : p.devices) d += (d.empty() ? "" : "; ") + s;
+        return "listed " + d + " (" + ms + ") -> the GPU path, as before";
+    }
+    return "no answer (" + p.why + ", " + ms + ") -> the GPU path, as before";
+}
+
+// ONCE per engine, from runHost (see above). Not run when every child is on the CPU already. Its line goes to engine.log
+// and to stdout (a test's capture; an engine the app spawned has no console to show it on).
+GpuProbe probeGpuAtStart(const std::wstring& llamaExe, const std::wstring& args = L"--list-devices",
+                         DWORD boundMs = kGpuProbeBoundMs) {
+    GpuProbe p;
+    std::string line;
+    if (g_forceCpu) {
+        p.why = "not run";
+        line = "not run -- every child is on the CPU already (DEVICE cpu or --cpu): the GPU is never opened";
+    } else {
+        p = runListDevices(llamaExe, args, boundMs);
+        if (p.verdict == GpuProbe::kNone) forceCpuChildren();
+        line = gpuProbeSentence(p);
+    }
+    engineLog("[SuVtitleEngine] GPU probe: " + line + "\n");
+    std::printf("[SuVtitleEngine] GPU probe: %s\n", line.c_str());
+    std::fflush(stdout);
+    return p;
+}
+
+// ---------------------------------------------------------------------------
 // The two child servers, kept up.
 //
 // GPU vs CPU is DECIDED HERE, by trying: spawn with the Vulkan flags, and if the
@@ -242,52 +723,162 @@ void openEngineLog() {
 // Both fallbacks were verified against these exact binaries (llama-server accepts
 // "-dev none" and comes up on CPU; whisper-server has -ng). A machine with no
 // Vulkan runtime therefore still works -- slowly, and honestly labelled.
+// (SuVtitle 1.1.0, wave GPU: "honestly" did not hold for a Vulkan LOADER with no device behind it -- the spawn with the
+// Vulkan flags SUCCEEDS there, on the servers' CPU back-ends, and the flags said GPU. probeGpuAtStart, above, asks
+// llama-server once at the engine's start; its positive "none" sends every child here straight to the CPU.)
 // ---------------------------------------------------------------------------
-// SUVTITLE SPLIT: AudioPB's Servers ran TWO kinds of children -- the LIVE pair (a draft and a final whisper,
-// the MT, brought up by preset: ensureUp / bring, the `auto` probe, draftPort / finalPort / up / gpu /
-// asrModel / resolvedPreset) and the FILE job's own whisper beside the same MT. Only the second came along:
-// bringFile / endFile and what they need, verbatim, minus the line that killed the live pair before a job
-// (there is none to make room for). The MT override (setMtOverride) went too: it only steered the live
-// pair's MT; a FILE job has always named its own (makeFileJob: MTMODEL, else the 4B).
-// "TWO ASR CHILDREN, NEVER TWO ASR CALLS" (AudioPB's rule here) holds a fortiori: one ASR child, called
-// from the pipeline thread only.
+// /!\ TWO ASR CHILDREN, NEVER TWO ASR CALLS. The preset is a pair of models (TrEngine.h) and
+// whisper-server holds exactly one model, so a quality preset needs two servers. What it does
+// NOT need is two of them working at once: the 17/09 bench measured a draft and a final
+// running concurrently on this GPU as SLOWER than the same two calls in sequence. The single
+// pipeline thread is what enforces that, by construction -- there is nobody else to call them
+// -- and it must stay that way. When the two models are the same file there is ONE child and
+// finalPort() simply points at it: loading small twice would cost VRAM and buy nothing.
+// SUVTITLE: BOTH HALVES, as in 641f1aa. The split (1.0.0) kept only the FILE job's whisper (bringFile / endFile);
+// SuVtitle 1.1.0 brings the LIVE pair back from AudioPB 50f79d6 (ensureUp / bring, the `auto` probe, the draft and
+// final children). The two whispers are NEVER resident together -- live and a job never run at the same time
+// (pipelineMain's three modes), bringFile kills the live pair before loading, and the pipeline frees a job's whisper
+// before ensureUp -- while the MT survives a switch when it is the same model (the 4B of quality / balanced and of
+// every FILE job): going from the live window to a film costs a whisper load, not the 2.9 GB of the 4B.
 class Servers {
 public:
-    uint16_t mtPort()     const { return mt_.port(); }
+    bool     gpu()        const { return asrGpu() && mtGpu_; }
+    bool     asrGpu()     const { return draftGpu_ && (models_.same() || finalGpu_); }
+    uint16_t draftPort()  const { if (const uint16_t p = standIn_.load()) return p; return asrDraft_.port(); }
+    uint16_t finalPort()  const { if (const uint16_t p = standIn_.load()) return p;
+                                  return models_.same() ? asrDraft_.port() : asrFinal_.port(); }
+    uint16_t mtPort()     const { if (const uint16_t p = standIn_.load()) return p; return mt_.port(); }
+    std::string asrModel() const { return asrModelsLabel(models_); }
     std::string mtModel()  const { return mtFile_; }
-    bool     mtGpu()      const { return mtGpu_; }       // SUVTITLE: STATE's gpu = fileGpu() && mtGpu()
+    bool     mtGpu()      const { return mtGpu_; }       // SUVTITLE: a FILE job's STATE gpu = fileGpu() && mtGpu()
+    // What `auto` settled on -- and, for every other preset, the preset itself. This is
+    // what STATE reports: the field means "what is ACTUALLY running" (TrPipe.h).
+    std::string resolvedPreset() const { return resolved_.empty() ? asked_ : resolved_; }
     const std::string& lastError() const { return err_; }
+    char lastFailKind() const { return failKind_; }      // U2: bringFile -- 'm' the MT, 'a' the whisper, 0 = neither
 
     void setPaths(const TrPaths& p) { paths_ = p; }
     bool payloadFound() const { return paths_.ok(); }    // SUVTITLE: the idle STATE says it
     // ... and in which words: the sentence naming the missing part (fix round RV3-3, resolvePathsAt), else the
     // generic one (a TrPaths made by hand).
     std::string payloadSentence() const { return paths_.missing.empty() ? std::string(kPayloadMissing) : paths_.missing; }
-    // SUVTITLE: the CONFIGURED preset (engine.txt PRESET, CTL) -- what AudioPB's ensureUp(preset) recorded as
-    // `asked_`. It only matters to presetFinalModel below: no live pair is brought up for it.
-    void setPreset(const std::string& p) { asked_ = p; }
+    // MTMODEL: when set it wins for EVERY preset, which is what makes an A/B of a candidate
+    // model one line of engine.txt instead of a rebuild.
+    void setMtOverride(const std::string& file) { mtOverride_ = file; }
+    // SUVTITLE: the CONFIGURED preset (engine.txt PRESET, CTL) -- `asked_`, which ensureUp records too. With no live
+    // pair up it only matters to presetFinalModel below. 1.1.0: a NEW choice re-opens the question, by ensureUp's own
+    // rule -- `auto`'s verdict, or a fallback, belongs to the choice it was made for, and must not outlive it.
+    void setPreset(const std::string& p) { if (p != asked_) { asked_ = p; resolved_.clear(); } }
 
-    void killAll() {
-        mt_.kill(); fileAsr_.kill();
-        fileLoaded_.clear();
-    }
-
-    // ---- FILE MODE (wave WB) ----------------------------------------------------------
-    // A FILE job runs on ITS OWN whisper child (the job's model: turbo, or large-v3 on `max`)
-    // and the 4B MT. (AudioPB: the live children were killed first -- VRAM -- and came back after the
-    // job through the pipeline's ensureUp; SuVtitle has none.) The MT is kept when it already is the
-    // file the job wants (no reload), and after the job endFile() frees only the job's whisper -- so
-    // the next job, often the next film of the queue, skips the MT's load. `abort` (FCANCEL / a
-    // superseding FILE / QUIT) stops a model load within 200 ms.
-    bool bringFile(const std::string& asrFile, const std::string& mtFile, bool verbose,
-                   const std::function<bool()>& abort, bool allowDtw = true) {
+    // Bring the servers up for `preset`, if they are not already. Returns false
+    // (with lastError set) when something is missing or refuses to start; the caller
+    // backs off and tries again -- a USB GPU reset should heal by itself.
+    // SuVtitle 1.1.0: `abort` (the pipeline's: QUIT, or the live path no longer wanted) stops a model load within
+    // ~200 ms, as a FILE job's always could (bringFile) -- a user who closes the Live window during a 10 s load must not
+    // wait it out. And THE FALLBACK covers every preset, not `auto` alone (LIVE_PLAN 4.1): the best pair installed AT
+    // OR BELOW the one asked for runs -- SuVtitle 1.0.0's bundle shipped neither small nor base -- and STATE's preset
+    // says which one; nothing installed at or below it = a sentence naming the missing model, retried after a backoff.
+    bool ensureUp(const std::string& preset, bool verbose, const std::function<bool()>& abort = {}) {
+        if (standIn_.load()) { err_.clear(); return true; }      // [C8c]'s stand-in pair: nothing to load
         if (!paths_.ok()) {
             err_ = payloadSentence();
             return false;
         }
+        // A NEW choice re-opens the question. Coming back to `auto` must re-measure: the
+        // machine that answered last time may have been on battery, or sharing its GPU.
+        if (preset != asked_) { asked_ = preset; resolved_.clear(); }
+        // /!\ `auto` STARTS AT QUALITY, so it starts by loading a model a bundle is allowed
+        // not to have. Before W2 it resolved to `small` and could not miss; if it now walked
+        // into "ASR model missing: ggml-large-v3-turbo.bin" it would sit in the respawn
+        // backoff FOREVER on a machine where balanced would have worked perfectly. So the
+        // ambition is capped by what is installed -- here, and again on the verdict below.
+        const std::string want = !resolved_.empty() ? resolved_
+                               : installedAtOrBelow(preset == "auto" ? "quality" : preset);
+        if (!pairInstalled(want)) {
+            const AsrModels m = asrModelsFor(want);
+            err_ = "no speech model for the live translation at or below the " + preset + " preset (missing: "
+                 + (modelPresent(m.draft) ? m.final : m.draft) + ")";
+            return false;
+        }
+        if (!bring(want, verbose, abort)) return false;
+
+        if (preset == "auto" && resolved_.empty()) {
+            // THE T3 PROBE, at last. Note WHICH server it times: the FINAL one, on the
+            // quality pair, i.e. the expensive model the verdict is actually about.
+            probe_ = probeAutoPreset(finalPort(), asrGpu(), kProbeTimeoutMs);
+            engineLog("[SuVtitleEngine] auto preset: " + probe_.why + "\n");
+            if (verbose) std::printf("  [auto] %s\n", probe_.why.c_str());
+            resolved_ = installedAtOrBelow(probe_.preset);
+            if (resolved_ != want && !bring(resolved_, verbose, abort)) return false;
+        } else if (preset != "auto") {
+            resolved_ = want;               // what RUNS: the preset, or the best installed below it
+        }
+        err_.clear();
+        return true;
+    }
+
+    bool up() const {
+        if (standIn_.load()) return true;
+        return asrDraft_.alive() && (models_.same() || asrFinal_.alive()) && mt_.alive();
+    }
+    // TEST ONLY (fix round, [C8c]): the live pair is a STAND-IN -- one loopback HTTP server of the selftest's that
+    // answers /inference and /v1/chat/completions -- so the shipping pipeline thread drains, ends and resumes with no
+    // model: up() says yes and every live port names it, until killLive / killAll take it down like a real pair.
+    // Never called by the engine itself.
+    void standInLiveForTest(uint16_t port) { standIn_.store(port); }
+    void killAll() {
+        standIn_.store(0);
+        asrDraft_.kill(); asrFinal_.kill(); mt_.kill(); fileAsr_.kill();
+        draftLoaded_.clear(); finalLoaded_.clear(); fileLoaded_.clear();
+    }
+    // SuVtitle 1.1.0, LIVE 0: the live pair goes -- it is never resident beside a FILE job's whisper (VRAM) -- and the
+    // MT with it, unless it is the model a FILE job would load (`jobMt`): the next film then skips that load, as the
+    // film after a film does (1.0.0: the MT a job loaded stays up). asked_ / resolved_ stay: a new live start does not
+    // re-probe `auto`.
+    void killLive(const std::string& jobMt) {
+        standIn_.store(0);
+        asrDraft_.kill(); asrFinal_.kill();
+        draftLoaded_.clear(); finalLoaded_.clear();
+        if (mt_.alive() && mtWanted_ != jobMt) mt_.kill();
+    }
+    // SuVtitle 1.1.0: a FILE job's children run BELOW_NORMAL, CPU and GPU, for as long as the job runs; NORMAL at a
+    // live start and at idle (setProcessPriority says how and why). The pipeline calls it on every lap of a job's run
+    // (true) -- so a child the job's retry respawned, born NORMAL, is lowered at the next lap -- and at a live start
+    // and on every idle lap (false): a compare, unless something was lowered. Per child, only on a CHANGE (its class
+    // read back), so one engine-log line per change. The MT survives a switch to the live path (the same 4B) and is
+    // put back here; the live children are born NORMAL and never lowered.
+    void setBackground(bool low) {
+        if (!low && !bg_) return;
+        bg_ = low;
+        reprioritise(mt_.process(), low, "llama-server (MT)");
+        reprioritise(fileAsr_.process(), low, "whisper-server (FILE)");
+        if (g_prioStandInForTest) reprioritise(g_prioStandInForTest, low, "the selftest's stand-in");
+    }
+
+    // ---- FILE MODE (wave WB) ----------------------------------------------------------
+    // A FILE job runs on ITS OWN whisper child (the job's model: turbo, or large-v3 on `max`)
+    // and the 4B MT. /!\ THE LIVE ASR PAIR AND THE FILE ASR ARE NEVER RESIDENT TOGETHER: the
+    // live children are killed first (VRAM -- large-v3 is 3.1 GB, the 4B 2.9 GB), the MT is
+    // kept when it already is the file the job wants (quality / balanced: no reload). After
+    // the job endFile() frees only the job's whisper -- so the next job, often the next film of
+    // the queue, skips the MT's load (SUVTITLE; in AudioPB the pipeline's ensureUp brought the live
+    // pair back at once, and in SuVtitle 1.1.0 it does so only when the live path is wanted).
+    // `abort` (FCANCEL / a superseding FILE / QUIT) stops a model load within 200 ms.
+    // U2 (2026-11-02): `mtExact` = mtFile is the user's own model (FILE's mtModel) -- THAT file or a failure, never the
+    // silent fallback to the 1.5B (startMt); another MT than the one up = a llama restart, as for any change of model.
+    // lastFailKind() says which child would not come up: 'm' the MT, 'a' the whisper, 0 = neither (the payload, an abort).
+    bool bringFile(const std::string& asrFile, const std::string& mtFile, bool verbose,
+                   const std::function<bool()>& abort, bool allowDtw = true, bool mtExact = false) {
+        failKind_ = 0;
+        if (!paths_.ok()) {
+            err_ = payloadSentence();
+            return false;
+        }
+        asrDraft_.kill(); asrFinal_.kill();
+        draftLoaded_.clear(); finalLoaded_.clear();
         if (mt_.alive() && mtFile != mtWanted_) mt_.kill();
         mtWanted_ = mtFile;
-        if (!mt_.alive() && !startMt(mtFile, verbose, abort)) return false;
+        if (!mt_.alive() && !startMt(mtFile, verbose, abort, mtExact)) { failKind_ = 'm'; return false; }
         if (fileAsr_.alive() && (fileLoaded_ != asrFile || (fileDtw_ && !allowDtw))) { fileAsr_.kill(); fileLoaded_.clear(); }
         if (!fileAsr_.alive()) {
             // WAVE WF: the FILE whisper times its words by DTW (TrEngine.h, AsrWord::dtw) -- the
@@ -297,7 +888,7 @@ public:
             // is flash attention: +55 % ASR time (turbo, 25 film windows: 30.8 s -> 47.8 s; DTW
             // itself costs nothing). A model whose alignment heads this server has no preset for
             // runs without (the old token times), and so does a server binary that refuses the
-            // flags. The LIVE children never got it -- their latency was the product.
+            // flags. The LIVE children never get it -- their latency is the product.
             // Review P3, THE ORDER: GPU with DTW -> GPU without (flash attention off needs more VRAM:
             // a card that holds the models with it on but not off must stay on the GPU, ~10x faster
             // than any CPU) -> CPU with DTW only when kCpuDtw says it is cheap there -> CPU without.
@@ -324,8 +915,10 @@ public:
             }
             if (!up) {
                 fileDtw_ = false;
-                if (!startAsr(fileAsr_, asrFile, fileGpu_, "asr/file", verbose, abort, std::wstring(), kAsrCpuOnly))
+                if (!startAsr(fileAsr_, asrFile, fileGpu_, "asr/file", verbose, abort, std::wstring(), kAsrCpuOnly)) {
+                    failKind_ = 'a';                   // U2: the whisper would not come up (GPU or CPU)
                     return false;
+                }
             }
             fileLoaded_ = asrFile;
         }
@@ -339,10 +932,8 @@ public:
     bool     fileDtw()  const { return fileDtw_; }
     bool     modelInstalled(const std::string& file) const { return modelPresent(file); }
     // The preset's FINAL model, capped by what is installed -- the file job's fallback when turbo is not
-    // there. SUVTITLE: the CONFIGURED preset (no live pair runs, no probe resolves `auto`): `auto` (or none)
-    // = the best installed, an explicit one = the best installed AT OR BELOW it. That is exactly what
-    // AudioPB answered whenever its live pair had not come up as that preset, and the same model as its
-    // "running preset" whenever that preset's models are installed.
+    // there. SUVTITLE: the CONFIGURED preset (`auto` -- or none -- = the best installed, an explicit one = the best
+    // installed AT OR BELOW it), whatever the live pair resolved: a FILE job only runs when the live path does not.
     std::string presetFinalModel() const {
         return asrModelsFor(installedAtOrBelow(asked_.empty() || asked_ == "auto" ? "quality" : asked_)).final;
     }
@@ -353,13 +944,25 @@ public:
         "or set SUVTITLE_PAYLOAD to a folder holding whisper, llama, models)";
 
 private:
+    // One child of setBackground: left alone when it is down or already at that class (SetPriorityClass on the handle
+    // CreateProcess gave us does not fail, so a class that is right stays right and the next lap writes nothing).
+    static void reprioritise(HANDLE proc, bool low, const char* who) {
+        if (!proc || ::WaitForSingleObject(proc, 0) != WAIT_TIMEOUT) return;
+        if (::GetPriorityClass(proc) == (DWORD)(low ? BELOW_NORMAL_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS)) return;
+        setProcessPriority(proc, low, who);
+    }
     bool modelPresent(const std::string& file) const {
         if (paths_.modelsDir.empty()) return false;
         return ::GetFileAttributesW((paths_.modelsDir + L"\\" + utf8ToWideL(file)).c_str())
                != INVALID_FILE_ATTRIBUTES;
     }
-    // The best preset AT OR BELOW `p` whose two models are actually on disk. (In AudioPB only `auto`
-    // used it for the live pair: an explicit choice there had to fail loudly with "ASR model missing".)
+    bool pairInstalled(const std::string& p) const {
+        const AsrModels m = asrModelsFor(p);
+        return modelPresent(m.draft) && modelPresent(m.final);
+    }
+    // The best preset AT OR BELOW `p` whose two models are actually on disk. (AudioPB used it for `auto`
+    // only -- an explicit choice there had to fail loudly with "ASR model missing"; SuVtitle 1.1.0 falls
+    // back for every preset, and STATE's preset says what runs: see ensureUp.)
     std::string installedAtOrBelow(const std::string& p) const {
         static const char* kOrder[] = { "quality", "balanced", "light" };   // best first
         bool below = false;
@@ -372,12 +975,44 @@ private:
         return p;   // nothing installed at all: let the load produce the honest error
     }
 
+    // Reconcile the running children with what `target` asks for. Every branch is a KILL
+    // followed by a start, never a mutation: a whisper-server cannot be told to load
+    // another model, and pretending otherwise is how you end up transcribing on the model
+    // the user just moved away from.
+    // (SuVtitle 1.1.0: + `abort`, handed to every load -- ensureUp.)
+    bool bring(const std::string& target, bool verbose, const std::function<bool()>& abort = {}) {
+        const AsrModels want = asrModelsFor(target);
+        if (asrDraft_.alive() && draftLoaded_ != want.draft) { asrDraft_.kill(); draftLoaded_.clear(); }
+        if (asrFinal_.alive() && (want.same() || finalLoaded_ != want.final)) {
+            asrFinal_.kill();            // ...including "the two models became the same file"
+            finalLoaded_.clear();
+        }
+        models_ = want;
+        if (!asrDraft_.alive()) {
+            if (!startAsr(asrDraft_, want.draft, draftGpu_, "asr/draft", verbose, abort)) return false;
+            draftLoaded_ = want.draft;
+        }
+        if (!want.same() && !asrFinal_.alive()) {
+            if (!startAsr(asrFinal_, want.final, finalGpu_, "asr/final", verbose, abort)) return false;
+            finalLoaded_ = want.final;
+        }
+        // The MT model follows the preset too (light keeps the 1.5B; everything else gets
+        // the 4B), so a preset change can move it -- same kill-and-restart rule.
+        const std::string wantMt = mtOverride_.empty() ? mtModelFor(target) : mtOverride_;
+        if (mt_.alive() && wantMt != mtWanted_) mt_.kill();
+        mtWanted_ = wantMt;
+        if (!mt_.alive() && !startMt(wantMt, verbose, abort)) return false;
+        return true;
+    }
+
     // `extra` (WF): flags for this child only -- the FILE whisper's DTW (bringFile); "" = none.
     // `where` (review P3): kAsrGpuThenCpu, or the GPU / the CPU alone (bringFile orders its own tries).
     bool startAsr(ChildServer& child, const std::string& modelFile, bool& gpuFlag,
                   const char* tag, bool verbose, const std::function<bool()>& abort = {},
                   const std::wstring& extra = std::wstring(), int where = kAsrGpuThenCpu) {
-        const std::wstring model = paths_.modelsDir + L"\\" + utf8ToWideL(modelFile);
+        // U2: a PATH (a FILE job's imported model, checked by makeFileJob) is taken as it is; a bare name is the models folder's
+        const std::wstring model = modelFile.find_first_of("\\/:") != std::string::npos ? utf8ToWideL(modelFile)
+                                 : paths_.modelsDir + L"\\" + utf8ToWideL(modelFile);
         if (::GetFileAttributesW(model.c_str()) == INVALID_FILE_ATTRIBUTES) {
             err_ = "ASR model missing: " + modelFile;
             return false;
@@ -424,14 +1059,15 @@ private:
         return ::GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
     }
 
+    // U2: `exact` (a FILE job's imported model) = that file or the error -- never the fallback below.
     bool startMt(const std::string& wantFile, bool verbose,
-                 const std::function<bool()>& abort = {}) {
+                 const std::function<bool()>& abort = {}, bool exact = false) {
         std::string file = wantFile;
         std::wstring model;
         if (!resolveMt(file, model)) {
             const std::string alt = kMtModelFileSmall;
             std::wstring altPath;
-            if (file != alt && resolveMt(alt, altPath)) {
+            if (!exact && file != alt && resolveMt(alt, altPath)) {
                 const std::string note = "[SuVtitleEngine] " + file + " not in the models "
                                          "folder; falling back to " + alt + "\n";
                 engineLog(note);
@@ -478,23 +1114,42 @@ private:
     }
 
     TrPaths      paths_;
-    ChildServer  mt_;
-    ChildServer  fileAsr_;                     // WB: the FILE job's whisper
+    ChildServer  asrDraft_, asrFinal_, mt_;
+    ChildServer  fileAsr_;                     // WB: the FILE job's whisper (never with the live pair)
     std::string  fileLoaded_;
     bool         fileGpu_ = true;
     bool         fileDtw_ = false;             // WF: the FILE whisper runs with -dtw (bringFile)
-    std::string  mtWanted_;
+    AsrModels    models_ = asrModelsFor("balanced");
+    std::string  draftLoaded_, finalLoaded_;   // the file each child ACTUALLY has open
+    std::string  mtOverride_, mtWanted_;
+    char         failKind_ = 0;                // U2: bringFile's child that would not come up ('m' MT, 'a' whisper; 0 = neither)
     std::string  mtFile_ = kMtModelFileSmall;  // the file the MT child actually has open
-    std::string  asked_;                       // the configured preset (setPreset)
+    std::string  asked_, resolved_;            // what was asked for / what is running
+    ProbeVerdict probe_;
     std::string  err_;
-    bool         mtGpu_ = true;
+    // Per child, because they come up independently and a half-CPU pipeline is a real
+    // state: one honest flag AND-ed at the top beats one shared flag the last spawn wins.
+    bool         draftGpu_ = true, finalGpu_ = true, mtGpu_ = true;
+    bool         bg_ = false;                  // 1.1.0: a FILE job's children were lowered (setBackground)
+    std::atomic<uint16_t> standIn_{ 0 };       // fix round: [C8c]'s stand-in pair (0 = none, the product)
 };
 
-// (SUVTITLE SPLIT: StageTimes -- the LIVE final's per-stage timings -- was here. hopPeakDbfs below was the
-// live finals' onset gate; it stays, unused by the FILE path, because [0quater] (reviewFixTests, part of
-// --selftest-filemode) asserts its any-grid measure -- parity of that selftest. kVadHopMs is TrAudio.h's live
-// VAD hop, the same 30 ms as the file job's kFileHop.)
-constexpr int kVadHopMs = 30;
+// ---------------------------------------------------------------------------
+// One segment, end to end. Shared VERBATIM by the live path and the selftest --
+// which is the whole reason the selftest proves anything.
+// ---------------------------------------------------------------------------
+struct StageTimes {
+    uint32_t asrMs = 0, mtMs = 0, totalMs = 0, spkMs = 0; double spkSim = -1.0;
+    // WA: whether the Traditional safety net (toTraditional) had to rewrite this final's
+    // source / translation. Nothing ships on them -- they are the selftest's evidence of how
+    // much of a zh-tw session the PROMPT got right on its own.
+    bool srcToTrad = false, dstToTrad = false;
+    bool srcToSimp = false, dstToSimp = false;   // WB: the same evidence for a zh (Simplified) line
+    // WB (WA review): the prompt the final's decode was ACTUALLY SENT (AsrResult::promptSent),
+    // and the level the hallucination filter judged the audio at. Evidence, not product.
+    std::string asrPrompt;
+    double      judgedPeakDbfs = 0.0;
+};
 
 // The loudest 30 ms hop of `mono16k`, in dBFS of hop RMS -- the SAME measure TrAudio's
 // Segment::peakDbfs uses, computed over exactly the audio about to be transcribed.
@@ -655,18 +1310,550 @@ std::vector<MtPair> contextFor(const TrContext& c, const std::string& srcLang,
     return out;
 }
 
-// (SUVTITLE SPLIT: the LIVE stages were here -- finaliseAudio, processSegment, processCommitted, the drafts
-// (PartialState, draftTranscribe, processPartial) and the commit engine's step (AgreeState, snapStale,
-// trimCommitted, CommitOut, commitStep). They turned fabric audio into LINE / PART / END, and SuVtitle has no
-// fabric. The FILE job never called them: it has its own window step (fileWindowStep) and cue translation
-// (translateOneCue) below, on the same Routing / TrContext / script nets as above.)
+// ---------------------------------------------------------------------------
+// ONE FINAL, end to end: voiceprint, ASR on the FINAL server, routing, translation,
+// the conversation's memory. Two callers hand it two different pieces of audio -- a
+// closed segment (processSegment) and one committed sentence out of an open one
+// (processCommitted) -- and everything AFTER "what audio is this" is identical, which is
+// why it is one function and not two that drift.
+//
+// `fbSrc`/`fbLang` = what to say when the ASR comes back empty or hallucinated. Empty
+// means "then this is not a line" (a closed segment can legitimately be noise). A
+// committed sentence passes the draft's own words, because that audio was speech BY
+// CONSTRUCTION -- two independent decodes already agreed on those words -- so dropping it
+// would leave a hole in a paragraph rather than filter junk out of one.
+// ---------------------------------------------------------------------------
+bool finaliseAudio(Servers& srv, TrSpeaker& spk, const Routing& r, TrContext& ctx,
+                   const std::vector<float>& mono16k, double peakDbfs,
+                   const std::string& spkSlot, uint64_t segId,
+                   const std::string& fbSrc, const std::string& fbLang,
+                   trpipe::WireLine& out, StageTimes& tm, std::string& skip,
+                   std::string& err) {
+    skip.clear();
+    err.clear();
+    const uint64_t t0 = ::GetTickCount64();
+
+    // WHO, BEFORE WHAT. The embedding costs 11-29 ms against an ASR call measured in
+    // hundreds, so it runs INLINE on this thread and ahead of the transcription: by the
+    // time a line exists it already carries its final speaker, and no part of the UI
+    // ever has to re-label a subtitle that is already on screen.
+    const std::string spkLabel = spk.classify(mono16k, tm.spkSim, tm.spkMs);
+
+    const std::string wav = buildWav16k(mono16k);
+
+    // What we expect to hear decides BOTH what whisper is told and, under a lock, what
+    // language it is told to decode: a locked direction already knows the source, and
+    // removing that decision removes the one thing whisper gets wrong on a short clip --
+    // the cost of a mis-detection is not a wrong label, it is a transcript in the wrong
+    // alphabet.
+    const std::string expect = expectedLang(r, ctx);
+    AsrOptions opt;
+    // /!\ DETECTION STAYS ON, LOCK OR NO LOCK. Telling whisper the locked language would remove
+    // its one short-clip mistake -- and remove the PASSTHROUGH with it: a lock names the
+    // TARGET, and a line already spoken in that target must be recognised as such to be
+    // passed through, which a decoder forced onto the other language cannot do (it would
+    // decode Chinese audio as English-shaped noise). The prompt is where the lock's
+    // knowledge goes instead: it biases the decode without forbidding the other language.
+    opt.language = "auto";
+    opt.prompt   = asrPromptFor(r, ctx, expect);
+
+    // The level the filter judges is the QUIETER of the utterance's peak and this audio's own:
+    // see hopPeakDbfs -- a tail must be judged on the tail.
+    const double ownPeak = hopPeakDbfs(mono16k);
+    const double judged  = std::min(peakDbfs, ownPeak);
+    tm.judgedPeakDbfs = judged;
+    // NOTHING THE VAD TRACKED, NO TRANSCRIPTION (WB). Since W3 a closing TAIL can be nothing but
+    // the hangover after the last committed sentence -- and asking a PROMPTED model to transcribe
+    // that is asking it to repeat the prompt, i.e. the sentence the reader has just seen.
+    // /!\ THE GATE IS THE VAD'S *CLOSING* LEVEL, not its opening one (after the review): the VAD
+    // keeps an utterance open down to kVadCloseDbfs (hysteresis), so a continuation after a force
+    // cut, or a tail after a commit, can be real speech that never reaches -38 again -- the first
+    // gate dropped it whole. Audio with no hop at all above -44 (any grid: hopPeakDbfs) is audio
+    // the VAD itself would have been closing on; anything louder is transcribed, and its junk is
+    // the filters' to catch (the prompt's echo at any level, the quiet rules below).
+    // A committed sentence (fbSrc set) is speech by construction and is never gated.
+    if (fbSrc.empty() && ownPeak < kVadCloseDbfs) {
+        skip = "no onset: no hop reaches the VAD's closing level (own peak "
+             + std::to_string((int)ownPeak) + " dBFS)";
+        return false;
+    }
+
+    AsrResult asr;
+    // /!\ `opt` IS PASSED (WB, after the WA review). From W2a until this fix the call below read
+    // `asrTranscribe(..., err)` -- the prompt was BUILT here and never sent, so every final
+    // (closed segments and W3's committed sentences alike) was decoded with no glossary, no
+    // punctuation steering and no Traditional steering; only the drafts were prompted. Proved
+    // by [4] and [6] producing byte-identical finals under two different pairs.
+    if (!asrTranscribe(srv.finalPort(), wav, asr, kAsrTimeoutMs, err, opt)) return false;
+    if (!g_asrZhTextForTest.empty()) {          // the selftest's stand-in decode (see its comment)
+        asr.text     = g_asrZhTextForTest;
+        asr.language = "zh";
+        asr.words.clear();
+        asr.chinese  = chineseByScript(asr.text, asr.language);
+    }
+    tm.asrMs     = asr.ms;
+    tm.asrPrompt = asr.promptSent;
+    // ...and on QUIET audio, whisper's own verdict too: a decode it scores below its own failure
+    // threshold is noise read as words (WB, after the WA review -- see asrConfidence).
+    const double conf = asrConfidence(asr);
+    bool nothing = asr.text.empty()
+                || looksLikeHallucination(asr.text, judged, opt.prompt)
+                || (judged < kQuietGateDbfs && conf < kLowConfidenceLogp);
+    // SuVtitle 1.1.0 (RESUME 11) -- THE PHANTOM NET (TrFileJob.h livePhantomNet): whisper's stock outros and its loops,
+    // which the gates above let by at a normal level. The user's first live session (26/10/2026, French <-> Taiwanese)
+    // showed "Thank you for watching. Please subscribe." off a mic and "I don't know what I'm saying." twice off a
+    // browser: ENGLISH, a language outside the pair -- so both went on screen translated into its B half. Its junk is
+    // this call's "nothing"; a loop heard cleanly is said once.
+    std::string phantom;
+    if (!nothing) {
+        const std::string heardAs = sourceLangOf(asr, r);
+        const PhantomVerdict pv = livePhantomNet(asr.text, HeardHow{ judged, conf, asr.langProb,
+                                                                     heardAs != r.langA && heardAs != r.langB });
+        if (pv.junk) {
+            nothing = true;
+            phantom = pv.why;
+        } else if (pv.loop) {
+            asr.text = pv.text;
+            asr.words.clear();
+        }
+    }
+    if (nothing) {
+        if (fbSrc.empty()) {
+            char why[96];
+            std::snprintf(why, sizeof(why), "hallucination filter (peak %d dBFS, confidence %.2f): \"",
+                          (int)judged, conf);
+            skip = asr.text.empty() ? std::string("empty transcript")
+                 : (phantom.empty() ? std::string(why) : "phantom net (" + phantom + "): \"") + asr.text + "\"";
+            return false;
+        }
+        // THE DRAFT'S WORDS STAND IN. Two consecutive decodes agreed on them, so "the
+        // final heard nothing" is a fact about this one call, not about the audio.
+        asr.text = fbSrc;
+        asr.words.clear();
+        if (!fbLang.empty()) asr.language = fbLang;
+        asr.chinese = chineseByScript(asr.text, asr.language);
+        // ... said ONCE (RESUME 11). A committed sentence is never refused -- the commit engine would only ask for it
+        // again at its next draft, a final call each time -- but a loop in its words is still one sentence.
+        const std::string once = wholeLineRepeat(asr.text);
+        if (!once.empty()) asr.text = once;
+    }
+
+    const std::string srcLang = sourceLangOf(asr, r);
+    const Route route = routeFor(r, srcLang);
+    // WA: A zh-tw LINE IS WRITTEN IN TRADITIONAL, whatever whisper wrote. The prompt asks for it
+    // (asrGlossaryFor) and turbo obeys it -- but two cases escape it, both measured 10/10:
+    //   * the first sentence of a Chinese TURN in auto mode is not prompted in Traditional at
+    //     all: it is prompted in the language of the line BEFORE it (expectedLang), and under
+    //     the English prompt turbo writes bench_zh in Simplified (14 Simplified-only, 0 Trad);
+    //   * `small` (balanced) does not reliably obey even the Traditional prompt: one bench_zh
+    //     sentence came back entirely Simplified under it (selftest [6]).
+    // Converted HERE, before anything reads the text: the screen, the translator, and the
+    // conversation's memory -- which is the next prompt's tail, so one Simplified sentence
+    // must not be allowed to teach the next decode its script.
+    // WB: and the MIRROR for a zh line -- Simplified, whatever whisper wrote (toSimplified).
+    if (srcLang == "zh-tw")   asr.text = toTraditional(asr.text, &tm.srcToTrad);
+    else if (srcLang == "zh") asr.text = toSimplified(asr.text, &tm.srcToSimp);
+
+    out = trpipe::WireLine{};
+    out.lang     = srcLang;
+    out.src      = asr.text;
+    out.spkSlot  = spkSlot;
+    out.spkLang  = srcLang;
+    out.pass     = route.pass;
+    out.dstLang  = route.dstLang;     // == lang on a passthrough, by routeFor's construction
+    out.spkLabel = spkLabel;      // "" when the stage is off: the app falls back to {input, lang}
+    out.segId    = segId;         // the live lines that led here carried the same id
+
+    if (route.pass) {
+        out.dst = asr.text;
+        tm.mtMs = 0;
+    } else {
+        uint32_t mtMs = 0;
+        if (!g_mtReplyForTest.empty())
+            out.dst = g_mtReplyForTest;               // the selftest's stand-in model (see its comment)
+        else if (!mtTranslate(srv.mtPort(), asr.text, srcLang, route.dstLang,
+                              contextFor(ctx, srcLang, route.dstLang, r.mtContext),
+                              r.mtStyle, out.dst, mtMs, kMtTimeoutMs, err))
+            return false;
+        tm.mtMs = mtMs;
+        // ...and the translator's side of the same promise: Qwen asked for Taiwan's Chinese
+        // writes it, but lets the odd Simplified character through (U+89C9 inside a Traditional
+        // sentence, 10/10 selftest [6]). WB: and a translation INTO zh is shown Simplified.
+        if (route.dstLang == "zh-tw")   out.dst = toTraditional(out.dst, &tm.dstToTrad);
+        else if (route.dstLang == "zh") out.dst = toSimplified(out.dst, &tm.dstToSimp);
+        if (out.dst.empty()) { skip = "empty translation"; return false; }
+    }
+
+    // ---- the conversation's memory, updated HERE and only here (finals only) ----------
+    ctx.lastFinalLang = srcLang;
+    ctx.rememberSrc(srcLang, asr.text);
+    if (!route.pass) {
+        // A passthrough is not a translation example: replaying "X -> X" as a finished turn
+        // would teach the model that echoing the input is an acceptable answer.
+        ctx.pairs.push_back(MtPair{ asr.text, out.dst, srcLang, route.dstLang });
+        // Bounded by the biggest context any direction could ask for, not by MTCONTEXT:
+        // the deque holds BOTH directions and contextFor filters, so trimming to MTCONTEXT
+        // here would let an alternating conversation starve one direction entirely.
+        while (ctx.pairs.size() > 8) ctx.pairs.pop_front();
+    }
+
+    tm.totalMs = (uint32_t)(::GetTickCount64() - t0);
+    // `ms` IS THE INFERENCE, and only the inference: voiceprint + ASR + translation, the
+    // work this process did on this utterance. It is not the latency and no longer
+    // pretends to be -- the real test showed a user reading "579 ms" while waiting
+    // several seconds, because the wait is the SEGMENTATION (a sentence has to end, and
+    // that end is 400 ms of hangover away, or eight seconds in continuous speech) and
+    // none of that is inference. The number the user sees is waitMs, stamped when this
+    // message actually leaves; this one is the tooltip that explains it.
+    out.ms = tm.totalMs;
+    out.tEpochMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::system_clock::now().time_since_epoch()).count();
+    return true;
+}
+
+// A CLOSED utterance -- the tail that was still uncommitted when the VAD closed, or the
+// whole segment when nothing was committed. Returns true when a LINE should be emitted;
+// `skip` explains a silent drop. The caller stamps seq and closes: this function has no
+// business knowing how many lines came before it.
+bool processSegment(Servers& srv, TrSpeaker& spk, const Routing& r, TrContext& ctx,
+                    Segment& seg, trpipe::WireLine& out, StageTimes& tm, std::string& skip,
+                    std::string& err) {
+    return finaliseAudio(srv, spk, r, ctx, seg.mono16k, seg.peakDbfs, seg.dominantSource(),
+                         seg.segId, /*fbSrc=*/std::string(), /*fbLang=*/std::string(),
+                         out, tm, skip, err);
+}
+
+// ONE COMMITTED SENTENCE, out of a segment that is still open. The audio is the FRONT of
+// the draft's own snapshot, cut where the words said the sentence ended -- so the final
+// model is given exactly the sentence, on the exact samples the draft agreed about, and
+// never the same audio twice.
+bool processCommitted(Servers& srv, TrSpeaker& spk, const Routing& r, TrContext& ctx,
+                      const PartialSnap& snap, size_t cutSamples,
+                      const std::string& draftSrc, const std::string& draftLang,
+                      trpipe::WireLine& out, StageTimes& tm, std::string& skip,
+                      std::string& err) {
+    if (cutSamples > snap.mono16k.size()) cutSamples = snap.mono16k.size();
+    const std::vector<float> sentence(snap.mono16k.begin(),
+                                      snap.mono16k.begin() + (std::ptrdiff_t)cutSamples);
+    // /!\ THE FINAL MODEL, ALWAYS, even on balanced/light where it is the same file as the
+    // draft's. Same model is not the same CALL: the final runs with beam search and
+    // whisper's temperature fallback (the draft switches both off, AsrOptions::draft), on
+    // exactly the sentence's audio rather than on a window that trails off mid-word. That
+    // difference is the whole reason a committed line is a record and a draft is not.
+    return finaliseAudio(srv, spk, r, ctx, sentence, snap.peakDbfs, snap.srcSlot, snap.segId,
+                         draftSrc, draftLang, out, tm, skip, err);
+}
+
+// ---------------------------------------------------------------------------
+// One LIVE LINE, end to end. Shared VERBATIM by the live path and the selftest, for
+// the same reason processSegment is.
+//
+// Every `return false` in here is SILENT. A draft that could not be produced is not a
+// fault -- it is a frame the user does not get, and the finished paragraph for the same
+// utterance is already on its way. Nothing here may ever set an error state, kill a
+// server, or count against anything.
+// ---------------------------------------------------------------------------
+// What the previous draft of the CURRENT utterance said. Lives on the pipeline thread.
+struct PartialState {
+    uint64_t    segId = 0;      // the utterance the four fields below describe
+    std::string lastSrc;        // the transcript the last PART carried
+    std::string lastMtSrc;      // the transcript the last DRAFT TRANSLATION was made from
+    std::string lastDst;        // ... and that translation
+    // ... and the language THAT one came out in. Carried with it rather than recomputed,
+    // because lastDst is re-sent unchanged while the text has not moved enough to be worth
+    // a new call -- and the draft whose language changed halfway through a sentence (a
+    // mis-detection that corrected itself) must not have its old text relabelled.
+    std::string lastDstLang;
+};
+
+// The draft's ASR, ALONE. Split out of processPartial (W3) for one reason: the commit
+// engine needs this call's WORDS, and it must be able to decide that this draft becomes a
+// finished sentence BEFORE anybody pays for a draft translation of text that is about to
+// be replaced by a real one. Everything it refuses, it refuses silently -- see the note
+// above processPartial.
+bool draftTranscribe(Servers& srv, const Routing& r, const TrContext& ctx,
+                     const PartialSnap& snap, AsrResult& asr, std::string& err) {
+    err.clear();
+    asr = AsrResult{};
+
+    const std::string expect = expectedLang(r, ctx);
+    AsrOptions opt;
+    opt.draft    = true;      // greedy, and NO temperature fallback: see AsrOptions::draft
+    // /!\ DETECTION STAYS ON, LOCK OR NO LOCK -- the note in processSegment, verbatim: a lock
+    // names the TARGET, and a line already spoken in that target must still be recognised
+    // as such to be passed through.
+    opt.language = "auto";
+    opt.prompt   = asrPromptFor(r, ctx, expect);
+
+    const std::string wav = buildWav16k(snap.mono16k);
+    // THE DRAFT MODEL, which is the whole point of a preset being a pair: on quality this
+    // is `small` while the finals run on turbo, so the live line costs ~0.3 s instead of
+    // ~1.15 s and the screen can actually move during a sentence.
+    if (!asrTranscribe(srv.draftPort(), wav, asr, kPartialTimeoutMs, err, opt))
+        return false;
+    if (asr.text.empty()) return false;
+    // FILTERED HERE, so the commit engine never sees hallucinated words: committing one
+    // would put junk in the scrollback permanently, where a bad PART merely flickers.
+    if (looksLikeHallucination(asr.text, snap.peakDbfs, opt.prompt)) return false;
+    // ... and the PHANTOM NET (RESUME 11, see finaliseAudio), with one difference: a LOOP is no draft either. Its WORDS
+    // are what the commit engine cuts sentences from, and saying the text once would leave them saying it twice.
+    const std::string heardAs = sourceLangOf(asr, r);
+    const PhantomVerdict pv = livePhantomNet(asr.text, HeardHow{ snap.peakDbfs, asrConfidence(asr), asr.langProb,
+                                                                 heardAs != r.langA && heardAs != r.langB });
+    if (pv.junk || pv.loop) return false;
+    return true;
+}
+
+bool processPartial(Servers& srv, TrAudio& audio, const Routing& r, const TrContext& ctx,
+                    const PartialSnap& snap, const AsrResult& asr, bool wantMt,
+                    PartialState& st, trpipe::WirePartial& out, uint32_t& mtMs,
+                    std::string& err) {
+    err.clear();
+    mtMs = 0;
+    if (st.segId != snap.segId) { st = PartialState{}; st.segId = snap.segId; }
+    // The words have not moved. Sending them again would cost a pipe message and a UI
+    // repaint to show a screen that is already showing exactly this. (Since W3 this also
+    // absorbs the draft that follows a commit and only re-says the tail we already sent.)
+    if (asr.text == st.lastSrc) return false;
+
+    const std::string srcLang = sourceLangOf(asr, r);
+    const Route route = routeFor(r, srcLang);
+
+    out = trpipe::WirePartial{};
+    out.segId = snap.segId;
+    out.lang  = srcLang;
+    // WA: the live line obeys the finals' script rule (finaliseAudio), and not only for looks:
+    // the UI cuts a committed sentence off the front of this line by COMPARING the two texts
+    // (trTrimIndex), and a Simplified draft under a Traditional final would never match --
+    // the reader would see the sentence twice. Only what is SHOWN is converted; the dedupe
+    // above and the MT below keep reading whisper's own words. (WB: zh -> Simplified, likewise.)
+    out.src   = scriptNet(asr.text, srcLang);
+
+    if (wantMt) {
+        const bool passthrough = route.pass;
+
+        // THE PREEMPTION POINT. The ASR is spent either way, but the translation is
+        // still ahead of us -- so if an utterance finished while we were transcribing a
+        // draft of the NEXT breath, the draft gives up its second half here and the
+        // finished paragraph goes first. This is the only place the decision can still
+        // be made, and it is why a draft can delay a final by one ASR call and no more.
+        if (passthrough) {
+            st.lastMtSrc    = asr.text;
+            st.lastDst      = out.src;         // what the source line shows, script and all
+            st.lastDstLang  = route.dstLang;   // == srcLang here, by routeFor's construction
+        } else if (!audio.finalWaiting()
+                   && textDistance(asr.text, st.lastMtSrc) >= kPartialMtDeltaBytes) {
+            std::string dst;
+            uint32_t ms = 0;
+            std::string mterr;
+            // The SAME context the finals get, and the draft adds nothing to it (TrContext).
+            const bool got = !g_mtReplyForTest.empty()
+                           ? (dst = g_mtReplyForTest, true)          // the selftest's stand-in model
+                           : mtTranslate(srv.mtPort(), asr.text, srcLang, route.dstLang,
+                                         contextFor(ctx, srcLang, route.dstLang, r.mtContext),
+                                         r.mtStyle, dst, ms, kPartialTimeoutMs, mterr);
+            if (got && !dst.empty()) {
+                st.lastMtSrc   = asr.text;
+                st.lastDst     = scriptNet(dst, route.dstLang);   // WA (zh-tw), WB (zh)
+                st.lastDstLang = route.dstLang;
+                mtMs = ms;
+            }
+            // A draft that would not translate is NOT evidence the pipeline is broken,
+            // so it does not kill the servers the way a final's failure does. The final
+            // for this same utterance is seconds away and will diagnose it properly.
+        }
+        // CARRIED FORWARD when the text has not moved enough to be worth re-translating.
+        // A draft whose translation lags its source by a couple of words is what a draft
+        // IS; blanking the translation line and repainting it a second later is a
+        // flicker the eye reads as a fault. Empty only until the first draft lands.
+        out.dst     = st.lastDst;
+        out.dstLang = st.lastDstLang;     // "" exactly when there is no dst to label
+    }
+
+    st.lastSrc   = asr.text;
+    out.tEpochMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::system_clock::now().time_since_epoch()).count();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// The COMMIT step. Pipeline thread, shared VERBATIM by the live path and the selftest.
+// ---------------------------------------------------------------------------
+// What the engine remembers between two drafts. Two halves with two lifetimes, and the
+// difference matters: the AGREEMENT is about one window and dies when the window moves,
+// while the HAND-OFF is what this thread believes the audio thread has been told and must
+// outlive it (it is what lets a tail that raced a commit be trimmed).
+struct AgreeState {
+    uint64_t                 segId  = 0;
+    size_t                   window = (size_t)-1;   // snapshot startOffset `prevAtoms` describes
+    std::vector<std::string> prevAtoms;
+
+    uint64_t committedSeg = 0;      // the segment we last asked to commit ...
+    size_t   committedOff = 0;      // ... and how far, in samples from ITS start
+};
+
+// A snapshot published BEFORE the audio thread applied our last commit still carries the
+// sentence we have already sent. Drafting it would repaint finished text and could commit
+// it a second time; skipping it costs one cadence and nothing else.
+bool snapStale(const AgreeState& agr, const PartialSnap& s) {
+    return agr.committedSeg == s.segId && s.startOffset < agr.committedOff;
+}
+
+// /!\ THE ONE RACE THIS ENGINE HAS, CLOSED HERE. commitUpTo is applied by the audio thread
+// at its next hop, and a VAD close can land in the very hop that carried the request -- the
+// segment is then already queued, the request is (rightly) ignored, and the tail still
+// holds the sentence we have just put on screen. The overlap is EXACTLY what we asked to
+// commit, so it is trimmed here rather than transcribed, translated and displayed twice.
+// Cheap, exact, and it needs no agreement with the audio thread about who won.
+void trimCommitted(const AgreeState& agr, Segment& seg) {
+    if (agr.committedSeg != seg.segId || agr.committedOff <= seg.startOffset) return;
+    size_t drop = agr.committedOff - seg.startOffset;
+    if (drop > seg.mono16k.size()) drop = seg.mono16k.size();
+    seg.mono16k.erase(seg.mono16k.begin(), seg.mono16k.begin() + (std::ptrdiff_t)drop);
+    seg.startOffset = agr.committedOff;
+}
+
+// Everything a committed sentence produces. The caller emits, IN THIS ORDER, the LINE and
+// then (when there is one) the tail PART -- that order is the one thing this function
+// cannot do for it, and it is the one thing a UI cannot recover from if it is wrong.
+struct CommitOut {
+    trpipe::WireLine    line;
+    bool                hasTail = false;
+    trpipe::WirePartial tail;
+    uint64_t            refTickMs = 0;   // when the SENTENCE ended, on the wall clock
+    size_t              newOffset = 0;   // the commit offset handed to the audio thread
+    StageTimes          tm;
+    bool                byPause = false; // the fallback rule fired (for the selftest's log)
+    std::string         draftSrc;        // WB: the DRAFT's words for this sentence -- what the
+                                         // live line showed; the selftest compares the final
+                                         // with it (the UI's head-trim works on the same pair)
+};
+
+// Returns true when a sentence was finalised. Every `false` is SILENT and cheap: the
+// sentence's audio is still inside the open segment, so nothing is lost by not committing
+// it -- it simply gets said later, as part of a longer line. That property is what makes
+// the engine safe to give up at any point, and it is used three times below.
+bool commitStep(Servers& srv, TrSpeaker& spk, TrAudio& audio, const Routing& r,
+                TrContext& ctx, const CommitCfg& cfg, const PartialSnap& snap,
+                const AsrResult& draft, AgreeState& agr, PartialState& pst,
+                CommitOut& out, std::string& err) {
+    err.clear();
+    if (!cfg.on || draft.words.empty()) return false;
+
+    std::vector<std::string> atoms;
+    std::vector<size_t>      atomEnd;
+    atomsOf(draft.words, atoms, atomEnd);
+
+    // LocalAgreement-2, and its one precondition: the two drafts must describe the SAME
+    // window. After a commit the window moves, and an agreement across that move would be
+    // comparing a sentence with its own remainder -- which agrees on nothing, or worse,
+    // agrees by accident.
+    const bool   sameWindow  = (agr.segId == snap.segId && agr.window == snap.startOffset);
+    const size_t stableAtoms = sameWindow ? commonPrefixLen(agr.prevAtoms, atoms) : 0;
+    agr.segId     = snap.segId;
+    agr.window    = snap.startOffset;
+    agr.prevAtoms = atoms;              // this draft is the next one's partner, regardless
+
+    if (!stableAtoms) return false;
+
+    // A word is stable only when ALL of its tokens are: half of a Chinese word is not
+    // evidence about the other half.
+    size_t stableWords = 0;
+    for (size_t w = 0; w < draft.words.size(); ++w) {
+        if (atomEnd[w] > stableAtoms) break;
+        stableWords = w + 1;
+    }
+    const CommitPick pick = commitPick(draft.words, stableWords, snap.seconds(), cfg);
+    if (!pick.has) return false;
+
+    // THE PREEMPTION POINT, the same one processPartial has and for the same reason: a
+    // commit costs a whole call on the FINAL model, and a finished utterance must never
+    // wait behind one. Giving up here loses nothing at all -- the audio is inside the tail
+    // that is already queued, so the sentence is still said, as part of that line.
+    if (audio.finalWaiting()) return false;
+
+    const std::string sentenceSrc = joinWords(draft.words, 0, pick.k);
+    const std::string tailSrc     = (pick.k + 1 < draft.words.size())
+                                  ? joinWords(draft.words, pick.k + 1, draft.words.size() - 1)
+                                  : std::string();
+    if (sentenceSrc.empty()) return false;
+
+    std::string skip;
+    if (!processCommitted(srv, spk, r, ctx, snap, pick.cutSamples, sentenceSrc,
+                          draft.language, out.line, out.tm, skip, err))
+        return false;                  // err set = transport; the caller backs the drafts off
+    out.line.closes = false;           // the speaker is still talking; seq is the caller's
+    out.draftSrc    = sentenceSrc;
+
+    // WHEN THE SENTENCE ENDED, on the wall clock -- the origin of its waitMs. The word
+    // timestamps are relative to the SNAPSHOT, the snapshot starts `startOffset` samples
+    // into the segment, and the segment's first sample was heard at segStartTickMs. Missing
+    // the middle term is the mistake this expression exists to make impossible.
+    const double endInSeg = (double)snap.startOffset / (double)kAsrRate + pick.endSec;
+    out.refTickMs = snap.segStartTickMs + (uint64_t)(endInSeg * 1000.0);
+    out.newOffset = snap.startOffset + pick.cutSamples;
+    out.byPause   = pick.byPause;
+
+    if (!tailSrc.empty()) {
+        out.hasTail       = true;
+        out.tail          = trpipe::WirePartial{};
+        out.tail.segId    = snap.segId;
+        out.tail.lang     = out.line.lang;   // the same breath: one language, decided once
+        // WA: shown, so in the line's script (see processPartial); pst.lastSrc below keeps
+        // whisper's own words, because the next draft is compared against THOSE.
+        out.tail.src      = scriptNet(tailSrc, out.tail.lang);
+        out.tail.tEpochMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count();
+        // dst DELIBERATELY EMPTY. The sentence's translation belongs to the line above it;
+        // showing it under the live line would be a translation of text that is no longer
+        // there. The next draft translates the tail, which is what the live line is for.
+    }
+
+    // The hand-off, and the resets that belong with it -- together, because a commit that
+    // moved the offset without resetting the agreement would compare the next draft against
+    // a window that no longer exists.
+    audio.commitUpTo(snap.segId, out.newOffset);
+    agr.committedSeg = snap.segId;
+    agr.committedOff = out.newOffset;
+    agr.prevAtoms.clear();
+    agr.window = (size_t)-1;            // one draft of latency: no commit on a single decode
+    pst = PartialState{};
+    pst.segId   = snap.segId;
+    pst.lastSrc = tailSrc;              // the live line already shows exactly this
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Shared state between the pipeline thread and the pipe servant.
 // ---------------------------------------------------------------------------
-// (SUVTITLE SPLIT: `Out` -- one LINE / PART / END for the servant, the live path's ONE ordered queue -- and
-// `SeqState` -- the per-utterance line counter -- were here. A FILE job's messages have their own
-// never-dropped queue, Shared::fileOut.)
+// One thing to send. BOTH kinds ride ONE queue, and that is a correctness requirement
+// rather than tidiness: a PART must never reach the app after the LINE that replaces
+// it, and two queues drained one after the other would reorder them the first time both
+// had something in at the same instant.
+struct Out {
+    enum Kind { kLine, kPartial, kEnd };
+    Kind                kind = kLine;
+    // LINES ONLY: the instant the speech this line covers ENDED, turned into waitMs at send
+    // time. The VAD cut for a closing line; the SENTENCE's own end for a committed one --
+    // one field, because it is one question ("how far behind the speaker is the screen?")
+    // and the two answers must be comparable.
+    uint64_t            endTickMs = 0;
+    trpipe::WireLine    line;
+    trpipe::WirePartial part;
+    trpipe::WireEnd     end;
+};
+
+// The per-utterance sequence number, and the promise it carries: a segId produces LINEs
+// seq = 1..n and then EXACTLY ONE of {LINE closes=1, END}, after which nothing. Kept as
+// ONE current pair rather than a map because utterances finish in order -- a queued final
+// is always drained before the next segment's first draft (the no-delay guarantee below),
+// so two segments can never be mid-flight at once.
+struct SeqState {
+    uint64_t segId = 0;
+    uint32_t n = 0;
+    uint32_t next(uint64_t s) { if (s != segId) { segId = s; n = 0; } return ++n; }
+    uint32_t count(uint64_t s) const { return s == segId ? n : 0u; }
+};
 
 // One FILE request as the servant queued it. `refuse` (WD) = the FILE named a job id but could not
 // be read (a `have` list that does not parse, no path): it still cancels a running job -- as any FILE
@@ -674,20 +1861,30 @@ std::vector<MtPair> contextFor(const TrContext& c, const std::string& srcLang,
 struct FileReq {
     trpipe::WireFile f;
     std::string      refuse;
+    // U3 (2026-11-02): or an FVOICE -- the voice pass shares the FILE jobs' ONE slot and their queue (an FVOICE ends a running
+    // FILE and a FILE ends a running FVOICE, in the wire's order). f.jobId / f.path carry its id and file for the code that
+    // answers any request whatever its kind (the supersede's FDONE, QUIT's, the FFOCUS slot).
+    bool              voice = false;
+    trpipe::WireVoice v;
     FileReq(const trpipe::WireFile& w, std::string why = std::string()) : f(w), refuse(std::move(why)) {}
+    FileReq(const trpipe::WireVoice& w, std::string why) : f(), refuse(std::move(why)), voice(true), v(w) {
+        f.jobId = w.jobId;
+        f.path  = w.path;
+    }
 };
-
 struct Shared {
     std::mutex                      mx;
-    // (SUVTITLE SPLIT: AudioPB's `outbox` -- the live LINE / PART / END queue, pipeline -> servant -- was here.)
+    std::deque<Out>                 outbox;     // pipeline -> servant, IN ORDER (the live path's LINE / PART / END)
     trpipe::WireState               state;
     bool                            stateDirty = true;
+    // The PLAYER's direction, preset and pair -- what a FILE job is analysed in (SuVtitle 1.1.0: the live path has its
+    // own pair, below; the preset is one setting for both).
     std::string                     mode   = "auto";
     std::string                     preset = "balanced";
     std::string                     langA  = "en";
     std::string                     langB  = "zh";
     bool                            presetChanged = false;
-    // (... and `clearAsked`: CTL clear=1 dropped the live queue at once. Nothing queues here: ignored.)
+    bool                            clearAsked = false;  // CTL clear (either scope): the live path's queue goes
     std::atomic<bool>               quit{ false };
     // W1: the servant's doorbell. Set ONCE, before the pipeline thread exists, and cleared
     // only after the join (runHost) -- so the pipeline thread never sees it change and it
@@ -698,6 +1895,23 @@ struct Shared {
     // stages directly and owns no pipe).
     HANDLE                          wake = nullptr;
 
+    // ---- THE LIVE PATH (SuVtitle 1.1.0) ---------------------------------------------------------
+    // What the app asked for -- LIVE, and CTL scope=live -- validated at the door (servantHandle); the pipeline takes
+    // it at the top of every lap and decides the mode from it (live wins: pipelineMain).
+    std::string                     liveMode  = "auto";   // the LIVE pair (TrConfig::liveMode / liveLangA / liveLangB)
+    std::string                     liveLangA = "en";
+    std::string                     liveLangB = "zh";
+    bool                            liveWanted = false;
+    std::vector<LiveInput>          liveInputs;           // the set the last LIVE 1 named (1..kMaxLiveInputs)
+    uint64_t                        liveGen = 0;          // bumped when that set CHANGES: an identical LIVE is a no-op
+    // liveWanted, mirrored lock-free: a live model load polls it (Servers::ensureUp's abort) and must not take mx.
+    std::atomic<bool>               liveWantedLive{ false };
+    // A TEST engine (testEnvAllowed in main): may a LIVE name "wav:" inputs (TrPipe.h)? Set once, before any thread.
+    bool                            testSources = false;
+    // LEVELS: ONE packed message, the newest wins (TrPipe.h: droppable by design, a meter that misses a tick is not a
+    // fault). "" = nothing new since the servant last sent one.
+    std::string                     levels;
+
     // ---- FILE MODE (wave WB) -------------------------------------------------------------
     // Requests IN (the servant appends, the pipeline drains at the top of every lap), and the
     // file messages OUT -- in their OWN queue, which is never trimmed: a dropped FCUE is a
@@ -707,9 +1921,11 @@ struct Shared {
     // that far behind -- and a tray that stops reading altogether breaks the pipe at
     // writeMessage's 3 s deadline, which ends the helper. FPROXY requests go to the proxy
     // worker (runHost), never through the pipeline.
+    // SuVtitle 1.1.0: the capture's INPUT / SRC / SRCEND ride this queue too -- an input's state and a picker's list
+    // must arrive whole -- and so does the one STATE that says why a LIVE was refused (refuseLiveLocked).
     std::deque<FileReq>             fileReqs;
     std::vector<uint64_t>           fileCancels;
-    std::deque<std::string>         fileOut;            // packed FPROG/FCUE/FDONE/FPROXYDONE
+    std::deque<std::string>         fileOut;            // packed FPROG/FCUE/FDONE/FPROXYDONE (+ INPUT/SRC/SRCEND)
     uint64_t                        runningJob = 0;     // the job the pipeline is running (0 = none)
     // v2 (WD): THE PLAYHEAD -- one slot, latest wins. The servant writes it for the running job or a
     // queued one (anything else is stale and dropped); the pipeline takes it at its next step
@@ -730,6 +1946,7 @@ struct Shared {
     // abort), so a 3 GB load is not waited out. AN ID, NOT A FLAG (WB, after the review): a flag
     // raised for a job that was ending as the FCANCEL arrived stayed raised, and the NEXT job's
     // load was aborted on every lap for ever. A stale id can only ever name a finished job.
+    // (SuVtitle 1.1.0: a LIVE 1 stops the running job's load the same way: the live path takes over.)
     std::atomic<uint64_t>           abortJob{ 0 };
 };
 constexpr uint64_t kAbortAll = ~0ull;    // abortJob on the way out: whatever is loading stops
@@ -755,8 +1972,28 @@ void setState(Shared& sh, const char* status, const std::string& err = std::stri
     if (changed) wakeServant(sh);   // outside the lock: see wakeServant
 }
 
-// (SUVTITLE SPLIT: spkConfigFrom -- the diarization stage's config -- and pushOut -- the live outbox's
-// producer -- were here.)
+// The diarization stage's config, out of engine.txt and the resolved payload.
+SpkConfig spkConfigFrom(const TrConfig& cfg, const TrPaths& paths) {
+    SpkConfig s;
+    s.on          = cfg.spkOn;
+    s.model       = paths.spkModel;
+    s.binDir      = paths.sherpaDir;
+    s.threshold   = cfg.spkThresh;
+    s.maxSpeakers = cfg.spkMax;
+    s.minSec      = cfg.spkMinSec;
+    s.recluster   = cfg.spkRecluster;
+    return s;
+}
+
+// Queue one message for the servant, oldest-first-out when the app has stopped reading.
+void pushOut(Shared& sh, Out&& o) {
+    {
+        std::lock_guard<std::mutex> lk(sh.mx);
+        while (sh.outbox.size() >= kOutboxCap) sh.outbox.pop_front();
+        sh.outbox.push_back(std::move(o));
+    }
+    wakeServant(sh);   // W1: the servant is asleep in a read; this is what cuts it short
+}
 
 // ===========================================================================
 // FILE MODE (wave WB): subtitling a RECORDING. The wire contract is TrPipe.h's "FILE MODE"
@@ -765,7 +2002,7 @@ void setState(Shared& sh, const char* status, const std::string& err = std::stri
 // PIPELINE thread -- the only thread allowed to call the servers, which is what keeps "one GPU
 // call at a time" true by construction -- one bounded step per lap (one model call, or one
 // model load that a cancel interrupts), so CTL / FCANCEL / QUIT are never more than one call
-// away. While a job runs the live path is paused and its audio DROPPED (TrPipe.h).
+// away. A job and the live path never run together (SuVtitle 1.1.0: pipelineMain's three modes).
 // ===========================================================================
 constexpr DWORD kFileAsrTimeoutMs = 300000;   // one 30 s window on a CPU-only machine
 constexpr int   kFileRetries      = 2;        // server restarts a job may spend
@@ -851,12 +2088,201 @@ struct FileJobStats {
     uint32_t    heldBack = 0;             // hard cuts that committed nothing and came back to the speech (B)
     uint32_t    dedupWords = 0;           // words dropped as already committed (B)
     uint32_t    mergedFrags = 0;          // fragments joined to a neighbour (E)
+    // F-RESUME (TrFileJob.h, hearCheck): unheard speech sent back to whisper, and stretches vouched for
+    // after their second hearing came back empty
+    uint32_t    reheard = 0, unheardKept = 0, cutCapped = 0;   // (+ early stops left uncut: kMaxCutChain)
     // WH: the sound track analysed, as the reader found it (TrMedia.cpp "WHICH SOUND TRACK"); "" = never opened
     std::string track;
     int         trackOrd = -1;
     uint32_t    trackId = 0, trackStream = 0, trackStreams = 0;
     std::string trackLang, trackHow;
+    // U3 (2026-11-02): a VOICE PASS's numbers (FVOICE; voiceLap) -- 0 for an analysis
+    uint32_t    voicePieces = 0, voiceChanges = 0, voicePrints = 0, voiceShort = 0, voiceFailed = 0;
+    uint32_t    voiceSpeakers = 0, voiceSnapped = 0, voiceSeeks = 0;
+    uint64_t    voiceDecodeMs = 0, voiceEmbedMs = 0, voiceClusterMs = 0, voicePeakMb = 0, voiceMaxBuf = 0;
+    std::vector<uint32_t> voiceLabels;    // what FSPK said
 };
+
+// ===========================================================================
+// U3 (2026-11-02): THE VOICE PASS -- FVOICE (TrPipe.h). A file's TRANSCRIPT is its analysis' original text (the FCUE src,
+// unchanged); its SPEAKERS are named by this job, run once the analysis is complete (the user: "les locuteurs reconnus a la
+// voix"): the same sound track decoded again (~4 s a lap, the analysis' own MediaReader and timeline), ONE voiceprint per
+// piece of the transcript (a cue, or one line of a dialogue-dash cue: the app cuts them) with CAM++ (TrSpeaker::embed), then
+// ALL of them clustered at once (TrSpeaker.h clusterOffline: the benched re-cluster rule, run over the whole file), the short
+// pieces given the nearest voice (MEASURED: docs/PROGRESS_U3.md M2 -- the live rule, "a short segment is the previous
+// speaker", mislabels a conversation's one-word answers), a KNOWN change of speaker (a dialogue dash) never given the label
+// of the piece before it; the speakers numbered by first appearance -> FSPK, then FDONE. It calls NO server -- a FILE's
+// whisper and llama are not touched -- and runs as a FILE job does: a bounded step a lap on the pipeline thread, in the FILE
+// jobs' one slot (a FILE ends it, it ends a FILE), FCANCEL / QUIT / LIVE never more than a lap away.
+// MEMORY (the director, 02/11): never a file's whole sound (2 h of 16 kHz float = 460 MB). The audio kept runs from the next
+// piece's start (less the snap window) to what is decoded: one piece (at most kVoiceMaxEmbedSec of it embedded) and one
+// chunk at a time. The voiceprints (192 floats a piece) and the clustering's triangle (kVoiceClusterMax pieces at most) are
+// all it holds; its log line says the process' peak working set.
+// ===========================================================================
+constexpr double   kVoiceMinEmbedSec = 0.5;     // shorter: no voiceprint at all (the attach rules)
+constexpr double   kVoiceMaxEmbedSec = 30.0;    // a piece's first 30 s make its voiceprint
+constexpr double   kVoiceSeekGapSec  = 30.0;    // the next piece this far past what is decoded: SEEK there
+constexpr double   kVoiceSnapSec     = 1.0;     // a known change's boundary moves to the quietest 30 ms this close to it...
+constexpr double   kVoiceSnapKeepSec = 0.25;    // ... leaving each of its two pieces at least this much
+constexpr int      kVoiceThreads     = 2;       // ORT threads: the film keeps playing (Live's stage uses 4)
+constexpr size_t   kVoiceClusterMax  = 3000;    // pieces clustered at most (the longest: 36 MB of triangle); others: the nearest voice
+constexpr uint64_t kVoiceProgMs      = 1000;    // FPROG voices at most this often
+constexpr uint64_t kVoiceLapMs       = 200;     // voiceprints made in one lap at most this long (FCANCEL stays a lap away)
+
+// TEST-ONLY (U3): a stand-in voiceprint -- the piece's index and its audio in, a vector out (false = "no voiceprint"): what
+// lets [0v] drive whole voice jobs with no speaker model. Inert when empty; NEVER set by the helper itself.
+std::function<bool(size_t, const std::vector<float>&, std::vector<float>&)> g_voiceEmbedForTest;
+
+struct VoiceWork {
+    trpipe::WireVoice            req;
+    std::vector<trpipe::MsRange> spans;      // SAMPLES (16 kHz, the media timeline); a known change's boundary may move (snap)
+    std::vector<char>            change;     // per piece: a KNOWN change of speaker from the piece before it
+    SpkConfig                    cfg;        // the stage as engine.txt says (SPKON, the model, the runtime) -- kVoiceThreads
+    std::unique_ptr<TrSpeaker>   spk;
+    std::string                  model;      // FSPK's tag when names are given
+    std::string                  offWhy;     // no names: why ("" = the stage is on)
+    size_t                       next = 0;   // the next piece to hear
+    std::vector<std::vector<float>> emb;     // per piece: its voiceprint (empty = none)
+    std::vector<float>           buf;        // decoded audio, from bufStart
+    uint64_t                     bufStart = 0;
+    bool                         over = false;   // the reader has nothing more: its end, or it broke (FileJob::failErr)
+    uint64_t                     progTick = 0, doneMs = 0;
+    std::vector<uint32_t>        labels;     // the answer (FSPK): 1..speakers, 0 = none
+    uint32_t                     speakers = 0;
+};
+
+// The quietest 30 ms hop of `x` (its first sample at x0) starting in [lo, hi) -- where a known change of speaker's boundary
+// moves: the pause between the two voices. Returns that hop's middle; `b` itself when [lo, hi) holds no whole decoded hop.
+uint64_t quietestHop(const std::vector<float>& x, uint64_t x0, uint64_t lo, uint64_t hi, uint64_t b) {
+    const uint64_t hop = (uint64_t)kFileHop;
+    uint64_t best = b;
+    double bestE = std::numeric_limits<double>::infinity();
+    for (uint64_t at = lo; at + hop <= hi; at += hop / 2) {
+        if (at < x0 || at + hop > x0 + x.size()) continue;
+        double e = 0.0;
+        for (uint64_t k = at; k < at + hop; ++k) {
+            const double v = x[(size_t)(k - x0)];
+            e += v * v;
+        }
+        if (e < bestE) { bestE = e; best = at + hop / 2; }
+    }
+    return best;
+}
+
+// THE LABELS of a voice pass. PURE ([0v] drives it on synthetic voiceprints): `emb` per piece (empty = none), `secs` its
+// length, `change` a known change of speaker from the piece before. Returns the speaker count; `labels` 1..n per piece.
+//  1. the LONG pieces (>= minSec, with a voiceprint) are clustered (clusterOffline: threshold, cap) -- at most clusterMax of
+//     them, the longest; when none is long, every piece with a voiceprint is;
+//  2. in TIME ORDER, every other piece: with a voiceprint, the nearest voice when its cosine is >= threshold (an extra long
+//     one: the nearest whatever), else the previous piece's speaker (M2: the one-word answers); without one, the previous
+//     piece's (the first ones take the next one's);
+//  3. a KNOWN CHANGE never keeps its predecessor's speaker: with a voiceprint, the nearest OTHER voice (no threshold: the dash
+//     already says it is someone else); without one, the most recent speaker before it that is not its predecessor's (a
+//     dialogue goes back and forth); else a NEW voice (within the cap);
+//  4. numbered 1..n by first appearance.
+uint32_t voiceLabels(const std::vector<std::vector<float>>& emb, const std::vector<double>& secs, const std::vector<char>& change,
+                     double threshold, int cap, double minSec, size_t clusterMax, std::vector<uint32_t>& labels) {
+    const size_t n = emb.size();
+    labels.assign(n, 0);
+    if (n == 0 || secs.size() != n || change.size() != n) return 0;
+    if (cap < 1) cap = 1;
+    std::vector<size_t> longs;
+    for (size_t i = 0; i < n; ++i) if (!emb[i].empty() && secs[i] >= minSec) longs.push_back(i);
+    if (longs.empty()) for (size_t i = 0; i < n; ++i) if (!emb[i].empty()) longs.push_back(i);
+    if (longs.empty()) return 0;                                  // no voiceprint at all: no names
+    std::vector<char> extra(n, 0);
+    if (longs.size() > clusterMax) {
+        std::vector<size_t> bySize = longs;
+        std::stable_sort(bySize.begin(), bySize.end(), [&](size_t a, size_t b) { return secs[a] > secs[b]; });
+        for (size_t k = clusterMax; k < bySize.size(); ++k) extra[bySize[k]] = 1;
+        longs.erase(std::remove_if(longs.begin(), longs.end(), [&](size_t i) { return extra[i] != 0; }), longs.end());
+    }
+    std::vector<std::vector<float>> in(n);
+    for (size_t i : longs) in[i] = emb[i];
+    const std::vector<int> cl = clusterOffline(in, threshold, cap);
+    std::vector<int> lab(cl);
+    int k = 0;
+    for (int c : cl) k = std::max(k, c + 1);
+    // the voices' centroids: the mean of their clustered pieces, renormalised; a voice a change made without a voiceprint has none
+    std::vector<std::vector<double>> cen((size_t)k);
+    std::vector<char> hasCen((size_t)k, 1);
+    for (size_t i : longs) {
+        auto& c = cen[(size_t)cl[i]];
+        if (c.empty()) c.assign(emb[i].size(), 0.0);
+        for (size_t d = 0; d < emb[i].size() && d < c.size(); ++d) c[d] += emb[i][d];
+    }
+    auto norm = [](std::vector<double>& c) {
+        double s = 0.0;
+        for (double x : c) s += x * x;
+        s = std::sqrt(s);
+        if (s > 1e-12) for (double& x : c) x /= s;
+    };
+    for (auto& c : cen) norm(c);
+    auto cosTo = [&](size_t i, int c) {
+        double s = 0.0;
+        const auto& v = emb[i];
+        const auto& m = cen[(size_t)c];
+        for (size_t d = 0; d < v.size() && d < m.size(); ++d) s += (double)v[d] * m[d];
+        return s;
+    };
+    auto nearest = [&](size_t i, int excl, double& sim) {
+        int best = -1;
+        sim = -2.0;
+        for (int c = 0; c < k; ++c) {
+            if (c == excl || !hasCen[(size_t)c]) continue;
+            const double s = cosTo(i, c);
+            if (s > sim) { sim = s; best = c; }
+        }
+        return best;
+    };
+    auto newVoice = [&](size_t i) {
+        if (k >= cap) return -1;
+        std::vector<double> c;
+        if (!emb[i].empty()) { c.assign(emb[i].begin(), emb[i].end()); norm(c); }
+        hasCen.push_back(c.empty() ? 0 : 1);
+        cen.push_back(std::move(c));
+        return k++;
+    };
+    auto mostRecentOther = [&](size_t i, int excl) {
+        for (size_t j = i; j-- > 0;) if (lab[j] >= 0 && lab[j] != excl) return lab[j];
+        return -1;
+    };
+    // the rule for a known change whose predecessor speaks as `prev`
+    auto otherThan = [&](size_t i, int prev) {
+        double s = 0.0;
+        int o = emb[i].empty() ? mostRecentOther(i, prev) : nearest(i, prev, s);
+        if (o < 0) o = newVoice(i);
+        return o < 0 ? lab[i] : o;                                 // (a cap of one voice: nothing can differ)
+    };
+    for (size_t i = 0; i < n; ++i) {
+        const int prev = i > 0 ? lab[i - 1] : -1;
+        if (lab[i] >= 0) {
+            if (change[i] && prev >= 0 && lab[i] == prev) lab[i] = otherThan(i, prev);
+            continue;
+        }
+        if (change[i] && prev >= 0) { lab[i] = otherThan(i, prev); if (lab[i] < 0) lab[i] = prev; continue; }
+        if (!emb[i].empty()) {
+            double s = 0.0;
+            const int c = nearest(i, -1, s);
+            lab[i] = (c >= 0 && (s >= threshold || extra[i])) ? c : prev;
+        } else {
+            lab[i] = prev;
+        }
+    }
+    // the first pieces, before any voice: the next one's -- then the known changes checked again (the fill may break one)
+    for (size_t i = n; i-- > 0;) if (lab[i] < 0 && i + 1 < n) lab[i] = lab[i + 1];
+    for (size_t i = 1; i < n; ++i)
+        if (change[i] && lab[i] >= 0 && lab[i] == lab[i - 1]) lab[i] = otherThan(i, lab[i - 1]);
+    // numbered by first appearance
+    std::vector<int> num((size_t)k, 0);
+    uint32_t next = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (lab[i] < 0) continue;
+        if (!num[(size_t)lab[i]]) num[(size_t)lab[i]] = (int)++next;
+        labels[i] = (uint32_t)num[(size_t)lab[i]];
+    }
+    return next;
+}
 
 struct FileJob {
     enum class Phase { Open, Load, Run, Drain };
@@ -870,6 +2296,7 @@ struct FileJob {
     Routing               r;                // the job's pair/mode SNAPSHOT (TrPipe.h)
     TrContext             ctx;              // the job's OWN memory: the live one is never touched
     std::string           asrModel, mtModel;
+    std::string           asrCustom, mtCustom;   // U2: the user's own models (FILE's asrModel / mtModel); "" = the shipping choice
     MediaReader           reader;
     EnergyTrack           energy;
     CueBuilder            cues;
@@ -890,7 +2317,13 @@ struct FileJob {
     uint64_t              progTick = 0;
     int                   retries = 0;
     WindowPlan            retryPlan;        // a DEGENERATE window being decoded again
-    int                   retryAttempt = 0; // 0 = none, 1 = unprompted, 2 = shortened, 3 = language forced (WF)
+    int                   retryAttempt = 0; // 0 = none, 1 = unprompted, 2 = shortened, 3 = language forced (WF),
+                                            // 4 = unheard speech at its head: the same window once more (F-RESUME)
+    bool                  headHeard = false;  // F-RESUME: the next request is a SECOND hearing (TrFileJob.h, hearCheck) ...
+    uint64_t              heardTo = 0;        // ... of the audio before this (the end of the window it follows)
+    uint64_t              prevCut = 0;        // ... after this early-stop cut (a new cut must pass it by kUnheardTailSec)
+    int                   cutChain = 0;       // early-stop cuts in a row; seamAt: where the last one cut (dropRepeatedHead)
+    double                seamAt = -1.0;
     // WF, D: the current window's language when it is FORCED into the pair ("" = auto), the committed
     // words per pair language (the file's dominant one), and the last ~30 s of committed words (B)
     std::string           forcedLang;
@@ -943,6 +2376,9 @@ struct FileJob {
     uint64_t              regionStart = 0;       // where the decode in `buf` began (a seek moves it)
     bool                  mustSeek = false;      // a seek was aborted: the reader is nowhere until the next
     std::string           lastProg;              // the last FPROG's ranges + done (dedupe a burst)
+    // U3 (2026-11-02): this job is a VOICE PASS (FVOICE), not an analysis -- fileJobLap and finishJob hand it to voiceLap /
+    // finishVoiceJob; it uses req.jobId / req.path / path / audio / reader / totalMs / hasVideo / opened / failErr / st / t0
+    std::unique_ptr<VoiceWork> voice;
 };
 
 // ---- v2: ranges (samples) ------------------------------------------------------------------------
@@ -1025,6 +2461,13 @@ void reportFrontier(FileJob& j) {
     j.cues.raiseFloor((double)j.runReported / kFileRate);
 }
 
+// U2 (2026-11-02): a model's FILE NAME -- what FPROG and STATE say of an imported model (its folder is the user's
+// business). A bare name (a shipping model) is itself.
+std::string modelLeaf(const std::string& path) {
+    const size_t cut = path.find_last_of("\\/");
+    return cut == std::string::npos ? path : path.substr(cut + 1);
+}
+
 // FPROG v2: `ranges` = what is analysed now (have + this job's, merged), doneMs = their total.
 // `force` = send even when nothing changed (loading, a window, the end); otherwise an identical
 // FPROG within 250 ms is not repeated (a burst of FFOCUS costs nothing but the last one).
@@ -1036,8 +2479,8 @@ void sendProg(FileJob& j, FileSink& sink, const char* phase, bool force = true) 
     p.phase    = phase;
     p.doneMs   = trpipe::rangesTotal(ms);
     p.totalMs  = j.totalMs;
-    p.asrModel = j.asrModel;
-    p.mtModel  = j.mtModel;
+    p.asrModel = modelLeaf(j.asrModel);   // U2: the FILE's name (an imported model's path stays the user's)
+    p.mtModel  = modelLeaf(j.mtModel);
     p.hasVideo = j.hasVideo;
     p.ranges   = trpipe::packRanges(ms);
     const std::string key = std::string(phase) + "|" + p.ranges;
@@ -1061,8 +2504,13 @@ void maybeSendProg(FileJob& j, FileSink& sink) {
 // EXACTLY ONE FDONE per FILE, sent BEFORE anything is torn down, so the tray never waits on
 // our cleanup or on the live models coming back. v2: a job that got past Open and does not end "ok"
 // first sends its RANGES -- what is analysed now -- so the tray can resume it exactly there.
+// U3: a voice pass ends its own way (FSPK before an ok FDONE, its own log line, no ranges, no server to free) -- below.
+void finishVoiceJob(std::unique_ptr<FileJob>& job, FileSink& sink, const char* result, const std::string& err,
+                    FileJobStats* out);
+
 void finishJob(std::unique_ptr<FileJob>& job, Servers& srv, FileSink& sink, const char* result,
                const std::string& err, FileJobStats* out) {
+    if (job->voice) { finishVoiceJob(job, sink, result, err, out); return; }   // U3
     FileJob& j = *job;
     if (j.opened && std::strcmp(result, "ok") != 0)
         sendProg(j, sink, (j.phase == FileJob::Phase::Open || j.phase == FileJob::Phase::Load) ? "loading" : "analyzing");
@@ -1116,6 +2564,32 @@ std::string badAudioSentence(const std::string& audio) {
     return "The request names a sound track that could not be read (\"" + shown + "\").";
 }
 
+// U2 (2026-11-02): THE USER'S OWN MODELS (TrPipe.h: FILE's asrModel / mtModel). The sentence of an imported model that
+// cannot be used BEGINS with trpipe::kFileModelErrAsr / kFileModelErrMt -- the app reads which kind failed
+// (fileModelErrKind) and goes back to the default for it -- then the FILE's name (echoed: printable, 120 bytes at most:
+// it came off the wire) and why.
+constexpr const char* kModelPathRefusal = "its path is not a full path to a file (\"X:\\...\" or \"\\\\server\\share\\...\")";
+std::string importedModelSentence(bool asr, const std::string& path, const std::string& why) {
+    std::string leaf;
+    for (char c : modelLeaf(path)) {
+        if (leaf.size() >= 120) { leaf += "..."; break; }
+        leaf += (static_cast<unsigned char>(c) >= 32 && c != 127) ? c : '?';
+    }
+    return std::string(asr ? trpipe::kFileModelErrAsr : trpipe::kFileModelErrMt) + leaf + "\" could not be used: " + why + ".";
+}
+// An imported model a FILE names, checked BEFORE anything loads: a path the wire takes, the file there, and its HEADER of
+// the kind asked (TrPipe.h modelFileKind -- never its name). False = `err` is its sentence (the job's one FDONE error).
+bool checkImportedModel(const std::string& path, bool asr, std::string& err) {
+    if (!trpipe::modelPathOk(path)) { err = importedModelSentence(asr, path, kModelPathRefusal); return false; }
+    std::string why;
+    const trpipe::ModelKind k = trpipe::modelFileKind(utf8ToWideL(path), &why);
+    if (k == (asr ? trpipe::ModelKind::Asr : trpipe::ModelKind::Mt)) return true;
+    if (k == trpipe::ModelKind::Mt) why = "it is a GGUF model (one that translates), not a whisper.cpp model";
+    else if (k == trpipe::ModelKind::Asr) why = "it is a whisper.cpp model (one that transcribes), not a GGUF model";
+    err = importedModelSentence(asr, path, why);
+    return false;
+}
+
 // A FILE request -> a job, or a refusal. /!\ A pair or a mode the helper cannot honour is an
 // FDONE error and NEVER a substituted value (WC): the tray caches the result under the pair
 // it asked for, so subtitles made under another one would be filed under the wrong name.
@@ -1152,6 +2626,10 @@ bool makeFileJob(const trpipe::WireFile& f, const std::string& curA, const std::
         err = badAudioSentence(f.audio);
         return false;
     }
+    // U2: the user's own models -- each named file there, and of the right kind by its HEADER, before anything loads;
+    // else the job's one FDONE error names it (the app goes back to the default for that kind)
+    if (!f.asrModel.empty() && !checkImportedModel(f.asrModel, true, err)) return false;
+    if (!f.mtModel.empty() && !checkImportedModel(f.mtModel, false, err)) return false;
     job.reset(new FileJob);
     job->req       = f;
     job->path      = utf8ToWideL(f.path);
@@ -1170,6 +2648,10 @@ bool makeFileJob(const trpipe::WireFile& f, const std::string& curA, const std::
     // The 4B even when the live preset is light: MTMODEL wins, as it does live.
     job->mtModel     = cfg.mtModel.empty() ? std::string(kMtModelFile) : cfg.mtModel;
     if (!g_fileMtModelForTest.empty()) job->mtModel = g_fileMtModelForTest;   // TEST-ONLY (CPU runs)
+    // U2: the user's own models (checked above) win over everything -- THAT file, never a fallback (bringFile's mtExact)
+    job->asrCustom = f.asrModel;
+    job->mtCustom  = f.mtModel;
+    if (!f.mtModel.empty()) job->mtModel = f.mtModel;
     for (const auto& r : haveMs) job->have.push_back({ msToSamples(r.s), msToSamples(r.e) });
     trpipe::mergeRanges(job->have);
     job->focusMs = f.focusMs;
@@ -1184,9 +2666,16 @@ std::string g_fileLargeModelForTest;   // "" = ggml-large-v3.bin; ONLY the selft
 double      g_fileFailDecodeAtForTest = 0.0;   // > 0: the decode "breaks" there; ONLY the selftest
 bool        g_fileFailSeekForTest = false;     // every seek fails (a file moved away); ONLY the selftest
 std::deque<std::string> g_fileAsrRepliesForTest;   // stand-in window decodes, consumed in order; ONLY the selftest
+// TEST-ONLY (F-RESUME): hearCheck off -- the job as it was before F-RESUME, so [8e] can hold every case against
+// what the same whisper gave WITHOUT it ("never more loss than before"). Never set by the helper itself.
+bool g_fileNoHearCheckForTest = false;
 
 bool chooseFileModels(FileJob& j, const Servers& srv, std::string& err) {
     static const char* kTurbo = "ggml-large-v3-turbo.bin";
+    if (!j.asrCustom.empty()) {               // U2: the user's own whisper.cpp model (makeFileJob checked it): `quality` unread
+        j.asrModel = j.asrCustom;
+        return true;
+    }
     if (!g_fileAsrModelForTest.empty() && srv.modelInstalled(g_fileAsrModelForTest)) {
         j.asrModel = g_fileAsrModelForTest;
         return true;
@@ -1408,6 +2897,8 @@ NextRun startNextRun(FileJob& j, const std::function<bool()>& abort) {
     j.lastTail.clear();
     j.lastHard = false;
     j.retryAttempt = 0;
+    j.headHeard = false;          // (F-RESUME)
+    j.heardTo = 0; j.prevCut = 0; j.cutChain = 0; j.seamAt = -1.0;
     j.forcedLang.clear();
     j.haveFirstAsr = false;
     j.recentWords.clear();        // (WF) the language count stays: it is the FILE's, not the stretch's
@@ -1437,6 +2928,8 @@ void closeRun(FileJob& j) {
 // degenerate window not yet accepted was not heard: dropped (the cursor is still its start).
 void stopRun(FileJob& j) {
     j.retryAttempt = 0;
+    j.headHeard = false;          // (F-RESUME: the cursor is still before any stretch waiting to be heard again)
+    j.heardTo = 0; j.prevCut = 0; j.cutChain = 0; j.seamAt = -1.0;
     j.forcedLang.clear();
     j.haveFirstAsr = false;
     j.cues.finish((double)j.cursor / kFileRate);
@@ -1734,7 +3227,7 @@ FileStep fileWindowStep(FileJob& j, Servers& srv, std::string& err, bool& done, 
                     (double)plan.s / kFileRate, (double)plan.e / kFileRate,
                     plan.why == WindowPlan::kPause ? "pause" : plan.why == WindowPlan::kHard ? "hard"
                     : plan.why == WindowPlan::kLimit ? "limit" : "eof",
-                    j.retryAttempt ? (j.retryAttempt == 3 ? ", forced" : ", retry") : "", asr.ms,
+                    j.retryAttempt ? (j.retryAttempt == 3 ? ", forced" : j.retryAttempt == 4 ? ", again" : ", retry") : "", asr.ms,
                     asr.language.c_str(), asr.langProb,
                     prompt.empty() ? "-" : promptTail(prompt, 24).c_str(), cv.words.size(),
                     cv.junkSegments, cv.tags, cv.foreign, cv.repeats, cv.degenerate ? " DEGENERATE" : "",
@@ -1797,10 +3290,39 @@ FileStep fileWindowStep(FileJob& j, Servers& srv, std::string& err, bool& done, 
             }
         }
     }
+    // F-RESUME: a decode FORCED into the pair after one heard outside it is the window's second hearing (hearCheck)
+    const bool forcedDecode = !j.forcedLang.empty();
     if (!j.forcedLang.empty() && cv.words.empty()) ++j.st.langEmpty;
     j.retryAttempt = 0;
     j.forcedLang.clear();
     j.haveFirstAsr = false;
+    // ---- F-RESUME: audio this verdict would vouch for that whisper stopped writing in (TrFileJob.h, hearCheck) ----
+    // The de-dup nets FIRST: an early stop is decided on what this request COMMITS (round 3, review F12c -- a request
+    // whose only word was heard twice must not cut). They only read the job's last words.
+    const bool hadWords = std::any_of(cv.words.begin(), cv.words.end(), [](const FileWord& w) { return hasLetterOrDigit(w.text); });
+    if (j.lastHard) dropRepeatedHead(cv.words, j.lastTail, j.seamAt);
+    const size_t dedup = dropAlreadyCommitted(cv.words, j.recentWords);    // WF, B: the SAFETY de-dup
+    HearContext hx;
+    hx.secondUpTo = forcedDecode ? plan.e : (j.headHeard ? j.heardTo : 0);
+    hx.prevCut    = j.headHeard ? j.prevCut : 0;
+    hx.cutChain   = j.cutChain;
+    hx.hadWords   = hadWords;
+    const HearCheck hear = g_fileNoHearCheckForTest ? HearCheck{} : hearCheck(j.energy, plan, cv, hx);
+    if (verbose && plan.why != WindowPlan::kHard && hear.lastWord >= 0.0)
+        std::printf("#     heard to %.2f s, then %.1f s of active audio\n", hear.lastWord, hear.activeSec);
+    else if (verbose && plan.why != WindowPlan::kHard)
+        std::printf("#     no word heard, %.1f s of active audio no statement covers\n", hear.activeSec);
+    if (hear.same) {
+        ++j.st.reheard;
+        if (verbose) std::printf("#     NOTHING COMMITTED: the same window, once more\n");
+        j.headHeard = true;
+        j.heardTo   = plan.e;                  // all of it is then heard twice
+        j.prevCut   = 0;
+        j.cutChain  = 0;
+        j.retryPlan = plan;
+        j.retryAttempt = 4;
+        return FileStep::Ok;
+    }
     j.st.junkSegments += (uint32_t)(cv.junkSegments + cv.repeats);
     j.st.foreignSegs  += (uint32_t)cv.foreign;
     j.st.tagSegs      += (uint32_t)cv.tags;
@@ -1810,11 +3332,39 @@ FileStep fileWindowStep(FileJob& j, Servers& srv, std::string& err, bool& done, 
         if (cv.timed) ++j.st.timedWindows;
     }
     if (cv.heldBack) ++j.st.heldBack;
-    if (j.lastHard) dropRepeatedHead(cv.words, j.lastTail);
-    // WF, B: the SAFETY de-dup -- words already committed, heard (or decoded) a second time
-    if (const size_t dd = dropAlreadyCommitted(cv.words, j.recentWords)) {
-        j.st.dedupWords += (uint32_t)dd;
-        if (verbose) std::printf("#     de-dup: %zu word(s) already committed, dropped\n", dd);
+    if (dedup) {
+        j.st.dedupWords += (uint32_t)dedup;
+        if (verbose) std::printf("#     de-dup: %zu word(s) already committed, dropped\n", dedup);
+    }
+    const uint64_t verdictEnd = cv.nextCursor;
+    if (hear.rehear) {
+        // AN EARLY STOP: every word heard is kept; the next window starts right after the last of them and is the
+        // second hearing of the rest of THIS window (heardTo)
+        ++j.st.reheard;
+        if (verbose) std::printf("#     EARLY STOP: everything heard kept, the next window from %.2f s\n",
+                                 (double)hear.nextCursor / kFileRate);
+        j.heardTo  = std::max<uint64_t>(j.headHeard ? j.heardTo : 0, verdictEnd);
+        j.prevCut  = hear.nextCursor;
+        j.seamAt   = (double)hear.nextCursor / kFileRate;
+        j.headHeard = true;
+        ++j.cutChain;
+        cv.nextCursor = hear.nextCursor;
+    } else {
+        if (hear.accepted) {
+            ++j.st.unheardKept;
+            if (hear.nextCursor && hear.nextCursor < verdictEnd) cv.nextCursor = hear.nextCursor;
+            if (verbose) std::printf("#     a second hearing, vouched for up to %.2f s%s\n", (double)cv.nextCursor / kFileRate,
+                                     cv.nextCursor < verdictEnd ? " (what was heard twice: the rest is on its first)" : "");
+        }
+        if (hear.capped) {
+            ++j.st.cutCapped;
+            if (verbose) std::printf("#     EARLY STOP not cut: %d cuts in a row already -- vouched for as before\n", j.cutChain);
+        }
+        j.headHeard = false;
+        j.heardTo   = 0;
+        j.prevCut   = 0;
+        j.cutChain  = 0;
+        j.seamAt    = -1.0;
     }
     j.cues.addWords(cv.words);
     // WF: what was committed -- the last ~30 s of words (B) and the file's language count (D)
@@ -1833,7 +3383,7 @@ FileStep fileWindowStep(FileJob& j, Servers& srv, std::string& err, bool& done, 
         j.lastTail.insert(j.lastTail.end(), cv.words.begin(), cv.words.end());
         if (j.lastTail.size() > 12) j.lastTail.erase(j.lastTail.begin(), j.lastTail.end() - 12);
     }
-    if (plan.why == WindowPlan::kPause && j.lastWordEnd >= 0.0) {
+    if (plan.why == WindowPlan::kPause && j.lastWordEnd >= 0.0 && cv.nextCursor == verdictEnd) {   // (F-RESUME: not when moved)
         // How much silence follows the last word: the next ACTIVE hop after the cut.
         size_t h = EnergyTrack::hopAt((double)plan.e / kFileRate);
         while (h < j.energy.hops() && !j.energy.active(h)) ++h;
@@ -1844,7 +3394,8 @@ FileStep fileWindowStep(FileJob& j, Servers& srv, std::string& err, bool& done, 
     j.dropTail = cv.sawJunk;
     // (review L1: a hard cut that committed nothing -- held back, or nothing heard -- is not re-heard by the
     // next window: its head is never cut against the words before it)
-    j.lastHard = plan.why == WindowPlan::kHard && !cv.heldBack && !cv.words.empty();
+    // (F-RESUME: a cut is re-heard from just after its last word, like a hard cut)
+    j.lastHard = (plan.why == WindowPlan::kHard || hear.rehear) && !cv.heldBack && !cv.words.empty();
     if (cv.nextCursor > j.cursor) j.cursor = cv.nextCursor;
     j.first = false;
     j.runFirst = false;
@@ -1857,8 +3408,292 @@ FileStep fileWindowStep(FileJob& j, Servers& srv, std::string& err, bool& done, 
 // ONE bounded step of the job (see the section header). The job is gone (FDONE sent) when
 // `job` comes back empty. `abort` interrupts a model load; the caller turns an aborted load
 // into the right FDONE (cancelled) when it processes the request that raised it.
+// ---- U3 (2026-11-02): THE VOICE PASS's job (see VoiceWork above) ----------------------------------------------------------
+// An FVOICE whose fields do not parse: the sentence of its one FDONE error (unpackVoice's rules, said). "" = it parses.
+std::string voiceRefusal(const trpipe::WireVoice& v) {
+    std::vector<trpipe::MsRange> r;
+    std::vector<uint32_t> c;
+    trpipe::AudioSel a;
+    if (v.path.empty()) return "The request names no file.";
+    if (!trpipe::parseAudioSel(v.audio, a)) return badAudioSentence(v.audio);
+    if (!trpipe::parseRanges(v.spans, r)) return "The request's list of pieces to name could not be read.";
+    if (r.empty()) return "The request names no piece to name.";
+    if (r.size() > trpipe::kVoiceSpanMax)
+        return "The request names more than " + std::to_string(trpipe::kVoiceSpanMax) + " pieces.";
+    if (!trpipe::parseChanges(v.changes, r.size(), c)) return "The request's list of speaker changes could not be read.";
+    return std::string();
+}
+
+// An FVOICE -> a voice job, or a refusal (its sentence). The stage is configured as engine.txt says (SPKON, SPKTHRESH,
+// SPKMAX, SPKMINSEC, the model and the runtime the payload resolves) -- on kVoiceThreads ORT threads.
+bool makeVoiceJob(const trpipe::WireVoice& v, const TrConfig& cfg, std::unique_ptr<FileJob>& job, std::string& err) {
+    err = voiceRefusal(v);
+    if (!err.empty()) return false;
+    trpipe::AudioSel sel;
+    std::vector<trpipe::MsRange> ms;
+    std::vector<uint32_t> ch;
+    trpipe::parseAudioSel(v.audio, sel);
+    trpipe::parseRanges(v.spans, ms);
+    trpipe::parseChanges(v.changes, ms.size(), ch);
+    job.reset(new FileJob);
+    job->req.jobId = v.jobId;
+    job->req.path  = v.path;
+    job->req.audio = v.audio;
+    job->path      = utf8ToWideL(v.path);
+    job->audio.chosen  = !v.audio.empty();
+    job->audio.ord     = sel.ord;
+    job->audio.trackId = sel.trackId;
+    job->t0 = ::GetTickCount64();
+    std::unique_ptr<VoiceWork> w(new VoiceWork);
+    w->req = v;
+    for (const auto& r : ms) w->spans.push_back({ msToSamples(r.s), msToSamples(r.e) });
+    w->change.assign(ms.size(), 0);
+    for (uint32_t i : ch) w->change[i] = 1;
+    w->emb.resize(ms.size());
+    w->cfg = spkConfigFrom(cfg, resolvePaths(cfg));
+    w->cfg.threads   = kVoiceThreads;
+    w->cfg.recluster = 0;
+    job->voice = std::move(w);
+    return true;
+}
+
+// FPROG with phase "voices": doneMs = the end of the last piece heard.
+void sendVoiceProg(FileJob& j, FileSink& sink) {
+    trpipe::WireFileProg p;
+    p.jobId    = j.req.jobId;
+    p.phase    = "voices";
+    p.doneMs   = j.voice->doneMs;
+    p.totalMs  = j.totalMs;
+    p.hasVideo = j.hasVideo;
+    j.voice->progTick = fileNowMs();
+    sink.push(trpipe::packFileProg(p));
+}
+
+// What piece i needs decoded before it is heard: its audio (at most kVoiceMaxEmbedSec of it) -- and, when the piece after
+// it is a KNOWN change touching it, that boundary's snap window too.
+uint64_t voiceNeed(const VoiceWork& w, size_t i) {
+    const trpipe::MsRange& sp = w.spans[i];
+    uint64_t need = std::min<uint64_t>(sp.e, sp.s + (uint64_t)(kVoiceMaxEmbedSec * kFileRate));
+    if (i + 1 < w.spans.size() && w.change[i + 1] && w.spans[i + 1].s <= sp.e)
+        need = std::max<uint64_t>(need, std::min<uint64_t>(w.spans[i + 1].e, sp.e + (uint64_t)(kVoiceSnapSec * kFileRate)));
+    return need;
+}
+
+// HEAR piece i: its boundary with a known change right after it moves to the pause between the two voices (the app shares a
+// dash cue's time by reading time -- a guess), then its voiceprint.
+void hearPiece(FileJob& j, size_t i) {
+    VoiceWork& w = *j.voice;
+    trpipe::MsRange& sp = w.spans[i];
+    if (i + 1 < w.spans.size() && w.change[i + 1] && w.spans[i + 1].s == sp.e) {
+        const uint64_t snap = (uint64_t)(kVoiceSnapSec * kFileRate), keep = (uint64_t)(kVoiceSnapKeepSec * kFileRate);
+        const uint64_t b  = sp.e;
+        const uint64_t lo = std::max<uint64_t>(sp.s + keep, b > snap ? b - snap : 0);
+        const uint64_t hi = std::min<uint64_t>(w.spans[i + 1].e > keep ? w.spans[i + 1].e - keep : 0, b + snap);
+        if (lo < hi) {
+            const uint64_t nb = quietestHop(w.buf, w.bufStart, lo, hi, b);
+            if (nb != b && nb > sp.s && nb < w.spans[i + 1].e) {
+                sp.e = nb;
+                w.spans[i + 1].s = nb;
+                ++j.st.voiceSnapped;
+            }
+        }
+    }
+    const uint64_t s = std::max<uint64_t>(sp.s, w.bufStart);
+    const uint64_t e = std::min<uint64_t>(std::min<uint64_t>(sp.e, sp.s + (uint64_t)(kVoiceMaxEmbedSec * kFileRate)),
+                                          w.bufStart + w.buf.size());
+    if (e <= s || (double)(e - s) / kFileRate < kVoiceMinEmbedSec) { ++j.st.voiceShort; return; }
+    const std::vector<float> clip(w.buf.begin() + (std::ptrdiff_t)(s - w.bufStart), w.buf.begin() + (std::ptrdiff_t)(e - w.bufStart));
+    uint32_t ms = 0;
+    const bool ok = g_voiceEmbedForTest ? g_voiceEmbedForTest(i, clip, w.emb[i]) : (w.spk && w.spk->embed(clip, w.emb[i], ms));
+    j.st.voiceEmbedMs += ms;
+    if (ok && !w.emb[i].empty()) ++j.st.voicePrints;
+    else { w.emb[i].clear(); ++j.st.voiceFailed; }
+    // the stage turned itself off (three faults in a row): no names for this file
+    if (!g_voiceEmbedForTest && w.spk && !w.spk->enabled() && w.offWhy.empty()) w.offWhy = w.spk->why();
+}
+
+// A voice pass ends: FSPK first when it ends ok (names, or none and why), then its ONE FDONE (count = the pieces named),
+// then its log line; the reader closes and the stage unloads ON THIS THREAD (job.reset()). No range FPROG, no server.
+void finishVoiceJob(std::unique_ptr<FileJob>& job, FileSink& sink, const char* result, const std::string& err,
+                    FileJobStats* out) {
+    FileJob& j = *job;
+    VoiceWork& w = *j.voice;
+    const bool ok = std::strcmp(result, "ok") == 0;
+    uint32_t named = 0;
+    if (ok) {
+        trpipe::WireSpk s;
+        s.jobId = j.req.jobId;
+        if (w.offWhy.empty() && w.speakers > 0) {
+            s.speakers = w.speakers;
+            s.labels   = w.labels;
+            s.model    = w.model;
+            for (uint32_t l : w.labels) if (l) ++named;
+        } else {
+            s.model = w.offWhy.empty() ? std::string("no voice could be recognised") : w.offWhy;
+        }
+        sink.push(trpipe::packSpk(s));
+    }
+    trpipe::WireFileDone d;
+    d.jobId  = j.req.jobId;
+    d.result = result;
+    d.count  = named;
+    d.err    = err;
+    sink.push(trpipe::packFileDone(d));
+    PROCESS_MEMORY_COUNTERS pmc{};
+    pmc.cb = sizeof(pmc);
+    const uint64_t peakMb = ::GetProcessMemoryInfo(::GetCurrentProcess(), &pmc, sizeof(pmc))
+                          ? (uint64_t)(pmc.PeakWorkingSetSize >> 20) : 0;
+    j.st.jobId         = j.req.jobId;
+    j.st.result        = result;
+    j.st.err           = err;
+    j.st.cues          = named;
+    j.st.voiceSpeakers = ok && w.offWhy.empty() ? w.speakers : 0;
+    j.st.voiceLabels   = ok && w.offWhy.empty() ? w.labels : std::vector<uint32_t>();
+    j.st.voicePeakMb   = peakMb;
+    j.st.totalMs       = j.totalMs;
+    j.st.hasVideo      = j.hasVideo;
+    j.st.wallMs        = ::GetTickCount64() - j.t0;
+    char line[512];
+    std::snprintf(line, sizeof(line),
+                  "[SuVtitleEngine] VOICE job %llu %s: %u piece(s) (%u known change(s)), %u voiceprint(s), %u too short, %u failed, "
+                  "%u speaker(s), %u boundary(ies) moved, %u seek(s); decode %llu ms, voiceprints %llu ms, clustering %llu ms, "
+                  "wall %llu ms; audio held at most %.1f s; peak working set %llu MB%s%s\n",
+                  (unsigned long long)j.req.jobId, result, j.st.voicePieces, j.st.voiceChanges, j.st.voicePrints, j.st.voiceShort,
+                  j.st.voiceFailed, j.st.voiceSpeakers, j.st.voiceSnapped, j.st.voiceSeeks,
+                  (unsigned long long)j.st.voiceDecodeMs, (unsigned long long)j.st.voiceEmbedMs,
+                  (unsigned long long)j.st.voiceClusterMs, (unsigned long long)j.st.wallMs,
+                  (double)j.st.voiceMaxBuf / kFileRate, (unsigned long long)peakMb,
+                  w.offWhy.empty() ? "" : "; no names: ", w.offWhy.c_str());
+    engineLog(line);
+    if (out) *out = j.st;
+    job.reset();
+}
+
+// ONE bounded step of a voice pass: Open (the reader, the stage), Run (a seek, ~4 s decoded, or the pieces now complete
+// heard -- at most kVoiceLapMs of voiceprints), Drain (the labels, FSPK, FDONE).
+void voiceLap(std::unique_ptr<FileJob>& job, FileSink& sink, const std::atomic<uint64_t>& abortJob, FileJobStats* stats) {
+    FileJob& j = *job;
+    VoiceWork& w = *j.voice;
+    std::string err;
+    switch (j.phase) {
+    case FileJob::Phase::Open:
+    case FileJob::Phase::Load: {
+        // the SAME sound track and timeline the analysis used (WH: the reader keeps it across every seek)
+        if (!j.reader.open(j.path, MediaReader::Out::Mono16k, j.audio, err)) {
+            finishVoiceJob(job, sink, "error", err, stats);
+            return;
+        }
+        j.opened   = true;
+        j.totalMs  = g_fileNoDurationForTest ? 0 : j.reader.info().durationMs;
+        j.hasVideo = j.reader.info().hasVideo;
+        std::string why;
+        if (g_voiceEmbedForTest) {
+            w.model = "stand-in";
+            why = "a stand-in (selftest)";
+        } else {
+            w.spk.reset(new TrSpeaker);
+            if (w.spk->begin(w.cfg, why)) {
+                w.model = kSpkModelTag;
+            } else {
+                w.offWhy = why.empty() ? std::string("the speaker model could not be loaded") : why;
+                w.spk.reset();
+            }
+        }
+        uint32_t changes = 0;
+        for (char c : w.change) changes += c ? 1u : 0u;
+        j.st.voicePieces  = (uint32_t)w.spans.size();
+        j.st.voiceChanges = changes;
+        engineLog("[SuVtitleEngine] VOICE job " + std::to_string(j.req.jobId) + ": " + std::to_string(w.spans.size())
+                  + " piece(s), " + std::to_string(changes) + " known change(s) of speaker -- "
+                  + (w.offWhy.empty() ? "the speaker stage: " + why : "no names: " + w.offWhy) + "\n");
+        sendVoiceProg(j, sink);
+        j.phase = w.offWhy.empty() ? FileJob::Phase::Run : FileJob::Phase::Drain;
+        return;
+    }
+    case FileJob::Phase::Run: {
+        if (sink.backlog() >= kFileOutSoftCap) { ::Sleep(20); return; }
+        if (!w.offWhy.empty() || w.next >= w.spans.size()) { j.phase = FileJob::Phase::Drain; return; }
+        const uint64_t snap = (uint64_t)(kVoiceSnapSec * kFileRate);
+        const uint64_t from = w.spans[w.next].s > snap ? w.spans[w.next].s - snap : 0;
+        const uint64_t bufEnd = w.bufStart + w.buf.size();
+        // far ahead of what is decoded (silence, music, a stretch nobody speaks in): SEEK there -- abortable, as a FILE's
+        if (!w.over && from > bufEnd + (uint64_t)(kVoiceSeekGapSec * kFileRate)) {
+            const uint64_t me = j.req.jobId;
+            const std::function<bool()> abort = [&abortJob, me] {
+                const uint64_t a = abortJob.load(std::memory_order_acquire);
+                return a == me || a == kAbortAll;
+            };
+            const uint64_t D = from / (uint64_t)kFileHop * (uint64_t)kFileHop;
+            if (j.reader.seek(D, err, abort)) {
+                w.buf.clear();
+                w.bufStart = D;
+                ++j.st.voiceSeeks;
+            } else if (!j.reader.lastSeekAborted()) {
+                w.over = true;
+                j.failErr = err.empty() ? std::string("The file could not be read at this point.") : err;
+            }   // (aborted: FCANCEL / a newer job / QUIT -- the request handler ends this job)
+            return;
+        }
+        if (!w.over && bufEnd < voiceNeed(w, w.next)) {
+            std::vector<float> chunk;
+            const uint64_t t0 = ::GetTickCount64();
+            if (!j.reader.readFloat(chunk, (size_t)kFileRate * 4, err)) {
+                w.over = true;
+                j.failErr = err.empty() ? std::string("The file could not be read.") : err;
+            } else {
+                w.buf.insert(w.buf.end(), chunk.begin(), chunk.end());
+                if (j.reader.eof()) w.over = true;
+            }
+            j.st.voiceDecodeMs += ::GetTickCount64() - t0;
+            j.st.voiceMaxBuf = std::max<uint64_t>(j.st.voiceMaxBuf, (uint64_t)w.buf.size());
+            return;
+        }
+        // every piece whose audio is all here (or all the file has) is heard now -- kVoiceLapMs of voiceprints at most
+        const uint64_t lap0 = ::GetTickCount64();
+        while (w.next < w.spans.size() && w.offWhy.empty()
+               && (w.over || w.bufStart + w.buf.size() >= voiceNeed(w, w.next))
+               && ::GetTickCount64() - lap0 < kVoiceLapMs) {
+            hearPiece(j, w.next);
+            w.doneMs = w.spans[w.next].e / (kFileRate / 1000);
+            ++w.next;
+        }
+        // keep only what the next piece (and its snap window) still needs: never the file's whole sound
+        if (w.next < w.spans.size()) {
+            const uint64_t keepFrom = w.spans[w.next].s > snap ? w.spans[w.next].s - snap : 0;
+            if (keepFrom > w.bufStart) {
+                const size_t drop = (size_t)std::min<uint64_t>(keepFrom - w.bufStart, (uint64_t)w.buf.size());
+                w.buf.erase(w.buf.begin(), w.buf.begin() + (std::ptrdiff_t)drop);
+                w.bufStart += drop;
+            }
+        } else {
+            std::vector<float>().swap(w.buf);
+        }
+        if (fileNowMs() - w.progTick >= kVoiceProgMs) sendVoiceProg(j, sink);
+        return;
+    }
+    case FileJob::Phase::Drain: {
+        // the file broke off under the pass: no names rather than names half heard -- its one FDONE says why
+        if (!j.failErr.empty()) { finishVoiceJob(job, sink, "error", j.failErr, stats); return; }
+        if (w.offWhy.empty()) {
+            std::vector<double> secs(w.spans.size());
+            for (size_t i = 0; i < w.spans.size(); ++i) secs[i] = (double)(w.spans[i].e - w.spans[i].s) / kFileRate;
+            const uint64_t t0 = ::GetTickCount64();
+            w.speakers = voiceLabels(w.emb, secs, w.change, w.cfg.threshold, w.cfg.maxSpeakers, w.cfg.minSec,
+                                     kVoiceClusterMax, w.labels);
+            j.st.voiceClusterMs = ::GetTickCount64() - t0;
+            if (w.speakers == 0) w.offWhy = "no piece was long enough to recognise a voice";
+        }
+        w.doneMs = j.totalMs;
+        sendVoiceProg(j, sink);
+        finishVoiceJob(job, sink, "ok", std::string(), stats);
+        return;
+    }
+    }
+}
+
 void fileJobLap(std::unique_ptr<FileJob>& job, Servers& srv, FileSink& sink,
                 const std::atomic<uint64_t>& abortJob, bool verbose, FileJobStats* stats) {
+    if (job->voice) { voiceLap(job, sink, abortJob, stats); return; }   // U3: the voice pass
     FileJob& j = *job;
     std::string err;
     switch (j.phase) {
@@ -1942,9 +3777,15 @@ void fileJobLap(std::unique_ptr<FileJob>& job, Servers& srv, FileSink& sink,
                 const uint64_t v = abortJob.load(std::memory_order_acquire);
                 return v == me || v == kAbortAll;
             };
-            if (!srv.bringFile(j.asrModel, j.mtModel, verbose, aborted, !j.noDtw)) {
+            if (!srv.bringFile(j.asrModel, j.mtModel, verbose, aborted, !j.noDtw, !j.mtCustom.empty())) {
                 if (aborted()) return;                     // the request handler ends it
-                finishJob(job, srv, sink, "error", srv.lastError(), stats);
+                // U2: an imported model that will not load (GPU or CPU) is ITS failure, in its sentence -- the app goes
+                // back to the default for that kind (TrPipe.h fileModelErrKind); a shipping model's stays as it was
+                const char failed = srv.lastFailKind();
+                const std::string e = failed == 'm' && !j.mtCustom.empty() ? importedModelSentence(false, j.mtCustom, srv.lastError())
+                                    : failed == 'a' && !j.asrCustom.empty() ? importedModelSentence(true, j.asrCustom, srv.lastError())
+                                    : srv.lastError();
+                finishJob(job, srv, sink, "error", e, stats);
                 return;
             }
             j.mtModel = srv.mtModel();         // what actually loaded (the 1.5B if the 4B is absent)
@@ -2098,7 +3939,9 @@ void fileRequests(Shared& sh, std::unique_ptr<FileJob>& job, Servers& srv, FileS
             continue;
         }
         std::string err = q.refuse;
-        if (err.empty() && makeFileJob(q.f, curA, curB, curMode, cfg, job, err)) continue;
+        // (U3: an FVOICE is a job of this one slot too -- the voice pass)
+        if (err.empty() && (q.voice ? makeVoiceJob(q.v, cfg, job, err)
+                                    : makeFileJob(q.f, curA, curB, curMode, cfg, job, err))) continue;
         trpipe::WireFileDone d;
         d.jobId = q.f.jobId; d.result = "error"; d.count = 0; d.err = err;
         sink.push(trpipe::packFileDone(d));
@@ -2145,18 +3988,24 @@ void cancelQueuedFiles(Shared& sh, FileSink& sink) {
 }
 
 // ---------------------------------------------------------------------------
-// THE PIPELINE THREAD.
-// SUVTITLE SPLIT: AudioPB's pipelineMain minus its live half. Kept as it was: the persistence of the pair /
-// direction / preset (re-read first), the STATE echo of a CTL, the FILE job's laps, the clean exit (every
-// running and queued FILE gets its one FDONE). Gone: TrAudio (no fabric), the live pair kept up at idle
-// (ensureUp + kRespawnBackoff), the segments, the drafts, the commit engine, diarization, LINE / PART / END
-// -- and with them the END that closed an utterance a job interrupted, and the live audio a job dropped.
-// IDLE IS IDLE: nothing is loaded until a FILE comes; then bringFile loads the job's own models, as it did
-// in AudioPB (minus killing a live pair to make room). The MT a job loaded stays up after FDONE, as it did:
-// the next job -- often the next film of the queue -- skips its 3 GB load; endFile frees the job's whisper.
-// STATE.status, here: "listening" = idle and READY (TrPipe.h is unchanged: the word stays, nothing listens);
-// "analyzing" = a job owns the lap; "error" = the payload is missing (err = the sentence a job would fail
-// with); "loading" only until the first lap. Never "transcribing" (that was a live final).
+// THE PIPELINE THREAD -- the only one that calls the servers.
+// SUVTITLE SPLIT (1.0.0) took AudioPB's pipelineMain minus its live half; SuVtitle 1.1.0 puts the live half back, from
+// AudioPB 50f79d6, as a machine of THREE MODES -- idle | live | file -- recomputed on every lap from what the servant
+// was told (Shared::liveWanted) and whether a job exists. LIVE WINS (the user, 24/10: live and file analysis never run
+// at the same time -- the conversation is happening now, a film can wait):
+//   * LIVE 1 with a job running: that job ends "cancelled" -- its FDONE first sends its ranges, so the app resumes it
+//     after the live with nothing redone -- every queued FILE too, and the job's whisper is freed (finishJob); then the
+//     live pair comes up (the MT kept when it is the same model) and the capture hub starts. A FILE DURING the live
+//     never reaches this thread: the servant refuses it at the door, with its one FDONE (servantHandle).
+//   * live, in its stride: AudioPB 1.1.0's loop, verbatim -- the servers kept up, a final first, a draft only when none
+//     is waiting, the commit engine, the self-pacing, the respawn on a transport failure.
+//   * LIVE 0: the hub stops; an utterance that already put sentences on screen (LINE closes=0) gets its END -- its audio
+//     is dropped, so the closing LINE will never come (641f1aa's rule for an utterance a job cut short); the VAD, the
+//     live line and the commit engine forget it all; the live whisper children go (the MT stays when a job would want it).
+//   * file: 1.0.0's job laps, unchanged. idle: nothing loaded (1.0.0's rule), STATE "listening" (or "error": no payload).
+// Kept from 1.0.0 too: the persistence of the pairs (re-read first), the STATE echo of a CTL, the clean exit (every
+// running and queued FILE gets its one FDONE). STATE.status: "listening" = idle and ready, or live and quiet;
+// "transcribing" = a live final; "analyzing" = a job; "loading" = models coming up; "error" = see err.
 // ---------------------------------------------------------------------------
 // The idle lap's pace: what AudioPB's idle laps blocked on (TrAudio::pop with kPopDeadlineMs, 20 ms) -- a FILE
 // waits at most this long to start, against a model load measured in seconds.
@@ -2180,50 +4029,170 @@ void stateModels(Shared& sh, const std::string& asr, const std::string& mt, bool
     if (moved) wakeServant(sh);
 }
 
-void pipelineMain(Shared& sh, Servers& srv, TrConfig cfg, bool persist = true) {
+// A LIVE the engine will not act on (TrPipe.h: refused WHOLE, the live state unchanged): ONE STATE whose err says why,
+// through the never-dropped queue -- so the next lap's ordinary STATE cannot overwrite it before it leaves. sh.mx HELD.
+void refuseLiveLocked(Shared& sh, const std::string& why) {
+    trpipe::WireState s = sh.state;
+    s.err = why;
+    sh.fileOut.push_back(trpipe::packState(s));
+}
+
+// Fix round (RVA-1): the drain's last word -- STATE live 0 -- must reach the app AFTER the drain's LINE / END. The
+// servant packs a dirty STATE before the live outbox it takes in the same lap (runHost), so the pipeline raises it only
+// once the servant has TAKEN the outbox. Bounded: a servant stuck on a pipe write (3 s per message, then the pipe
+// breaks) is the pipe's problem, not a reason to stay live. sh.mx NOT held.
+constexpr DWORD kDrainOrderWaitMs = 2000;
+void waitOutboxTaken(Shared& sh, DWORD maxMs) {
+    const ULONGLONG t0 = ::GetTickCount64();
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(sh.mx);
+            if (sh.outbox.empty()) return;
+        }
+        if (sh.quit.load(std::memory_order_acquire) || ::GetTickCount64() - t0 >= maxMs) return;
+        wakeServant(sh);
+        ::Sleep(5);
+    }
+}
+
+void pipelineMain(Shared& sh, TrAudio& audio, TrCaptureHub& hub, Servers& srv, TrConfig cfg, bool persist = true) {
+    uint64_t nextTry = 0;
     // ---- FILE MODE (wave WB) ------------------------------------------------------
     std::unique_ptr<FileJob> fileJob;
     SharedFileSink           fileSink(sh);
     srv.setPreset(cfg.preset);
-    {   // what a job WOULD run on at quality auto: chooseFileModels' auto branch, makeFileJob's MT
+    // What a job WOULD run on at quality auto (chooseFileModels' auto branch, makeFileJob's MT): STATE's models at
+    // idle -- announced now, and again each time the live path stops.
+    const std::string jobMt = cfg.mtModel.empty() ? std::string(kMtModelFile) : cfg.mtModel;
+    auto announceJobModels = [&] {
         const std::string asr = srv.modelInstalled("ggml-large-v3-turbo.bin") ? std::string("ggml-large-v3-turbo.bin")
-                                                                                : srv.presetFinalModel();
-        stateModels(sh, asr, cfg.mtModel.empty() ? std::string(kMtModelFile) : cfg.mtModel, !g_forceCpu);
-    }
+                                                                               : srv.presetFinalModel();
+        stateModels(sh, asr, jobMt, !g_forceCpu);
+    };
+    announceJobModels();
+    uint64_t lastClosedSeg = 0;   // the last utterance that got its LINE closes=1 / END (641f1aa: a stop owes no second)
+    // ---- the live line's own state, all of it on this thread --------------------
+    PartialState pst;
+    AgreeState   agr;                   // W3: the commit engine's memory
+    SeqState     seq;                   // ... and the per-utterance line counter
+    uint64_t     doneSegId       = 0;   // highest utterance whose FINAL we have taken
+    uint64_t     partialNextTry  = 0;   // back-off after a draft's transport failed
+    // HOISTED, and it matters: popPartial SWAPS buffers with the audio thread, so this
+    // one's allocation is what the audio thread reuses for the next snapshot. Declared
+    // inside the loop it would hand back an empty vector every time and the tap would
+    // allocate a fresh 12 s buffer per partial, on the audio thread.
+    PartialSnap  snap;
+    // The conversation's memory (last final per language, the MT context pairs). Lives
+    // here, on the ONE thread that runs the stages, so there is no lock and no sharing:
+    // see TrContext for the rule about who may write it.
+    TrContext    ctx;
+    // The knobs that do not change without a restart. mode/langA/langB DO change under a
+    // CTL, so they are re-read from `sh` on every lap below -- the LIVE pair (SuVtitle 1.1.0).
+    Routing      routing;
+    routing.mtStyle   = cfg.mtStyle.empty()
+                      ? mtStyleFor(cfg.mtModel.empty() ? mtModelFor(cfg.preset) : cfg.mtModel)
+                      : cfg.mtStyle;
+    routing.asrPrompt = cfg.asrPrompt;
+    routing.mtContext = cfg.mtContext;
+    CommitCfg commitCfg;
+    commitCfg.on        = cfg.commit;
+    commitCfg.lookahead = cfg.commitLookahead;
+    commitCfg.pause     = cfg.commitPause;
+    commitCfg.maxSec    = cfg.commitMaxSec;
+
+    // The extractor is created ONCE, on the thread that will use it -- it is not
+    // thread-safe and the model load is a one-off cost we would rather pay before the
+    // first person speaks than in the middle of a sentence. A failure is not fatal:
+    // the stage says why, STATE carries spkOn=0, and the helper names speakers by input.
+    // SuVtitle 1.1.0: at the FIRST LIVE START rather than at the engine's -- the engine starts with the app, and
+    // someone who only watches films must not pay for a voiceprint model (1.0.0's rule: idle loads nothing).
+    TrSpeaker spk;
+    bool      spkBegun = false;
+    // ---- the live mode's own bookkeeping (SuVtitle 1.1.0) ----
+    // Fix round (RVA-1, RVA-7; LIVE_PLAN ADDENDUM FIX ROUND): LIVE 0 = stop LISTENING, then FINISH. The live MODE
+    // (STATE live 1) outlives the capture: after a LIVE 0 the hub is stopped at once (the door does it, servantHandle)
+    // and the finals the VAD already queued go through the lap below -- the DRAIN -- before the mode ends.
+    bool      liveOn    = false;        // the live mode: STATE live 1 (listening, or finishing after a LIVE 0)
+    bool      capturing = false;        // ... and the hub runs and feeds the VAD (false while the drain runs)
+    uint64_t  liveGenOn = 0;            // ... the input set it was started (or last replaced) with
+    bool      liveAnnounce = false;     // STATE owes the live pair's models + "listening" (a start, a new set, a load)
+    bool      reloadOwed = false;       // a preset changed during a drain: the next live lap loads it
+    // The utterance whose DRAFT the live line shows (pst.segId), once it has had its ending (LINE closes=1 / END): the
+    // END the drain owes a draft on screen is owed only to one that never had it. Read off lastClosedSeg at the top of
+    // every lap -- the lap that closes an utterance never moves pst.segId (only a draft lap does).
+    uint64_t  partClosed = 0;
+    // What stops a LIVE model load: QUIT, or the live path no longer wanted (LIVE 0 during the load).
+    const std::function<bool()> liveAbort = [&sh] {
+        return sh.abortJob.load(std::memory_order_acquire) == kAbortAll
+            || !sh.liveWantedLive.load(std::memory_order_acquire);
+    };
 
     for (;;) {
         if (sh.quit.load(std::memory_order_acquire)) break;
 
-        std::string mode, preset, langA, langB;
-        bool presetChanged = false;
+        std::string mode, preset, langA, langB, liveMode, liveLangA, liveLangB;
+        bool presetChanged = false, clearAsked = false, liveWanted = false;
+        uint64_t liveGen = 0;
+        std::vector<LiveInput> liveInputs;
         {
             std::lock_guard<std::mutex> lk(sh.mx);
             mode = sh.mode; preset = sh.preset;
             langA = sh.langA; langB = sh.langB;
+            liveMode = sh.liveMode; liveLangA = sh.liveLangA; liveLangB = sh.liveLangB;
             presetChanged = sh.presetChanged; sh.presetChanged = false;
+            clearAsked = sh.clearAsked; sh.clearAsked = false;
+            liveWanted = sh.liveWanted;
+            liveGen = sh.liveGen;
+            if (liveWanted && (!capturing || liveGen != liveGenOn)) liveInputs = sh.liveInputs;
         }
-        // Persist mode/preset/pair -- with a RE-READ first, so a line this engine does not own (kept verbatim
-        // in `extra`) is never lost to a stale in-memory copy. (In AudioPB the tray wrote its window geometry
-        // into the same file; SuVtitle's app writes nothing there, S11 -- but a hand edit may.)
+        if (pst.segId != 0 && pst.segId == lastClosedSeg) partClosed = pst.segId;
+        // THE LIVE PAIR routes the live path (the user, 25/10: one pair per mode); the player's goes to the FILE jobs,
+        // which read it from `sh` themselves (fileRequests).
+        routing.mode  = liveMode;
+        routing.langA = liveLangA;
+        routing.langB = liveLangB;
+        if (clearAsked) {
+            audio.clear();
+            // Fix round (RVA-6; the ADDENDUM's speaker memory): a Clear is a NEW SESSION, so the conversation's memory
+            // (the last finals that prompt whisper, the MT's context pairs, the auto direction's last language) and the
+            // voice clusters go with it -- and STATE's voice count says so. Listen off / on inside a session keeps both.
+            ctx = TrContext{};
+            spk.clusterer().reset();
+            {
+                std::lock_guard<std::mutex> lk(sh.mx);
+                if (sh.state.spkCount != 0) { sh.state.spkCount = 0; sh.stateDirty = true; }
+            }
+            engineLog("[SuVtitleEngine] live: clear -- a new session (the conversation's memory and the voices reset)\n");
+        }
+        // Persist both pairs, the direction and the preset -- with a RE-READ first, so a line this engine does not own
+        // (kept verbatim in `extra`) is never lost to a stale in-memory copy. (In AudioPB the tray wrote its window
+        // geometry into the same file; SuVtitle's app writes nothing there, S11 -- but a hand edit may.)
         if (cfg.mode != mode || cfg.langA != langA || cfg.langB != langB
+            || cfg.liveMode != liveMode || cfg.liveLangA != liveLangA || cfg.liveLangB != liveLangB
             || (presetChanged && cfg.preset != preset)) {
             // WB: `persist` is false under --nofabric -- a TEST engine must never write the user's
             // engine.txt.
             if (persist) {
                 TrConfig fresh;
                 fresh.load();
-                fresh.mode   = mode;
-                fresh.preset = preset;
-                fresh.langA  = langA;
-                fresh.langB  = langB;
+                fresh.mode      = mode;
+                fresh.preset    = preset;
+                fresh.langA     = langA;
+                fresh.langB     = langB;
+                fresh.liveMode  = liveMode;
+                fresh.liveLangA = liveLangA;
+                fresh.liveLangB = liveLangB;
                 fresh.save();
             }
-            cfg.mode   = mode;
-            cfg.preset = preset;
-            cfg.langA  = langA;
-            cfg.langB  = langB;
+            cfg.mode      = mode;
+            cfg.preset    = preset;
+            cfg.langA     = langA;
+            cfg.langB     = langB;
+            cfg.liveMode  = liveMode;
+            cfg.liveLangA = liveLangA;
+            cfg.liveLangB = liveLangB;
         }
-        if (presetChanged) srv.setPreset(preset);       // the next job's fallback model (presetFinalModel)
+        if (presetChanged) srv.setPreset(preset);       // the live pair's choice, and the next job's fallback model
         {
             bool moved = false;
             {
@@ -2233,36 +4202,404 @@ void pipelineMain(Shared& sh, Servers& srv, TrConfig cfg, bool persist = true) {
                                                sh.stateDirty = true; moved = true; }
                 if (sh.state.langB != langB) { sh.state.langB = langB;
                                                sh.stateDirty = true; moved = true; }
-                // SUVTITLE: the preset is echoed as CONFIGURED -- AudioPB echoed the live preset its pair was
-                // resolved to (`auto` -> the probe's verdict), and there is no pair to resolve.
-                if (sh.state.preset != preset) { sh.state.preset = preset; sh.stateDirty = true; moved = true; }
+                if (sh.state.liveMode != liveMode || sh.state.liveLangA != liveLangA || sh.state.liveLangB != liveLangB) {
+                    sh.state.liveMode  = liveMode;
+                    sh.state.liveLangA = liveLangA;
+                    sh.state.liveLangB = liveLangB;
+                    sh.stateDirty = true;
+                    moved = true;
+                }
+                // SUVTITLE: the preset is echoed as CONFIGURED -- except while the live pair runs, when STATE says what
+                // ACTUALLY runs (`auto`'s verdict, a fallback: TrPipe.h's meaning, set where the pair comes up below).
+                if (!liveOn && sh.state.preset != preset) { sh.state.preset = preset; sh.stateDirty = true; moved = true; }
             }
             if (moved) wakeServant(sh);   // the echo of a CTL: the menu tick should not lag a poll
         }
 
-        // ---- FILE MODE (wave WB): a job, when there is one, owns the lap ------------------
-        fileRequests(sh, fileJob, srv, fileSink, cfg, nullptr);
-        if (fileJob) {
-            // (SUVTITLE SPLIT: AudioPB paused the live path here, every lap -- its fabric audio cleared, its
-            // live line and agreement reset, an END for an utterance the job cut short. Nothing to pause.)
-            setState(sh, "analyzing");
-            fileJobLap(fileJob, srv, fileSink, sh.abortJob, /*verbose=*/false, nullptr);
-            if (fileJob && fileJob->phase == FileJob::Phase::Run)     // its models are up: STATE says which
-                stateModels(sh, fileJob->asrModel, fileJob->mtModel, srv.fileGpu() && srv.mtGpu());
-            if (!fileJob) {
+        // ---- THE CAPTURE STOPS (LIVE 0) -- fix round RVA-1 / RVA-7. The door already stopped the hub when it read the
+        // LIVE 0 (servantHandle: the devices are released at once, not when the model call this thread may have been
+        // in returns); this stop is then a no-op, and still the JOIN that hands the VAD's state back to this thread. A
+        // stopped hub this thread did not stop while the live is still wanted = a LIVE 0 then a LIVE 1 the laps never
+        // saw apart: the same stop, then the start below resumes. Either way the end of the input is a CLOSE: the open
+        // utterance becomes a final (>= kMinSegMs, or something of it committed) or is dropped (TrAudio::endOfInput).
+        if (capturing && (!liveWanted || !hub.running())) {
+            hub.stop();
+            audio.endLive();
+            audio.endOfInput();
+            capturing = false;
+            engineLog(std::string("[SuVtitleEngine] live: capture stopped") + (liveWanted ? " (to resume at once)" : "")
+                      + (audio.finalWaiting() ? "; finishing the queued finals" : "; nothing queued") + "\n");
+        }
+
+        if (!liveWanted && liveOn) {
+            // ---- THE DRAIN (LIVE 0, the ADDENDUM's (3)): STATE live stays 1, the lap below takes the queued finals one
+            // by one -- LINEs as usual, no draft (nothing feeds the VAD: pop never comes back empty here), no load (a
+            // pair that is not up has nothing to finish them with: what is left is dropped below). A FILE is refused
+            // meanwhile, as during the live (servantHandle); a LIVE 1 resumes the capture (the start below); QUIT
+            // breaks the loop at its top: no drain.
+            if (presetChanged) reloadOwed = true;      // the pair finishes on what runs; a resume loads the new one
+            if (!srv.up() || !audio.finalWaiting()) {
+                // ---- THE LIVE MODE ENDS (the ADDENDUM's (4) and (5)) --------------------------------------------
+                if (audio.finalWaiting()) {
+                    engineLog("[SuVtitleEngine] live: the live pair is down -- the queued finals are dropped\n");
+                    audio.clear();
+                }
+                // (4) The endings still owed, oldest first: the utterance whose sentences are on screen (LINE closes=0)
+                // and the one whose draft the live line shows (PART) -- each only if it never had its ending. Without
+                // them their live line would hang until the UI's 20 s orphan timer, after "off".
+                uint64_t owed[2] = { 0, 0 };
+                if (seq.segId != 0 && seq.segId != lastClosedSeg && seq.count(seq.segId) > 0) owed[0] = seq.segId;
+                if (pst.segId != 0 && !pst.lastSrc.empty() && pst.segId != partClosed && pst.segId != lastClosedSeg
+                    && pst.segId != owed[0])
+                    owed[1] = pst.segId;
+                if (owed[0] && owed[1] && owed[1] < owed[0]) std::swap(owed[0], owed[1]);
+                for (const uint64_t s : owed) {
+                    if (!s) continue;
+                    Out o;
+                    o.kind = Out::kEnd;
+                    o.end.segId = s;
+                    pushOut(sh, std::move(o));
+                    if (s == seq.segId) lastClosedSeg = s;     // a stop owes no second ending (641f1aa)
+                    if (s == pst.segId) partClosed = s;
+                    if (s > doneSegId) doneSegId = s;
+                }
+                // ... and the live line's state is forgotten: the pending draft, the agreement -- the next live starts
+                // clean. (The conversation's memory and the voices are KEPT: a Clear resets them, not a stop.)
+                audio.dropPartialsUpTo(~0ull);
+                pst = PartialState{};
+                agr = AgreeState{};
+                // (5) idle: the live whisper children go.
+                srv.killLive(jobMt);
+                liveOn = false;
+                liveGenOn = 0;
+                reloadOwed = false;
+                nextTry = 0;                    // a backoff belongs to the run it was earned in
+                // STATE live 0 comes AFTER the drain's last LINE / END on the wire: the servant packs a dirty STATE
+                // before the live outbox it takes in the same lap (runHost), so it is raised only once the servant has
+                // TAKEN what precedes it.
+                waitOutboxTaken(sh, kDrainOrderWaitMs);
+                {
+                    std::lock_guard<std::mutex> lk(sh.mx);
+                    sh.state.live = false;
+                    sh.state.preset = preset;
+                    sh.stateDirty = true;
+                }
+                wakeServant(sh);
+                announceJobModels();
+                engineLog("[SuVtitleEngine] live: stopped\n");
+                continue;
+            }
+            // else: the lap below takes the next queued final
+        } else if (!liveWanted) {
+            // ---- FILE MODE (wave WB): a job, when there is one, owns the lap ------------------
+            fileRequests(sh, fileJob, srv, fileSink, cfg, nullptr);
+            if (fileJob) {
+                setState(sh, "analyzing");
+                fileJobLap(fileJob, srv, fileSink, sh.abortJob, /*verbose=*/false, nullptr);
+                if (fileJob && !fileJob->voice && fileJob->phase == FileJob::Phase::Run) {   // its models are up: STATE says which (U3: a voice pass has none)
+                    stateModels(sh, modelLeaf(fileJob->asrModel), modelLeaf(fileJob->mtModel), srv.fileGpu() && srv.mtGpu());   // (U2: names)
+                    // ... and they run BELOW_NORMAL, CPU and GPU, while the job runs: the film it analyses must
+                    // never freeze (1.1.0; a compare once done, and after a retry's respawn it lowers the new ones)
+                    srv.setBackground(true);
+                }
+                if (!fileJob) {
+                    std::lock_guard<std::mutex> lk(sh.mx);
+                    sh.runningJob = 0;
+                }
+                continue;
+            }
+            // ---- IDLE. Also the way OUT of a job, whatever ended it -- before its Load (an unreadable file,
+            // "max" without its model, a cancel or a supersede in its first lap) or after: "analyzing" must never
+            // outlive the job (WB, after the review). setState writes only a CHANGE, so this costs a compare.
+            // 1.1.0: what a job left up (its MT) runs NORMAL again -- a compare too, once done.
+            srv.setBackground(false);
+            if (srv.payloadFound()) setState(sh, "listening");
+            else                    setState(sh, "error", srv.payloadSentence());
+            ::Sleep(kIdleLapMs);
+            continue;
+        } else {
+            // ================================================================================================
+            // LIVE (SuVtitle 1.1.0). A job gives way first -- cancelled, its ranges standing (finishJob sends them, then
+            // its FDONE, then frees its whisper), and so does every FILE queued behind it. The servant already stopped
+            // its model load (abortJob), and refuses every FILE until the live path stops.
+            // ================================================================================================
+            if (fileJob) {
+                finishJob(fileJob, srv, fileSink, "cancelled", std::string(), nullptr);
                 std::lock_guard<std::mutex> lk(sh.mx);
                 sh.runningJob = 0;
             }
+            cancelQueuedFiles(sh, fileSink);        // also drains the FCANCELs: there is no job left to cancel
+            // The live path runs NORMAL, CPU and GPU: the job's MT, kept across the switch (the same 4B), goes back up;
+            // the live children are born NORMAL.
+            if (!liveOn) srv.setBackground(false);
+            if (!capturing || liveGen != liveGenOn) {
+                if (!spkBegun) {
+                    spkBegun = true;
+                    std::string why;
+                    const bool ok = spk.begin(spkConfigFrom(cfg, resolvePaths(cfg)), why);
+                    // The sentence goes to the log, not into STATE's `err`: `err` means the
+                    // TRANSLATOR is broken and paints the window red, and a missing voiceprint model
+                    // is not that -- subtitles still work, they are just labelled by input.
+                    engineLog(std::string("[SuVtitleEngine] diarization ") + (ok ? "ON: " : "OFF: ") + why + "\n");
+                    {
+                        std::lock_guard<std::mutex> lk(sh.mx);
+                        sh.state.spkOn    = ok;
+                        sh.state.spkModel = ok ? kSpkModelTag : "";
+                        sh.state.spkCount = 0;
+                        sh.stateDirty     = true;
+                    }
+                    wakeServant(sh);
+                }
+                // Start -- or REPLACE the running set: the hub keeps every input whose {key, chan, gain} did not move
+                // (TrCaptureApi.h), and the VAD carries on through a replace. beginLive only on a START: it rearms the
+                // audio thread's state, which belongs to the mixer while one runs. (Fix round: a start while the live
+                // mode is on is a RESUME -- a LIVE 1 during the drain: the queued finals still go through the lap, as
+                // live processing again.)
+                const bool starting = !capturing;
+                const bool resuming = starting && liveOn;
+                // ... unless the live was turned off since this lap read it: a LIVE 0 that the door has just honoured
+                // (the devices released) must not be undone by a stale start -- the next lap stops / drains instead.
+                {
+                    std::lock_guard<std::mutex> lk(sh.mx);
+                    if (!sh.liveWanted) continue;
+                }
+                if (starting) audio.beginLive();
+                if (!hub.start(liveInputs, &audio)) {
+                    // The door already checked everything the hub refuses outright (TrCaptureApi.h start); say it anyway,
+                    // and keep the live state as it was -- a refused START means no live path at all.
+                    if (starting) audio.endLive();
+                    engineLog("[SuVtitleEngine] live: the capture refused the input set\n");
+                    {
+                        std::lock_guard<std::mutex> lk(sh.mx);
+                        refuseLiveLocked(sh, "The live translation could not open these inputs.");
+                        if (starting) { sh.liveWanted = false; sh.liveWantedLive.store(false, std::memory_order_release); }
+                    }
+                    wakeServant(sh);
+                    liveGenOn = liveGen;            // never retried as it is: the next LIVE is a new set
+                    continue;
+                }
+                liveOn = true;
+                capturing = true;
+                liveGenOn = liveGen;
+                liveAnnounce = true;                // loaded below or already up: STATE says so, below
+                {
+                    std::lock_guard<std::mutex> lk(sh.mx);
+                    sh.state.live = true;
+                    sh.stateDirty = true;
+                }
+                wakeServant(sh);
+                std::string keys;
+                for (const LiveInput& in : liveInputs) keys += (keys.empty() ? "" : ", ") + in.key;
+                engineLog("[SuVtitleEngine] live: "
+                          + std::string(resuming ? "resumed (a LIVE 1 during the drain)" : starting ? "started" : "inputs replaced") + " -- "
+                          + std::to_string(liveInputs.size()) + " input(s): " + keys + "; pair " + liveLangA + "/"
+                          + liveLangB + " " + liveMode + ", preset " + preset + "\n");
+            }
+
+            // ---- keep the servers up -------------------------------------------
+            if (!srv.up() || presetChanged || reloadOwed) {
+                if (::GetTickCount64() < nextTry) { ::Sleep(200); continue; }
+                setState(sh, "loading");
+                reloadOwed = false;
+                if (!srv.ensureUp(preset, /*verbose=*/false, liveAbort)) {
+                    // QUIT, or LIVE 0 during the load: not an error -- the next lap stops the live path (or the thread).
+                    if (liveAbort()) continue;
+                    setState(sh, "error", srv.lastError());
+                    nextTry = ::GetTickCount64() + kRespawnBackoff;
+                    continue;
+                }
+                // The style follows the model that ACTUALLY came up, not the one the config
+                // asked for: startMt falls back to the small model when a preset's default is
+                // not installed, and a prompt shape aimed at a model that is not loaded is the
+                // kind of mismatch that shows up as "the translations got worse" and nothing else.
+                if (cfg.mtStyle.empty()) routing.mtStyle = mtStyleFor(srv.mtModel());
+                liveAnnounce = true;
+            }
+            // SuVtitle 1.1.0: STATE says what the live path runs on, and "listening", after every load AND at every start
+            // or new input set, loaded or not. In AudioPB the live path ran from the engine's first lap, which always went
+            // through the load above; here a start can find the pair already up -- a set replaced while live, a Servers its
+            // caller brought up ([C8b] on [3]'s pair) -- and STATE then went on naming the idle models of a FILE job, never
+            // "listening" (the first model run of [C8b], 25/10).
+            if (liveAnnounce) {
+                liveAnnounce = false;
+                {
+                    std::lock_guard<std::mutex> lk(sh.mx);
+                    // The RESOLVED preset: `auto` reports what its probe settled on, because
+                    // this field means "what is ACTUALLY running" (TrPipe.h) and "auto" is not
+                    // a thing that runs. What is PERSISTED above is still the user's "auto".
+                    sh.state.preset   = srv.resolvedPreset();
+                    sh.state.asrModel = srv.asrModel();
+                    sh.state.mtModel  = srv.mtModel();
+                    sh.state.gpu      = srv.gpu();
+                    sh.stateDirty     = true;
+                }
+                wakeServant(sh);
+                setState(sh, "listening");
+            }
+        }
+
+        // ---- one utterance, or -- only if none is due -- one LIVE LINE -------
+        //
+        // /!\ THE NO-DELAY GUARANTEE, AND ITS MECHANISM. A draft must never make a
+        // finished subtitle wait. That is enforced by CONSTRUCTION, in three places,
+        // and not by any timing assumption:
+        //
+        //   1. THE WAIT IS THE TEST. A partial is only ever STARTED on the branch
+        //      where audio.pop() came back EMPTY. There is no code path that begins a
+        //      draft while a finished utterance is queued, because "no final is
+        //      queued" is literally the condition under which the branch is reached.
+        //   2. ONE AT A TIME. This is a single thread and the slot is popped once, so
+        //      at most one draft inference exists at any moment. Drafts cannot pile
+        //      up, and a slow one cannot be joined by a second slow one.
+        //   3. THE DRAFT GIVES UP ITS SECOND HALF. Between a draft's ASR and its
+        //      translation, processPartial re-checks the queue and skips the model
+        //      call if an utterance finished meanwhile (TrAudio::finalWaiting).
+        //
+        // What remains -- honestly -- is ONE draft ASR that can already be in flight
+        // when a segment closes. It is bounded by kPartialTimeoutMs and measures
+        // ~0.4 s at the balanced preset on this machine. It cannot compound, because
+        // (1) forbids starting the next one while that final is waiting.
+        Segment seg;
+        if (!audio.pop(seg, kPopDeadlineMs)) {
+            if (srv.up() && ::GetTickCount64() >= partialNextTry) {
+                if (audio.popPartial(snap) && snap.segId > doneSegId && !snapStale(agr, snap)) {
+                    // (snap.segId <= doneSegId means its paragraph is already on
+                    // screen: drafting it now would repaint the screen backwards.
+                    // The audio thread drops these at the cut too -- two owners,
+                    // because either one alone leaves a window. snapStale is the
+                    // third: a snapshot taken before our last commit landed.)
+                    AsrResult draft;
+                    std::string perr;
+                    if (!draftTranscribe(srv, routing, ctx, snap, draft, perr)) {
+                        if (!perr.empty()) partialNextTry = ::GetTickCount64() + kPartialBackoffMs;
+                        continue;
+                    }
+                    uint64_t spent = draft.ms;
+
+                    // ---- a finished SENTENCE, mid-utterance (W3) --------------------
+                    CommitOut co;
+                    std::string cerr;
+                    if (commitStep(srv, spk, audio, routing, ctx, commitCfg, snap, draft,
+                                   agr, pst, co, cerr)) {
+                        co.line.seq = seq.next(co.line.segId);
+                        Out o;
+                        o.kind = Out::kLine;
+                        o.endTickMs = co.refTickMs;
+                        o.line = std::move(co.line);
+                        pushOut(sh, std::move(o));
+                        // ORDER: the LINE, then what is LEFT of the live line. The other
+                        // way round would show the user the remainder of a sentence he has
+                        // not been given yet.
+                        if (co.hasTail) {
+                            Out t;
+                            t.kind = Out::kPartial;
+                            t.part = std::move(co.tail);
+                            pushOut(sh, std::move(t));
+                        }
+                        spent += (uint64_t)co.tm.totalMs;
+                    } else {
+                        if (!cerr.empty()) {
+                            // A commit's transport failure is still a DRAFT-class event: it
+                            // must not kill the servers (the next real final will diagnose
+                            // that properly), but it must stop us doing it again at once.
+                            partialNextTry = ::GetTickCount64() + kPartialBackoffMs;
+                            continue;
+                        }
+                        trpipe::WirePartial p;
+                        uint32_t pMtMs = 0;
+                        if (processPartial(srv, audio, routing, ctx, snap, draft,
+                                           cfg.partialMt, pst, p, pMtMs, perr)) {
+                            Out o;
+                            o.kind = Out::kPartial;
+                            o.part = std::move(p);
+                            pushOut(sh, std::move(o));
+                            spent += pMtMs;
+                        }
+                    }
+                    // SELF-PACING (fluidity pass): the next draft may not start
+                    // sooner than this one took, so drafting never exceeds ~50%
+                    // of the thread whatever the machine -- a fast GPU keeps the
+                    // full PARTIALSEC cadence (draft << cadence), a CPU preset
+                    // degrades the cadence gracefully instead of starving finals.
+                    // A commit pays for its own final here too, which is what keeps
+                    // the engine self-limiting on a machine that cannot afford it.
+                    partialNextTry = ::GetTickCount64() + spent;
+                }
+            }
             continue;
         }
-        // ---- IDLE. Also the way OUT of a job, whatever ended it -- before its Load (an unreadable file,
-        // "max" without its model, a cancel or a supersede in its first lap) or after: "analyzing" must never
-        // outlive the job (WB, after the review). setState writes only a CHANGE, so this costs a compare.
-        if (srv.payloadFound()) setState(sh, "listening");
-        else                    setState(sh, "error", srv.payloadSentence());
-        ::Sleep(kIdleLapMs);
+        // This utterance is finished. Anything still pending for it -- or for anything
+        // older -- is moot from this instant, on BOTH sides of the hand-off.
+        audio.dropPartialsUpTo(seg.segId);
+        if (seg.segId > doneSegId) doneSegId = seg.segId;
+        // Deliberately not touched by drafts: a status that flickered "transcribing"
+        // every 1.2 s while someone talks says nothing and reads as instability.
+        setState(sh, "transcribing");
+        trimCommitted(agr, seg);
+
+        trpipe::WireLine line;
+        StageTimes tm;
+        std::string skip, err;
+        // A tail shorter than a sentence is not transcribed at all: it is the breath at the
+        // end of the last committed one. (The audio thread only queues such a tail when
+        // something WAS committed -- otherwise it drops it, exactly as it always has.)
+        const bool worthIt = seg.mono16k.size() >= (size_t)(kMinSegMs * kAsrRate / 1000);
+        const bool emit = worthIt
+                       && processSegment(srv, spk, routing, ctx, seg, line, tm, skip, err);
+        if (emit) {
+            line.seq    = seq.next(line.segId);
+            line.closes = true;      // this is what ends the utterance on screen
+        }
+        {   // The voice count moves whether or not the line survived: a segment the
+            // hallucination filter dropped was still a segment the clusterer saw. And
+            // the stage can take ITSELF off the field mid-session (a faulting model),
+            // so its on/off is re-read here rather than assumed from startup.
+            std::lock_guard<std::mutex> lk(sh.mx);
+            const int  n  = spk.speakerCount();
+            const bool on = spk.enabled();
+            if (sh.state.spkCount != n)  { sh.state.spkCount = n;  sh.stateDirty = true; }
+            if (sh.state.spkOn    != on) { sh.state.spkOn    = on;
+                                           sh.state.spkModel = on ? kSpkModelTag : "";
+                                           sh.stateDirty = true; }
+            if (emit) {
+                Out o;
+                o.endTickMs = seg.cutTickMs;   // waitMs is stamped from this, at send time
+                o.line = std::move(line);
+                while (sh.outbox.size() >= kOutboxCap) sh.outbox.pop_front();
+                sh.outbox.push_back(std::move(o));
+                lastClosedSeg = seg.segId;
+            } else if (seq.count(seg.segId)) {
+                // NO LINE, BUT LINES CAME BEFORE IT. The live line under them has to fall,
+                // and only a message can make it fall -- without this it would hang on
+                // screen until the UI's 20 s orphan timer, i.e. long into the next speaker.
+                Out o;
+                o.kind = Out::kEnd;
+                o.end.segId = seg.segId;
+                while (sh.outbox.size() >= kOutboxCap) sh.outbox.pop_front();
+                sh.outbox.push_back(std::move(o));
+                lastClosedSeg = seg.segId;
+            }
+        }
+        // W1: the FINISHED subtitle, which is the one message in this file that must not
+        // wait for a poll. Outside the lock, and unconditional: the speaker count may have
+        // moved even when the line itself was dropped, and STATE rides the same doorbell.
+        wakeServant(sh);
+        if (!emit && !err.empty()) {
+            // A transport failure means a server died or wedged. Kill BOTH and let the
+            // loop above rebuild them: half a pipeline is not a state worth nursing.
+            setState(sh, "error", err);
+            srv.killAll();
+            nextTry = ::GetTickCount64() + kRespawnBackoff;
+            continue;
+        }
+        setState(sh, "listening");
     }
-    // QUIT / a broken pipe with a job running: its one FDONE ("cancelled") still goes out --
+    // QUIT / a broken pipe. The live path stops with the thread (the hub is joined before the VAD it feeds goes away).
+    if (liveOn) {
+        hub.stop();
+        audio.endLive();
+    }
+    // With a job running: its one FDONE ("cancelled") still goes out --
     // runHost drains the file outbox one last time after this thread is joined.
     if (fileJob) finishJob(fileJob, srv, fileSink, "cancelled", std::string(), nullptr);
     // ...and so does every FILE still QUEUED, never started (WB, after the review): EXACTLY one
@@ -2354,26 +4691,52 @@ private:
 
 // ---------------------------------------------------------------------------
 // ONE message from the tray, as the servant handles it (WD: out of runHost, so the selftest drives
-// the very same code with no pipe). false = QUIT. `proxy` may be null (the selftest: FPROXY ignored).
+// the very same code with no pipe). false = QUIT. `proxy` may be null (the selftest: FPROXY ignored);
+// so may `hub` (SuVtitle 1.1.0: SRCLIST is then answered by nobody).
+// SuVtitle 1.1.0 adds the LIVE path's doors: LIVE (strict, refused WHOLE -- one STATE err, the live state unchanged),
+// SRCLIST, CTL's scope (whose pair: the player's or the live one; any other scope = the whole CTL ignored) and CTL
+// clear honoured again -- and closes one: NO FILE DURING THE LIVE (the user, 24/10), refused here, never queued.
+// /!\ The hub is never called with sh.mx held: its threads take sh.mx to report (HostLiveEvents).
 // ---------------------------------------------------------------------------
-bool servantHandle(Shared& sh, ProxyWorker* proxy, const std::vector<std::string>& t) {
+// The one sentence a FILE gets while the live path runs (LIVE_PLAN section 2): the app shows it as a notice, never as a
+// failure, and sends the FILE again (with its `have`) when the live stops.
+constexpr const char* kLiveFileRefusal = "Live translation is on: files are analysed when it stops.";
+
+bool servantHandle(Shared& sh, ProxyWorker* proxy, const std::vector<std::string>& t, TrCaptureHub* hub = nullptr) {
     if (t.empty()) return true;
     if (t[0] == "QUIT") return false;
     trpipe::WireCtl c;
     trpipe::WireFile wf;
     trpipe::WireProxy wp;
+    trpipe::WireLive wl;
+    trpipe::WireVoice wv;   // U3: the voice pass (FVOICE)
     uint64_t cancelId = 0, focusId = 0, focusMs = 0;
     if (trpipe::unpackFile(t, wf)) {
         // FILE MODE (WB). Queued for the pipeline; a job already running is told to stop
         // at once (its model load included) -- its FDONE "cancelled" goes first.
-        std::lock_guard<std::mutex> lk(sh.mx);
-        sh.fileReqs.push_back(FileReq(wf));
-        if (sh.runningJob) sh.abortJob.store(sh.runningJob, std::memory_order_release);
-        // the playhead's chain starts at the FILE's focus (review C1: the first tick follows it)
-        sh.chainJob  = wf.jobId;
-        sh.chainMs   = wf.focusMs;
-        sh.chainTick = fileNowMs();
-        sh.focusJump = false;
+        bool refused = false;
+        {
+            std::lock_guard<std::mutex> lk(sh.mx);
+            if (sh.liveWanted || sh.state.live) {
+                // SuVtitle 1.1.0: the live path runs -- its ONE FDONE now, "error" with the sentence (TrPipe.h: exactly
+                // one per FILE), and nothing else: no job is running to stop, the live start cancelled it. (Fix round:
+                // STATE live stays 1 while a LIVE 0 finishes the queued finals -- the drain -- and a FILE is refused
+                // then exactly as during the live: the ADDENDUM.)
+                trpipe::WireFileDone d;
+                d.jobId = wf.jobId; d.result = "error"; d.count = 0; d.err = kLiveFileRefusal;
+                sh.fileOut.push_back(trpipe::packFileDone(d));
+                refused = true;
+            } else {
+                sh.fileReqs.push_back(FileReq(wf));
+                if (sh.runningJob) sh.abortJob.store(sh.runningJob, std::memory_order_release);
+                // the playhead's chain starts at the FILE's focus (review C1: the first tick follows it)
+                sh.chainJob  = wf.jobId;
+                sh.chainMs   = wf.focusMs;
+                sh.chainTick = fileNowMs();
+                sh.focusJump = false;
+            }
+        }
+        if (refused) wakeServant(sh);
     } else if (t[0] == "FILE" && t.size() >= 2 && trpipe::jobIdOf(t[1]) != 0) {
         // WD: a FILE that names a job but cannot be read -- a `have` that does not parse, no path.
         // Refused, but never silently: like any FILE it stops the running job, and it gets its ONE
@@ -2385,12 +4748,75 @@ bool servantHandle(Shared& sh, ProxyWorker* proxy, const std::vector<std::string
         // sentence (unpackFile checks `have` first, so a bad `have` keeps the sentence it always had)
         std::vector<trpipe::MsRange> chk;
         const bool haveOk = trpipe::parseRanges(t.size() >= 8 ? trpipe::unesc(t[7]) : std::string(), chk);
+        // U2: or an imported model's path that does not parse (TrPipe.h modelPathOk) -- an imported model's own sentence
+        // (the app goes back to the default for that kind)
+        const std::string audioField = t.size() >= 10 ? trpipe::unesc(t[9]) : std::string();
+        const std::string asrField = t.size() >= 11 ? trpipe::unesc(t[10]) : std::string();
+        const std::string mtField = t.size() >= 12 ? trpipe::unesc(t[11]) : std::string();
+        trpipe::AudioSel audioChk;
         const std::string why = bad.path.empty() ? std::string("The request names no file.")
             : !haveOk ? std::string("The request's list of already-subtitled stretches could not be read.")
-            : badAudioSentence(t.size() >= 10 ? trpipe::unesc(t[9]) : std::string());
-        std::lock_guard<std::mutex> lk(sh.mx);
-        sh.fileReqs.push_back(FileReq(bad, why));
-        if (sh.runningJob) sh.abortJob.store(sh.runningJob, std::memory_order_release);
+            : !trpipe::parseAudioSel(audioField, audioChk) ? badAudioSentence(audioField)
+            : !trpipe::modelFieldOk(asrField) ? importedModelSentence(true, asrField, kModelPathRefusal)
+            : importedModelSentence(false, mtField, kModelPathRefusal);
+        bool now = false;
+        {
+            std::lock_guard<std::mutex> lk(sh.mx);
+            if (sh.liveWanted || sh.state.live) {
+                // SuVtitle 1.1.0: during the live (or its drain), at once and with its OWN reason (it would be refused
+                // anyway) -- the pipeline is not answering FILEs.
+                trpipe::WireFileDone d;
+                d.jobId = bad.jobId; d.result = "error"; d.count = 0; d.err = why;
+                sh.fileOut.push_back(trpipe::packFileDone(d));
+                now = true;
+            } else {
+                sh.fileReqs.push_back(FileReq(bad, why));
+                if (sh.runningJob) sh.abortJob.store(sh.runningJob, std::memory_order_release);
+            }
+        }
+        if (now) wakeServant(sh);
+    } else if (trpipe::unpackVoice(t, wv)) {
+        // U3: THE VOICE PASS -- a job of the FILE jobs' one slot and queue: queued for the pipeline, the running job (a FILE or
+        // another FVOICE) told to stop at once (its FDONE "cancelled" goes first); during the live, refused as a FILE is.
+        bool refused = false;
+        {
+            std::lock_guard<std::mutex> lk(sh.mx);
+            if (sh.liveWanted || sh.state.live) {
+                trpipe::WireFileDone d;
+                d.jobId = wv.jobId; d.result = "error"; d.count = 0; d.err = kLiveFileRefusal;
+                sh.fileOut.push_back(trpipe::packFileDone(d));
+                refused = true;
+            } else {
+                sh.fileReqs.push_back(FileReq(wv, std::string()));
+                if (sh.runningJob) sh.abortJob.store(sh.runningJob, std::memory_order_release);
+            }
+        }
+        if (refused) wakeServant(sh);
+    } else if (t[0] == "FVOICE" && t.size() >= 2 && trpipe::jobIdOf(t[1]) != 0) {
+        // U3: an FVOICE that names a job but cannot be read -- refused WHOLE with its one FDONE error, in the order the
+        // pipeline answers requests; like a malformed FILE it still ends the running job.
+        trpipe::WireVoice bad;
+        bad.jobId   = trpipe::jobIdOf(t[1]);
+        bad.path    = t.size() >= 3 ? trpipe::unesc(t[2]) : std::string();
+        bad.audio   = t.size() >= 4 ? trpipe::unesc(t[3]) : std::string();
+        bad.spans   = t.size() >= 5 ? trpipe::unesc(t[4]) : std::string();
+        bad.changes = t.size() >= 6 ? trpipe::unesc(t[5]) : std::string();
+        std::string why = voiceRefusal(bad);
+        if (why.empty()) why = "The request could not be read.";
+        bool now = false;
+        {
+            std::lock_guard<std::mutex> lk(sh.mx);
+            if (sh.liveWanted || sh.state.live) {
+                trpipe::WireFileDone d;
+                d.jobId = bad.jobId; d.result = "error"; d.count = 0; d.err = why;
+                sh.fileOut.push_back(trpipe::packFileDone(d));
+                now = true;
+            } else {
+                sh.fileReqs.push_back(FileReq(bad, why));
+                if (sh.runningJob) sh.abortJob.store(sh.runningJob, std::memory_order_release);
+            }
+        }
+        if (now) wakeServant(sh);
     } else if (trpipe::unpackFileFocus(t, focusId, focusMs)) {
         // WD: THE PLAYHEAD. For the running job or a queued one -- latest wins, one slot -- and a
         // queued FILE starts there; any other id is a finished or unknown job: dropped, silently.
@@ -2427,8 +4853,48 @@ bool servantHandle(Shared& sh, ProxyWorker* proxy, const std::vector<std::string
         }
         if (proxy) proxy->cancel(cancelId);
     } else if (trpipe::unpackProxy(t, wp)) {
+        // (SuVtitle 1.1.0: accepted during the live too -- a playback copy on the CPU, not an analysis.)
         if (proxy) proxy->request(wp);
+    } else if (t[0] == "LIVE") {
+        // SuVtitle 1.1.0: THE LIVE PATH, wanted or not. STRICT (unpackLive: capturing the wrong device, or the right one
+        // at the wrong gain, is worse than not starting) and WHOLE: a LIVE that does not read changes nothing and says
+        // why, once. A "wav:" input is a test engine's only (TrPipe.h); a running job's model load stops at once.
+        bool ok = trpipe::unpackLive(t, wl);
+        std::string why = "The live translation request could not be read (no input, too many, or a malformed one).";
+        if (ok && wl.on && !sh.testSources)
+            for (const LiveInput& in : wl.inputs)
+                if (trpipe::liveKeyKind(in.key) == "wav") { ok = false; why = "Test inputs (wav:) are for a test engine only."; }
+        {
+            std::lock_guard<std::mutex> lk(sh.mx);
+            if (!ok) {
+                refuseLiveLocked(sh, why);
+            } else if (wl.on) {
+                bool same = sh.liveWanted && sh.liveInputs.size() == wl.inputs.size();
+                for (size_t i = 0; same && i < wl.inputs.size(); ++i) {
+                    const LiveInput &a = sh.liveInputs[i], &b = wl.inputs[i];
+                    same = a.key == b.key && a.label == b.label && a.chan == b.chan && a.gainDb == b.gainDb;
+                }
+                if (!same) { sh.liveInputs = wl.inputs; ++sh.liveGen; }   // idempotent: the same LIVE twice moves nothing
+                sh.liveWanted = true;
+                sh.liveWantedLive.store(true, std::memory_order_release);
+                if (sh.runningJob) sh.abortJob.store(sh.runningJob, std::memory_order_release);
+            } else {
+                sh.liveWanted = false;
+                sh.liveWantedLive.store(false, std::memory_order_release);
+            }
+        }
+        if (!ok) wakeServant(sh);
+        // Fix round (RVA-7): LIVE 0 releases the devices AT ONCE -- the microphone closes now, not when the model call
+        // the pipeline thread may be in returns (seconds on a CPU). The hub's stop is thread-safe, bounded, and never
+        // called with sh.mx held; the pipeline's own stop at its next lap is then the no-op that hands it the VAD.
+        if (ok && !wl.on && hub) hub->stop();
+    } else if (trpipe::isSrcList(t)) {
+        // SuVtitle 1.1.0: "send me the list" -- answered by the hub, on its own thread (HostLiveEvents::onSources).
+        if (hub) hub->requestSources();
     } else if (trpipe::unpackCtl(t, c)) {
+        // SuVtitle 1.1.0: a scope this engine does not know is the reader's to IGNORE WHOLE (TrPipe.h): a live pair
+        // applied to the films by mistake would re-key their whole cache.
+        if (!trpipe::ctlScopeKnown(c)) return true;
         // The pair is VALIDATED here, at the door. A code the helper cannot honour
         // must never reach the pipeline (it would route every line into a language
         // no model has heard of); rejecting it silently means STATE keeps echoing
@@ -2438,21 +4904,28 @@ bool servantHandle(Shared& sh, ProxyWorker* proxy, const std::vector<std::string
         const std::string a = normalizeLangCode(c.langA);
         const std::string b = normalizeLangCode(c.langB);
         std::lock_guard<std::mutex> lk(sh.mx);
-        if (!c.mode.empty()   && c.mode != sh.mode)     { sh.mode = c.mode; sh.stateDirty = true; }
+        // WHOSE direction and pair (SuVtitle 1.1.0): scope=live moves the live window's, anything else the player's --
+        // by the same rules, on the same door.
+        const bool live = trpipe::ctlIsLive(c);
+        std::string& curMode = live ? sh.liveMode  : sh.mode;
+        std::string& curA    = live ? sh.liveLangA : sh.langA;
+        std::string& curB    = live ? sh.liveLangB : sh.langB;
+        if (!c.mode.empty()   && c.mode != curMode)   { curMode = c.mode; sh.stateDirty = true; }
         if (!c.preset.empty() && c.preset != sh.preset) { sh.preset = c.preset;
                                                           sh.presetChanged = true;
                                                           sh.stateDirty = true; }
         // Both halves are applied together or not at all: a pair is a pair, and
         // half of a swap (en/zh -> zh/zh) is a session where nothing is translated.
-        const std::string wantA = a.empty() ? sh.langA : a;
-        const std::string wantB = b.empty() ? sh.langB : b;
-        if (wantA != wantB && (wantA != sh.langA || wantB != sh.langB)) {
-            sh.langA = wantA;
-            sh.langB = wantB;
+        const std::string wantA = a.empty() ? curA : a;
+        const std::string wantB = b.empty() ? curB : b;
+        if (wantA != wantB && (wantA != curA || wantB != curB)) {
+            curA = wantA;
+            curB = wantB;
             sh.stateDirty = true;
         }
-        // (SUVTITLE SPLIT: `clear` -- "drop queued segments now" -- raised sh.clearAsked for the live queue. A
-        // file-only engine queues no segment: ignored, as TrPipe.h lets a reader do with what it cannot use.)
+        // `clear` -- "drop queued segments now" -- acts on the live path, the only one with a queue (TrPipe.h),
+        // whichever pair the CTL was about (SuVtitle 1.1.0: honoured again).
+        if (c.clear) sh.clearAsked = true;
     }
     return true;
 }
@@ -2464,9 +4937,12 @@ bool servantHandle(Shared& sh, ProxyWorker* proxy, const std::vector<std::string
 // materialised -- so the next start is not a first one, whatever AudioPB's file says by then. A TEST engine
 // (--nofabric) reads its engine.txt as AudioPB's test helper read translator.txt, and seeds and writes NOTHING.
 // `seedWhy` (optional): the seed's one line for the log on a first start, "" otherwise.
+// SuVtitle 1.1.0: + THE LIVE PAIR, when the file holds none (a first start, a 1.0.0 engine.txt): AudioPB's live pair,
+// else the player's (seedLivePair) -- `liveWhy` (optional) says which, "" when the file had one. A test engine reads
+// nothing of AudioPB's for it either: the player's pair, in memory.
 // ---------------------------------------------------------------------------
 TrConfig startConfig(bool testEngine, const std::string& presetArg, const std::string& modeArg,
-                     std::string* seedWhy = nullptr) {
+                     std::string* seedWhy = nullptr, std::string* liveWhy = nullptr) {
     TrConfig cfg;
     const std::wstring own = TrConfig::path();
     const bool first = !testEngine && !own.empty() && ::GetFileAttributesW(own.c_str()) == INVALID_FILE_ATTRIBUTES;
@@ -2474,6 +4950,12 @@ TrConfig startConfig(bool testEngine, const std::string& presetArg, const std::s
     std::string why;
     if (first) seedFromAudioPB(cfg, why);         // all or nothing; never fatal
     if (seedWhy) *seedWhy = why;
+    std::string lw;
+    if (!cfg.liveInFile) {
+        if (!testEngine) seedLivePair(cfg, lw);   // all or nothing, read only; never fatal
+        else { cfg.liveMode = cfg.mode; cfg.liveLangA = cfg.langA; cfg.liveLangB = cfg.langB; }
+    }
+    if (liveWhy) *liveWhy = lw;
     if (!presetArg.empty()) cfg.preset = presetArg;
     if (!modeArg.empty())   cfg.mode   = modeArg;
     if (!testEngine) cfg.save();                  // materialise the file on a first run
@@ -2481,14 +4963,67 @@ TrConfig startConfig(bool testEngine, const std::string& presetArg, const std::s
 }
 
 // ---------------------------------------------------------------------------
+// The capture hub's events -> the pipe (SuVtitle 1.1.0; TrCaptureApi.h ILiveEvents). Called on the HUB's threads, so
+// each one only ENQUEUES under sh.mx and rings the servant's doorbell: INPUT / SRC / SRCEND into the never-dropped
+// queue (an input's state, a picker's list: they must arrive whole and in order), LEVELS into a one-message slot
+// where the newest wins (a meter that misses a tick is not a fault). The picker list's generation is minted here.
+// ---------------------------------------------------------------------------
+class HostLiveEvents final : public ILiveEvents {
+public:
+    explicit HostLiveEvents(Shared& sh) : sh_(sh) {}
+
+    void onInputState(const std::string& key, const std::string& state, const std::string& why) override {
+        trpipe::WireInput in;
+        in.key = key; in.state = state; in.why = why;
+        { std::lock_guard<std::mutex> lk(sh_.mx); sh_.fileOut.push_back(trpipe::packInput(in)); }
+        wakeServant(sh_);
+        engineLog("[SuVtitleEngine] live input " + key + ": " + state + (why.empty() ? std::string() : " -- " + why) + "\n");
+    }
+    void onLevels(const std::vector<std::pair<std::string, float>>& peakDbfs) override {
+        trpipe::WireLevels l;
+        l.peaks = peakDbfs;
+        std::string m = trpipe::packLevels(l);
+        { std::lock_guard<std::mutex> lk(sh_.mx); sh_.levels.swap(m); }
+        wakeServant(sh_);
+    }
+    void onSources(const std::vector<SourceInfo>& list) override {
+        const uint32_t gen = gen_.fetch_add(1, std::memory_order_relaxed) + 1;
+        std::vector<std::string> msgs;
+        msgs.reserve(list.size() + 1);
+        for (const SourceInfo& s : list) {
+            trpipe::WireSrc w;
+            w.gen = gen; w.kind = s.kind; w.key = s.key; w.label = s.label; w.state = s.state;
+            w.rate = s.rate; w.ch = s.ch; w.flags = s.flags;
+            msgs.push_back(trpipe::packSrc(w));
+        }
+        trpipe::WireSrcEnd e;
+        e.gen = gen; e.n = (uint32_t)list.size();
+        msgs.push_back(trpipe::packSrcEnd(e));
+        {
+            std::lock_guard<std::mutex> lk(sh_.mx);
+            for (auto& m : msgs) sh_.fileOut.push_back(std::move(m));
+        }
+        wakeServant(sh_);
+    }
+    void onLog(const std::string& line) override { engineLog("[SuVtitleEngine] capture: " + line + "\n"); }
+
+private:
+    Shared&               sh_;
+    std::atomic<uint32_t> gen_{ 0 };
+};
+
+// ---------------------------------------------------------------------------
 // Host mode: the pipe servant.
 // SUVTITLE SPLIT: AudioPB's runHost minus the fabric -- no TrAudio to start (it claimed the card's slot, and
-// the helper exited 2 when it could not), no live outbox to drain (LINE / PART / END, each LINE's waitMs
-// stamped at send). New here: the log file (host mode only), the first-start seed (E8), DEVICE cpu, HELLO
-// "engine", --rate ignored.
+// the helper exited 2 when it could not). New here: the log file (host mode only), the first-start seed (E8), DEVICE
+// cpu, HELLO "engine", --rate ignored.
+// SuVtitle 1.1.0: the live path back -- TrAudio (the VAD) and the capture hub that feeds it, both idle until a
+// LIVE 1 (the pipeline drives them), HostLiveEvents for what the hub reports, and the live outbox drained again
+// (LINE / PART / END, each LINE's waitMs stamped at send) -- plus the LEVELS slot.
 // ---------------------------------------------------------------------------
 int runHost(const std::string& pipePath, uint32_t parentPid,
-            const std::string& presetArg, const std::string& modeArg, bool nofabric) {
+            const std::string& presetArg, const std::string& modeArg, bool nofabric,
+            bool testSources, bool virtualClock) {
     watchParent(parentPid);
 
     // /!\ --nofabric (WB, a TEST engine driven by a test pipe client) writes NOTHING of the user's: not engine.txt
@@ -2496,22 +5031,29 @@ int runHost(const std::string& pipePath, uint32_t parentPid,
     // there is no fabric to stay off any more; the switch keeps its other meaning -- "this is a test engine" -- for
     // the test kits.)
     if (!nofabric) openEngineLog();
-    std::string seedWhy;
-    const TrConfig cfg = startConfig(nofabric, presetArg, modeArg, &seedWhy);
+    std::string seedWhy, liveWhy;
+    const TrConfig cfg = startConfig(nofabric, presetArg, modeArg, &seedWhy, &liveWhy);
     // S11, DEVICE cpu: every child on the CPU and the GPU never opened -- the test switch's own mechanism.
     if (cfg.device == "cpu") forceCpuChildren();
     const TrPaths paths = resolvePaths(cfg);
     engineLog(std::string("[SuVtitleEngine] ") + SUVTITLE_ENGINE_VERSION_STR + " start: pid "
               + std::to_string((unsigned long)::GetCurrentProcessId()) + ", parent " + std::to_string((unsigned long)parentPid)
               + ", preset " + cfg.preset + ", mode " + cfg.mode + ", pair " + cfg.langA + "/" + cfg.langB
-              + ", device " + cfg.device + (g_forceCpu ? " (every child on the CPU)" : "") + "\n");
+              + ", live pair " + cfg.liveLangA + "/" + cfg.liveLangB + " " + cfg.liveMode
+              + ", device " + cfg.device + (g_forceCpu ? " (every child on the CPU)" : "")
+              + (testSources ? ", test inputs (wav:) accepted" : "") + (virtualClock ? ", virtual capture clock" : "") + "\n");
     if (!seedWhy.empty()) engineLog("[SuVtitleEngine] first start (no engine.txt): " + seedWhy + "\n");
+    if (!liveWhy.empty()) engineLog("[SuVtitleEngine] " + liveWhy + "\n");
     engineLog("[SuVtitleEngine] payload: whisper "
               + (paths.whisperExe.empty() ? std::string("NOT FOUND") : wideToUtf8L(paths.whisperExe))
               + " | llama " + (paths.llamaExe.empty() ? std::string("NOT FOUND") : wideToUtf8L(paths.llamaExe))
               + " | models " + (paths.modelsDir.empty() ? std::string("NOT FOUND") : wideToUtf8L(paths.modelsDir))
               + (paths.devPayload ? " (the dev payload named by SUVTITLE_PAYLOAD: nothing staged next to the exe)" : " (the bundle)")
               + (paths.missing.empty() ? std::string() : " -- " + paths.missing) + "\n");
+    engineLog("[SuVtitleEngine] diarization runtime: sherpa "
+              + (paths.sherpaDir.empty() ? std::string("none") : wideToUtf8L(paths.sherpaDir))
+              + " | speaker model " + (paths.spkModel.empty() ? std::string("none") : wideToUtf8L(paths.spkModel))
+              + " (optional: without them the live lines are named by input, not by voice)\n");
 
     // Connect to the app's pipe (it exists before we were spawned). OVERLAPPED on
     // both ends: neither side may ever block on the other (see TrPipe.h).
@@ -2531,8 +5073,8 @@ int runHost(const std::string& pipePath, uint32_t parentPid,
     DWORD pmode = PIPE_READMODE_MESSAGE;
     ::SetNamedPipeHandleState(pipe, &pmode, nullptr, nullptr);
 
-    // HELLO <slotName>: AudioPB named its fabric slot here ("tr:Translator (pid)", the card's identity on the
-    // desk). SuVtitle has no fabric, so the field means nothing any more -- and TrPipe.h is unchanged, so it
+    // HELLO <slotName>: AudioPB named its routing slot here ("tr:Translator (pid)", the card's identity on the
+    // desk). SuVtitle has no such slot, so the field means nothing any more -- and TrPipe.h is unchanged, so it
     // is still sent, with a FIXED value (SPLIT_PLAN's rule for a field without a meaning). The app reads
     // HELLO as "connected", whatever it names.
     trpipe::writeMessage(pipe, "HELLO\tengine");
@@ -2542,13 +5084,20 @@ int runHost(const std::string& pipePath, uint32_t parentPid,
     sh.preset = cfg.preset;
     sh.langA = cfg.langA;
     sh.langB = cfg.langB;
+    sh.liveMode  = cfg.liveMode;
+    sh.liveLangA = cfg.liveLangA;
+    sh.liveLangB = cfg.liveLangB;
+    sh.testSources = testSources;
     sh.state.preset = cfg.preset;
     sh.state.mode   = cfg.mode;
     sh.state.langA  = cfg.langA;
     sh.state.langB  = cfg.langB;
-    // spkOn / spkModel / spkCount stay 0 / "" / 0 (WireState's defaults, fixed): no diarization stage, and
-    // TrPipe.h makes that trio optional for a reader. asrModel / mtModel / gpu: the pipeline thread's first
-    // act (stateModels).
+    sh.state.live      = false;
+    sh.state.liveMode  = cfg.liveMode;
+    sh.state.liveLangA = cfg.liveLangA;
+    sh.state.liveLangB = cfg.liveLangB;
+    // spkOn / spkModel / spkCount stay 0 / "" / 0 (WireState's defaults) until the first live start loads the
+    // diarization stage (pipelineMain). asrModel / mtModel / gpu: the pipeline thread's first act (stateModels).
     // W1: the doorbell, created BEFORE the pipeline thread so that thread never sees it
     // change. A creation failure is not fatal -- nullptr simply means the servant falls
     // back to its deadline, which is what it did before this wave existed.
@@ -2556,8 +5105,30 @@ int runHost(const std::string& pipePath, uint32_t parentPid,
 
     Servers srv;
     srv.setPaths(paths);
+    srv.setMtOverride(cfg.mtModel);
 
-    std::thread pipeline(pipelineMain, std::ref(sh), std::ref(srv), cfg, !nofabric);
+    // THE LIVE PATH (SuVtitle 1.1.0): the VAD and the capture that feeds it, both idle until a LIVE 1. Declared after
+    // `sh` and in this order on purpose: the hub (whose threads call `audio` and `liveEvents`) goes first on the way out.
+    TrAudio audio;
+    // Arm the live line BEFORE anything feeds it (setPartialSec is safe later, it just costs one cadence).
+    audio.setPartialSec(cfg.partialSec);
+    HostLiveEvents liveEvents(sh);
+    HubOptions hubOpts;
+    hubOpts.appPid       = parentPid;       // the app's tree (its WebView2 children included) is never a source
+    hubOpts.testSources  = testSources;
+    hubOpts.virtualClock = virtualClock;
+    // Fix round (RVA-9): the picker's list watching outlives a live run (TrCaptureHub.cpp) and its thread rings the
+    // doorbell, so the hub is DESTROYED -- which ends the watching -- before the doorbell closes, below: hence the owner.
+    std::unique_ptr<TrCaptureHub> hubOwner(new TrCaptureHub(&liveEvents, hubOpts));
+    TrCaptureHub& hub = *hubOwner;
+
+    // THE START'S GPU PROBE (wave GPU, probeGpuAtStart) -- HERE and nowhere else. After the HELLO: the app gives an engine
+    // 8 s to connect and say it (TranslatorManager.cpp kConnectDeadlineMs), and a slow driver must not become a restart
+    // loop. BEFORE the pipeline thread: its first act announces the FILE mode's gpu (= !g_forceCpu), so the first STATE
+    // already tells the truth -- and g_forceCpu, a plain bool, has no reader yet. Once per engine, whatever it answers; not
+    // run under DEVICE cpu / --cpu (the start line says "every child on the CPU" then).
+    probeGpuAtStart(paths.llamaExe);
+    std::thread pipeline(pipelineMain, std::ref(sh), std::ref(audio), std::ref(hub), std::ref(srv), cfg, !nofabric);
     // FILE MODE (WB): the FPROXY worker, CPU only, posting into the same never-dropped outbox.
     SharedFileSink proxySink(sh);
     ProxyWorker    proxy(proxySink);
@@ -2568,6 +5139,8 @@ int runHost(const std::string& pipePath, uint32_t parentPid,
     for (;;) {
         // 1) drain anything we owe the app
         std::vector<std::string> outbox;
+        std::deque<Out> live;               // the live outbox, taken whole: packed below, OUTSIDE sh.mx
+        std::string levels;
         {
             std::lock_guard<std::mutex> lk(sh.mx);
             if (sh.stateDirty || ::GetTickCount64() - lastStateBeat > 5000) {
@@ -2580,9 +5153,34 @@ int runHost(const std::string& pipePath, uint32_t parentPid,
                 outbox.push_back(std::move(sh.fileOut.front()));
                 sh.fileOut.pop_front();
             }
-            // (SUVTITLE SPLIT: the live outbox -- LINE / PART / END, each LINE's waitMs stamped here, "as late
-            // as it is possible to stamp it" -- was drained after the file messages.)
+            live.swap(sh.outbox);
+            levels.swap(sh.levels);
         }
+        while (!live.empty()) {
+            Out& o = live.front();
+            if (o.kind == Out::kPartial) {
+                outbox.push_back(trpipe::packPartial(o.part));
+            } else if (o.kind == Out::kEnd) {
+                outbox.push_back(trpipe::packEnd(o.end));
+            } else {
+                // THE HONEST NUMBER, stamped as late as it is possible to stamp it:
+                // the wall clock from the end of the speech this line covers to this
+                // message leaving. It therefore contains everything the user actually
+                // waited through -- the queue behind a slower utterance, and this
+                // loop's own poll -- which is exactly what `ms` (the inference alone)
+                // leaves out. For a COMMITTED line the origin is the sentence's own
+                // end rather than the VAD close, which is the whole point of W3: the
+                // number falls from "seconds" to "about one inference".
+                o.line.waitMs = waitMsFrom(o.endTickMs);
+                // SuVtitle 1.1.0: + the capture's own front-end delay for the input that spoke -- the device period,
+                // the hub's FIFO, the decimator (TrCaptureHub::inputDelayMs; 0 = unknown): the VAD's clock starts when
+                // the audio REACHES it, the speaker spoke that much earlier. Asked of the hub OUTSIDE sh.mx.
+                o.line.waitMs += (uint32_t)(hub.inputDelayMs(o.line.spkSlot) + 0.5);
+                outbox.push_back(trpipe::packLine(o.line));
+            }
+            live.pop_front();
+        }
+        if (!levels.empty()) outbox.push_back(std::move(levels));
         bool broken = false;
         for (auto& m : outbox)
             if (!trpipe::writeMessage(pipe, m)) { broken = true; break; }
@@ -2593,13 +5191,13 @@ int runHost(const std::string& pipePath, uint32_t parentPid,
         //
         //    W1: ...and the deadline is no longer what decides when the next message
         //    goes out. `sh.wake` cuts this read short the instant the pipeline pushes
-        //    anything, so an FCUE / FPROG / STATE crosses the pipe in microseconds instead of
+        //    anything, so a LINE / PART / FCUE / STATE crosses the pipe in microseconds instead of
         //    waiting out whatever was left of the 200 ms. Being woken is not an event in
         //    itself: the loop simply goes round, and step 1 above does the work.
         std::string msg;
         bool pipeBroken = false;
         if (trpipe::readMessage(pipe, msg, 200, &pipeBroken, sh.wake)) {
-            if (!servantHandle(sh, &proxy, trpipe::split(msg))) break;     // QUIT
+            if (!servantHandle(sh, &proxy, trpipe::split(msg), &hub)) break;     // QUIT
         } else if (pipeBroken) {
             why = "the app went away (the pipe broke)";
             break;                       // the app went away
@@ -2609,6 +5207,8 @@ int runHost(const std::string& pipePath, uint32_t parentPid,
     sh.quit.store(true, std::memory_order_release);
     sh.abortJob.store(kAbortAll, std::memory_order_release);   // a model load in progress stops now
     if (pipeline.joinable()) pipeline.join();
+    hub.stop();                       // joined BEFORE the doorbell closes: its threads ring it (HostLiveEvents)
+    hubOwner.reset();                 // ... and so is the list watching (fix round RVA-9): the hub is gone from here on
     proxy.stop();                     // its FPROXYDONE ("cancelled") is queued before this returns
     // THE LAST FILE MESSAGES: the FDONE / FPROXYDONE of whatever QUIT interrupted. Best effort
     // -- on QUIT the app may already have stopped reading, and on a broken pipe nothing can
@@ -2632,9 +5232,130 @@ int runHost(const std::string& pipePath, uint32_t parentPid,
 // ===========================================================================
 // SELFTEST
 // ===========================================================================
-// (SUVTITLE SPLIT: WavFile / readWavMono -- the live selftest's bench reader -- and compressGaps -- its
-// continuous-speech builder for the commit engine's section [4] -- were here. The file selftests read their
-// media through the shipping reader, decodeAll16k below.)
+struct WavFile {
+    uint32_t rate = 0;
+    std::vector<float> mono;
+};
+
+bool readWavMono(const std::wstring& path, WavFile& out, std::string& err) {
+    HANDLE h = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { err = "cannot open"; return false; }
+    LARGE_INTEGER sz{};
+    ::GetFileSizeEx(h, &sz);
+    std::vector<unsigned char> b((size_t)sz.QuadPart);
+    DWORD rd = 0;
+    const BOOL ok = b.empty() ? FALSE : ::ReadFile(h, b.data(), (DWORD)b.size(), &rd, nullptr);
+    ::CloseHandle(h);
+    if (!ok || rd != b.size()) { err = "cannot read"; return false; }
+    if (b.size() < 44 || std::memcmp(b.data(), "RIFF", 4) || std::memcmp(b.data() + 8, "WAVE", 4)) {
+        err = "not a RIFF/WAVE file"; return false;
+    }
+    auto rd16 = [&](size_t i) { return (uint16_t)(b[i] | (b[i + 1] << 8)); };
+    auto rd32 = [&](size_t i) { return (uint32_t)(b[i] | (b[i+1] << 8) | (b[i+2] << 16) | ((uint32_t)b[i+3] << 24)); };
+
+    size_t at = 12;
+    uint16_t fmt = 0, ch = 0, bits = 0;
+    size_t dataAt = 0, dataLen = 0;
+    while (at + 8 <= b.size()) {
+        const std::string id((const char*)&b[at], 4);
+        const uint32_t len = rd32(at + 4);
+        const size_t body = at + 8;
+        if (id == "fmt " && body + 16 <= b.size()) {
+            fmt  = rd16(body);
+            ch   = rd16(body + 2);
+            out.rate = rd32(body + 4);
+            bits = rd16(body + 14);
+        } else if (id == "data") {
+            dataAt = body;
+            dataLen = (size_t)len;
+            if (dataAt + dataLen > b.size()) dataLen = b.size() - dataAt;
+            break;
+        }
+        at = body + len + (len & 1);
+    }
+    if (!dataLen || !ch || !out.rate) { err = "no usable data chunk"; return false; }
+
+    const size_t frames = dataLen / ((size_t)ch * (bits / 8));
+    out.mono.resize(frames);
+    for (size_t f = 0; f < frames; ++f) {
+        double acc = 0.0;
+        for (uint16_t c = 0; c < ch; ++c) {
+            const size_t i = dataAt + (f * ch + c) * (bits / 8);
+            if (fmt == 3 && bits == 32)      acc += (double)*(const float*)&b[i];
+            else if (bits == 16)             acc += (double)(int16_t)rd16(i) / 32768.0;
+            else if (bits == 32)             acc += (double)(int32_t)rd32(i) / 2147483648.0;
+        }
+        out.mono[f] = (float)(acc / (double)ch);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// CONTINUOUS SPEECH, out of the bench material we have.
+//
+// /!\ THE BENCH FILES CANNOT TEST THIS WAVE AS THEY ARE, and finding that out is what this
+// function is. Each is five separate sentences with a second or more of silence between
+// them, so the VAD closes after every one: each segment IS one sentence, the closing line
+// says it at once, and the commit engine has nothing to bite on -- section [4] would have
+// "passed" while proving nothing. The case W3 exists for is the opposite one: somebody who
+// does not stop, whose sentences pile up behind an 8 s force-cut.
+//
+// So it is built from the SAME audio rather than from new audio: every silence is shortened
+// to less than the VAD's hangover, and the five sentences become ONE utterance. Real
+// speech, real punctuation, real word timings -- only the pauses are shorter. What is kept
+// of each gap is its FIRST 150 ms, not silence we invented: splicing two waveforms at an
+// arbitrary sample is a click, and a click is an onset the VAD would answer.
+// ---------------------------------------------------------------------------
+std::vector<float> compressGaps(const std::vector<float>& in, uint32_t rate, double keepMs) {
+    const int hop = (int)(rate * 30 / 1000);
+    if (hop <= 0 || in.size() < (size_t)hop * 4) return in;
+    const size_t hops = in.size() / (size_t)hop;
+    std::vector<bool> speech(hops, false);
+    for (size_t h = 0; h < hops; ++h) {
+        double sum = 0.0;
+        for (int i = 0; i < hop; ++i) {
+            const double v = (double)in[h * (size_t)hop + (size_t)i];
+            sum += v * v;
+        }
+        const double rms = std::sqrt(sum / (double)hop);
+        speech[h] = rms > 1.0e-9 && 20.0 * std::log10(rms) > kVadOpenDbfs;
+    }
+    // Dilate: the gate's own pre-roll exists because a word's attack sits below its body,
+    // and cutting that attack off would change what whisper hears, not just when.
+    //
+    // /!\ TWO HOPS, AND THE BUDGET IS WHY. What is left between two sentences is
+    // 2 hops + keepMs + 2 hops, and it must come to LESS than the VAD's hangover
+    // (kHangoverMs) or the gate closes and the whole exercise produces five separate
+    // utterances again -- which is exactly what the first version of this function did at
+    // six hops: 510 ms against a 300 ms hangover, and section [4] reported the same five
+    // one-sentence segments as before while claiming to be testing continuous speech.
+    const size_t dil = 2;
+    std::vector<bool> keep = speech;
+    for (size_t h = 0; h < hops; ++h)
+        if (speech[h])
+            for (size_t d = (h > dil ? h - dil : 0); d < hops && d <= h + dil; ++d) keep[d] = true;
+
+    const size_t keepHops = (size_t)std::max(1.0, keepMs / 30.0);
+    std::vector<float> out;
+    out.reserve(in.size());
+    size_t h = 0;
+    while (h < hops) {
+        if (keep[h]) {
+            out.insert(out.end(), in.begin() + (std::ptrdiff_t)(h * (size_t)hop),
+                       in.begin() + (std::ptrdiff_t)((h + 1) * (size_t)hop));
+            ++h;
+            continue;
+        }
+        size_t run = 0;
+        while (h + run < hops && !keep[h + run]) ++run;
+        const size_t take = std::min(run, keepHops);
+        out.insert(out.end(), in.begin() + (std::ptrdiff_t)(h * (size_t)hop),
+                   in.begin() + (std::ptrdiff_t)((h + take) * (size_t)hop));
+        h += run;
+    }
+    return out;
+}
 
 // A millisecond clock with real resolution. GetTickCount64 moves in 15.6 ms steps,
 // which is the same order as the things this file measures.
@@ -2686,7 +5407,8 @@ double goertzel(const std::vector<float>& x, double freq, double rate) {
 //        bench text, Traditional under zh-tw, the edit list seen from the cues, cancel,
 //        supersede, refusals, RTF turbo vs large-v3;
 //   [7d] the job's whisper is gone afterwards (AudioPB's [7d] [7e] [7f] -- the live pair, the live
-//        finals' script nets, the live onset gate -- went with the live path: SUVTITLE SPLIT).
+//        finals' script nets, the live onset gate -- left this section with the split; since SuVtitle 1.1.0
+//        the last two are --selftest-live's [7] and [8]).
 // Fixtures: <SUVTITLE_TEST_MEDIA>\filemode\ (see testMediaRoot below). Missing = NOT CHECKED,
 // printed as such -- never a silent pass. GPU decodes are not deterministic: every live claim
 // is an invariant or a threshold, never an exact text.
@@ -3477,19 +6199,28 @@ void filmGradeTests(Servers& srv, const TrConfig& cfg, int& failures) {
         } else {
             std::vector<std::string> sent;
             g_fileNoModelsForTest = true;
-            g_fileAsrForTest = [&](uint64_t s, uint64_t, const std::string&) -> std::string {
+            // (F-RESUME: the forced decode's sentence ends 0.4 s before the end of the window it answers -- a whisper
+            // that stopped 2 s into c.mp3's 5-12 s of speech would be an EARLY STOP, and that window heard again;
+            // what lies before the sentence is the window's head, never sent back)
+            g_fileAsrForTest = [&](uint64_t s, uint64_t e, const std::string&) -> std::string {
                 sent.push_back(g_fileAsrLangSentForTest);
                 if (s > 5 * kFileRate) return "{\"text\":\"\",\"language\":\"english\",\"segments\":[]}";
                 if (g_fileAsrLangSentForTest == "auto") return kFilmRu;   // heard as Russian
                 const bool en = g_fileAsrLangSentForTest == "en";
+                const double a0 = std::max(0.2, (double)(e - s) / kFileRate - 2.0), d = 0.4;   // 4 words of 0.4 s
+                auto wd = [&](const char* t, int k) {
+                    char b[160];
+                    std::snprintf(b, sizeof(b), "{\"word\":\"%s\",\"start\":%.2f,\"end\":%.2f,\"t_dtw\":%d,\"probability\":0.9}%s",
+                                  t, a0 + d * k, a0 + d * (k + 1), (int)std::lround((a0 + d * (k + 1)) * 100.0), k < 3 ? "," : "");
+                    return std::string(b);
+                };
+                char seg[80];
+                std::snprintf(seg, sizeof(seg), "\",\"start\":%.2f,\"end\":%.2f,\"words\":[", a0, a0 + 4.0 * d);
                 return std::string("{\"text\":\"") + (en ? " I will call for help." : " Je vais lancer un appel.")
                      + "\",\"language\":\"" + (en ? "english" : "french") + "\",\"segments\":[{\"id\":0,\"text\":\""
-                     + (en ? " I will call for help." : " Je vais lancer un appel.") + "\",\"start\":0.2,\"end\":1.8,\"words\":["
-                     "{\"word\":\"" + (en ? " I" : " Je") + "\",\"start\":0.2,\"end\":0.5,\"t_dtw\":50,\"probability\":0.9},"
-                     "{\"word\":\"" + (en ? " will" : " vais") + "\",\"start\":0.5,\"end\":0.8,\"t_dtw\":80,\"probability\":0.9},"
-                     "{\"word\":\"" + (en ? " call" : " lancer") + "\",\"start\":0.8,\"end\":1.2,\"t_dtw\":120,\"probability\":0.9},"
-                     "{\"word\":\"" + (en ? " for help." : " un appel.") + "\",\"start\":1.2,\"end\":1.8,\"t_dtw\":180,\"probability\":0.9}],"
-                     "\"temperature\":0.0,\"avg_logprob\":-0.1}]}";
+                     + (en ? " I will call for help." : " Je vais lancer un appel.") + seg
+                     + wd(en ? " I" : " Je", 0) + wd(en ? " will" : " vais", 1) + wd(en ? " call" : " lancer", 2)
+                     + wd(en ? " for help." : " un appel.", 3) + "],\"temperature\":0.0,\"avg_logprob\":-0.1}]}";
             };
             g_fileMtForTest = [](const std::string& src, const std::string&, const std::string&, size_t) { return "T(" + src + ")"; };
             const JobRun r = runFileJob(srv, cfg, 7701, wideToUtf8L(cmp3), "fr", "en", "auto", "auto", true);
@@ -3508,6 +6239,21 @@ void filmGradeTests(Servers& srv, const TrConfig& cfg, int& failures) {
             ok(forcedThen && r.st.langRedecodes == 1 && line && !cyr && !r.dones.empty() && r.dones.back().result == "ok",
                "D: through the job lap, a window heard in Russian is decoded again FORCED into the pair, and only that "
                "decode's words become cues");
+            // F-RESUME, THE COST IN THE OPEN (review LOW): the first window -- heard, then forced, its sentence reaching its
+            // end -- is never sent back; every later window, which this stand-in answers with NOTHING, is heard exactly twice
+            std::map<uint64_t, int> hearings;
+            for (const auto& p : r.st.plans) ++hearings[p.s];
+            bool laterTwice = hearings.size() >= 2;
+            int firstWindow = 0;
+            for (const auto& kv : hearings) {
+                if (kv.first <= 5 * kFileRate) firstWindow += kv.second;
+                else laterTwice = laterTwice && kv.second == 2;
+            }
+            std::printf("    job lap cost: %zu window(s), %zu request(s): the first %d (auto + forced), each later one heard %s\n",
+                        hearings.size(), r.st.plans.size(), firstWindow, laterTwice ? "exactly twice (nothing written)" : "NOT twice");
+            ok(firstWindow == 2 && laterTwice && r.st.reheard + 1 == hearings.size() && r.st.unheardKept + 1 == hearings.size(),
+               "F-RESUME: the job lap's requests are what the design costs -- the forced window never sent back, a window "
+               "whisper wrote nothing in heard exactly twice");
         }
     }
     // ---- E: readability -----------------------------------------------------------------------------------
@@ -3907,18 +6653,19 @@ void filmGradeTests(Servers& srv, const TrConfig& cfg, int& failures) {
                 // lines forced into French did); and music's "E a\xc3\xad! E a\xc3\xad!" with the same forced credits
                 for (int unsureRun = 0; unsureRun < 4; ++unsureRun) {
                     std::vector<std::string> sent;
-                    const std::string unsureDoc = docOf("russian", 0.5, { sg(ruSent, 0.3, 2.3, true), empty });
-                    const std::string keptDoc = docOf("french", 0.5, { sg(ruSent, 0.3, 2.3, true), empty });
-                    const std::string creditsDoc = docOf("french", 0.5, { sg("Sous-titrage Soci\xc3\xa9t\xc3\xa9 Radio-Canada",
-                                                                             0.3, 2.3, true), empty });
-                    const std::string ptUnsure = docOf("portuguese", 0.6, { sg("E a\xc3\xad! E a\xc3\xad!", 0.3, 2.3, true), empty });
                     g_fileNoModelsForTest = true;
-                    g_fileAsrForTest = [&](uint64_t s, uint64_t, const std::string&) -> std::string {
+                    // (F-RESUME: each sentence ends 0.4 s before the end of the window it answers -- one stopping 2.3 s
+                    // into c.mp3's 5-12 s of speech is an EARLY STOP, and that window would be heard again)
+                    g_fileAsrForTest = [&](uint64_t s, uint64_t e, const std::string&) -> std::string {
                         sent.push_back(g_fileAsrLangSentForTest);
                         if (s > 5 * kFileRate) return "{\"text\":\"\",\"language\":\"english\",\"segments\":[]}";
+                        const double z = std::max(2.3, (double)(e - s) / kFileRate - 0.4), a = z - 2.0;
                         if (g_fileAsrLangSentForTest == "auto")
-                            return unsureRun == 0 ? ruDoc : unsureRun == 3 ? ptUnsure : unsureDoc;
-                        return unsureRun == 1 ? keptDoc : creditsDoc;   // forced: Russian kept / a credits line
+                            return unsureRun == 0 ? docOf("russian", 0.95, { sg(ruSent, a, z, true), empty })
+                                 : unsureRun == 3 ? docOf("portuguese", 0.6, { sg("E a\xc3\xad! E a\xc3\xad!", a, z, true), empty })
+                                 : docOf("russian", 0.5, { sg(ruSent, a, z, true), empty });
+                        return unsureRun == 1 ? docOf("french", 0.5, { sg(ruSent, a, z, true), empty })   // forced: Russian kept
+                             : docOf("french", 0.5, { sg("Sous-titrage Soci\xc3\xa9t\xc3\xa9 Radio-Canada", a, z, true), empty });
                     };
                     g_fileMtForTest = [](const std::string& src, const std::string&, const std::string&, size_t) { return "T(" + src + ")"; };
                     const JobRun r = runFileJob(srv, cfg, 7702 + (uint64_t)unsureRun, wideToUtf8L(cmp3),
@@ -5316,8 +8063,9 @@ std::vector<UttMark> readMarks(const std::wstring& path) {
 
 // A stand-in WHISPER for the window [s, e) (samples): every utterance it overlaps, as words of 0.4 s
 // (" u<i><letter>"), cut at the window's end, a full stop on an utterance that ends inside the window.
-// Times relative to the window, as whisper gives them. Deterministic, position-aware.
-std::string standInWhisper(const std::vector<UttMark>& marks, uint64_t s, uint64_t e) {
+// Times relative to the window, as whisper gives them. Deterministic, position-aware. `dtw` (F-RESUME): each word
+// also carries its DTW time (its end, in whisper's centiseconds), as the shipping file whisper's words do.
+std::string standInWhisper(const std::vector<UttMark>& marks, uint64_t s, uint64_t e, bool dtw = false) {
     const double ws = (double)s / kFileRate, we = (double)e / kFileRate;
     std::string segs, text;
     int id = 0;
@@ -5336,8 +8084,9 @@ std::string standInWhisper(const std::vector<UttMark>& marks, uint64_t s, uint64
             const bool endsHere = (z >= u.e - 1e-9) && (u.e <= we - 0.05);
             std::string w = " u" + std::to_string(i) + (char)('a' + (k % 26)) + (k >= 26 ? std::to_string(k / 26) : std::string());
             if (endsHere) w += ".";
-            std::snprintf(b, sizeof(b), "%s{\"word\":\"%s\",\"start\":%.2f,\"end\":%.2f,\"t_dtw\":-1,\"probability\":0.9}",
-                          words.empty() ? "" : ",", w.c_str(), a - ws, zz - ws);
+            std::snprintf(b, sizeof(b), "%s{\"word\":\"%s\",\"start\":%.2f,\"end\":%.2f,\"t_dtw\":%lld,\"probability\":0.9}",
+                          words.empty() ? "" : ",", w.c_str(), a - ws, zz - ws,
+                          dtw ? (long long)std::llround((zz - ws) * 100.0) : -1LL);
             words += b;
             stext += w;
             if (first < 0) first = a - ws;
@@ -5378,7 +8127,8 @@ struct V2Clock {
 // and may set the focus slot, queue an FCANCEL, a FILE. The FILE itself goes through servantHandle.
 V2Run driveV2(Servers& srv, const TrConfig& cfg, const std::vector<UttMark>& marks, const trpipe::WireFile& f,
               const std::function<void(Shared&, const V2Run&, int)>& perLap = {},
-              int maxLaps = 20000, V2Clock* clock = nullptr) {
+              int maxLaps = 20000, V2Clock* clock = nullptr,
+              const std::function<std::string(uint64_t, uint64_t, const std::string&)>& asr = {}) {
     V2Run r;
     Shared sh;
     CollectSink sink;
@@ -5387,7 +8137,7 @@ V2Run driveV2(Servers& srv, const TrConfig& cfg, const std::vector<UttMark>& mar
     g_fileAsrForTest = [&](uint64_t s, uint64_t e, const std::string& prompt) {
         r.asr.push_back({ s, e, prompt, sink.lines.size() });
         if (clock) clock->now += clock->asrMs;
-        return standInWhisper(marks, s, e);
+        return asr ? asr(s, e, prompt) : standInWhisper(marks, s, e);   // (F-RESUME: a whisper that fails on cue)
     };
     g_fileMtForTest = [&](const std::string& src, const std::string&, const std::string&, size_t ctx) {
         r.mt.push_back({ src, ctx, sink.lines.size() });
@@ -6824,6 +9574,703 @@ void fileModeV2Selftest(Servers& srv, const TrConfig& cfg, int& failures, bool l
                                                   : "SEE FAILURES ABOVE");
     }
 
+    // ---------------------------------------------------------------- [8e]
+    // F-RESUME (2026-10-26; redesigned after its adversarial review): AUDIO WHISPER STOPPED WRITING IN IS NOT VOUCHED
+    // FOR (TrFileJob.h, hearCheck). The defect, measured (docs\PROGRESS_F-RESUME.md): meeting.wav, whisper base, a FILE
+    // cancelled at 31.41 s then resumed -- whisper answered the pause-ended window 68.80-98.64 s with two segments
+    // ending 9.0 s in; the window vouched for all of itself and 20.8 s of speech never got a subtitle while the record
+    // said DONE. Offline and media-free: synthetic films written to %TEMP% ("utterances" of tone, effects, music over
+    // a -66 dBFS floor) and a stand-in whisper that knows where each utterance is (DTW-timed words) and fails on cue.
+    // Every job runs TWICE -- with hearCheck and without it (g_fileNoHearCheckForTest, the job before F-RESUME) -- so
+    // each case is held against what the same whisper gave before: never more loss, and what it costs in requests.
+    // The review's probes are here by their names (F1-F8); A-E are the defect's own shapes.
+    std::printf("\n[8e] F-RESUME -- audio whisper stopped writing in is heard again, never vouched for (offline, synthetic)\n");
+    {
+        const int before = failures;
+        uint32_t rng = 12345;
+        auto floorNoise = [&rng]() { rng = rng * 1664525u + 1013904223u; return ((float)(rng >> 8) / 16777216.0f - 0.5f) * 0.0006f; };
+        auto toneAt = [](size_t k) { return 0.25f * (float)std::sin(2.0 * 3.14159265358979 * 220.0 * (double)k / 16000.0); };
+        auto sfxAt  = [](size_t k) { return 0.08f * (float)std::sin(2.0 * 3.14159265358979 * 1000.0 * (double)k / 16000.0); };
+        // ---- the rules alone: hearCheck / activeSecOutside / dropRepeatedHead ---------------------------------
+        {
+            // 0.5 s of floor, 20 s of "speech", 2 s of floor, 2.0 s of an "effect", 2 s of floor
+            std::vector<float> x;
+            auto add = [&](double sec, int kind) {
+                for (int i = 0; i < (int)(sec * 16000); ++i)
+                    x.push_back(kind == 1 ? toneAt(x.size()) : kind == 2 ? sfxAt(x.size()) : floorNoise());
+            };
+            add(0.5, 0); add(20.0, 1); add(2.0, 0); add(2.0, 2); add(2.0, 0);
+            EnergyTrack en;
+            en.push(x.data(), x.size());
+            auto verdict = [&](double from, double upTo, bool timed) {     // 0.4 s words from `from` to `upTo`, all heard
+                CommitVerdict v;
+                v.timed = timed;
+                for (double t = from; t + 0.4 <= upTo + 1e-9; t += 0.4) {
+                    FileWord w{ t, t + 0.4, " w", "en" };
+                    w.timed = timed;
+                    v.words.push_back(w);
+                    v.heardReal.push_back({ t, t + 0.4 });
+                }
+                return v;
+            };
+            auto ctxOf = [](double secondUpTo, double prevCut, int chain) {
+                HearContext c;
+                c.secondUpTo = (uint64_t)std::llround(secondUpTo * 16000);
+                c.prevCut = (uint64_t)std::llround(prevCut * 16000);
+                c.cutChain = chain;
+                c.hadWords = true;
+                return c;
+            };
+            const HearContext first = ctxOf(0.0, 0.0, 0);
+            WindowPlan p;
+            p.s = (uint64_t)(0.3 * 16000); p.e = (uint64_t)(26.4 * 16000); p.why = WindowPlan::kPause;
+            CommitVerdict stop = verdict(0.5, 6.5, true);               // whisper stopped 6 s into 20 s of speech
+            stop.nextCursor = p.e;
+            const HearCheck h1 = hearCheck(en, p, stop, first);
+            std::printf("    rule: stopped 6 s into 20 s -> heard to %.2f s, %.1f s active after; next window from %.2f s\n",
+                        h1.lastWord, h1.activeSec, (double)h1.nextCursor / 16000.0);
+            ok(h1.rehear && !h1.same && std::fabs((double)h1.nextCursor / 16000.0 - 6.52) < 0.01 && h1.activeSec > 15.0,
+               "F-RESUME rule: an EARLY STOP (the measured shape) -- the next window starts right after the last heard word");
+            const HearCheck h2 = hearCheck(en, p, stop, ctxOf(20.0, 3.0, 1)), h3 = hearCheck(en, p, stop, ctxOf(20.0, 6.0, 1));
+            ok(h2.rehear && !h3.rehear && h3.accepted && std::fabs((double)h3.nextCursor / 16000.0 - 20.0) < 0.01,
+               "F-RESUME rule: a second hearing cuts again only past the cut it follows by kUnheardTailSec (3.0 -> 6.5: cut); "
+               "6.0 -> 6.5 is no progress: accepted, up to what was heard before (20.0 s) -- no crawl (review F12c)");
+            ok(!hearCheck(en, p, stop, ctxOf(20.0, 3.0, kMaxCutChain)).rehear && hearCheck(en, p, stop, ctxOf(20.0, 3.0, kMaxCutChain)).capped,
+               "F-RESUME rule: kMaxCutChain cuts in a row -- the next early stop is not cut (the safety net)");
+            CommitVerdict gap = verdict(0.5, 6.5, true), tail2 = verdict(0.5, 20.5, true);
+            for (const auto& w : verdict(14.1, 20.5, true).words) { gap.words.push_back(w); gap.heardReal.push_back({ w.start, w.end }); }
+            gap.nextCursor = tail2.nextCursor = p.e;
+            ok(!hearCheck(en, p, gap, first).rehear && !hearCheck(en, p, tail2, first).rehear,
+               "F-RESUME rule: a GAP between heard words (7.6 s of speech) is never acted on; nor a 2.0 s effect after the last "
+               "word (under kUnheardTailSec)");
+            CommitVerdict none;
+            none.nextCursor = p.e;
+            const HearCheck n1 = hearCheck(en, p, none, first), n2 = hearCheck(en, p, none, ctxOf(26.4, 0.0, 0)),
+                            n3 = hearCheck(en, p, none, ctxOf(10.0, 6.5, 1));
+            ok(n1.rehear && n1.same && !n2.rehear && n2.accepted && n2.nextCursor == p.e && n3.accepted
+               && std::fabs((double)n3.nextCursor / 16000.0 - 10.0) < 0.01,
+               "F-RESUME rule: NOTHING COMMITTED -- the same window once more; a second hearing that commits nothing is vouched "
+               "for up to what was heard twice (all of it; or 10.0 s, the rest on its FIRST hearing -- review F9 / F9b)");
+            CommitVerdict dupes = none;                                  // its words, all heard twice (dropped by the de-dup)
+            for (const auto& w : stop.words) dupes.heardReal.push_back({ w.start, w.end });
+            const HearCheck d1 = hearCheck(en, p, dupes, first);
+            ok(d1.same && !hearCheck(en, p, dupes, ctxOf(26.4, 0.0, 1)).rehear,
+               "F-RESUME rule: a request whose words were all heard twice commits nothing and never CUTS (review F12c): heard "
+               "once more on a first hearing, vouched for on a second");
+            CommitVerdict music = none;
+            music.heardNonSpeech.push_back({ 0.4, 20.6 });               // whisper's own "[Music]" / " ." over it
+            CommitVerdict dotAfter = stop, tagAfter = tail2;
+            dotAfter.heardNonSpeech.push_back({ 6.6, 26.1 });           // review F6: " ." to the window's end
+            CommitVerdict tail4 = verdict(0.5, 18.5, true);              // 2 s of speech + 2 s of effect after it: 4 s
+            tail4.nextCursor = p.e;
+            tagAfter = tail4;
+            tagAfter.heardTags.push_back({ 18.6, 26.0 });                // ... that whisper tagged "[Applause]"
+            ok(!hearCheck(en, p, music, first).rehear && hearCheck(en, p, dotAfter, first).rehear
+               && hearCheck(en, p, tail4, first).rehear && !hearCheck(en, p, tagAfter, first).rehear,
+               "F-RESUME rule: a window whisper SAID is not speech is heard; after the last word, an explicit tag covers its "
+               "span (review LOW 4) but a \" .\" never does (review F6)");
+            WindowPlan hp = p;
+            hp.why = WindowPlan::kHard;
+            CommitVerdict hardStop = stop;
+            hardStop.nextCursor = (uint64_t)std::llround(6.52 * 16000);
+            HearContext noWords = first;
+            noWords.hadWords = false;
+            ok(!hearCheck(en, hp, hardStop, first).rehear && hearCheck(en, hp, none, noWords).same,
+               "F-RESUME rule: a hard cut that kept words is left to its own rule; one that kept nothing is heard once more");
+            CommitVerdict untimed = verdict(0.5, 6.5, false);
+            untimed.nextCursor = p.e;
+            const HearCheck u1 = hearCheck(en, p, untimed, first);
+            ok(u1.rehear && u1.activeSec < h1.activeSec - 0.4, "F-RESUME rule: whisper's token times (no DTW) leave 1 s after the last word");
+            // the seam: ONE repeated word at an EARLY STOP's seam, starting within kSeamCopySec of it -- the same audio;
+            // 0.3 s after it, or at a hard cut, it may be said twice (review LOW 3: "...I said no." | "No, I won't")
+            auto T = [](double s, double e, const char* t) { FileWord w{ s, e, t, "en" }; w.timed = true; return w; };
+            const std::vector<FileWord> tail = { T(12.7, 13.1, " u3f"), T(13.08, 13.12, " no.") };
+            std::vector<FileWord> atSeam = { T(13.6, 14.1, " no."), T(15.0, 15.4, " u4a") };
+            std::vector<FileWord> later  = { T(13.82, 14.2, " No,"), T(15.0, 15.4, " u4a") };
+            std::vector<FileWord> hard   = { T(13.6, 14.1, " no."), T(15.0, 15.4, " u4a") };
+            dropRepeatedHead(atSeam, tail, 13.52);
+            dropRepeatedHead(later, tail, 13.52);
+            dropRepeatedHead(hard, tail);
+            ok(atSeam.size() == 1 && atSeam[0].text == " u4a" && later.size() == 2 && hard.size() == 2,
+               "F-RESUME rule: at an early stop's seam a single word written again 0.08 s after it is dropped; 0.30 s after "
+               "it, or at a hard cut, it stays (said twice)");
+        }
+        // ---- whole jobs through the shipping request handler + job lap, each WITH and WITHOUT hearCheck -----------
+        wchar_t tmpDir[MAX_PATH] = {};
+        ::GetTempPathW(MAX_PATH, tmpDir);
+        auto writeFilm = [&](const std::wstring& path, double sec, const std::vector<UttMark>& tones, const std::vector<UttMark>& sfx) {
+            std::vector<float> x((size_t)(sec * 16000));
+            for (auto& v : x) v = floorNoise();
+            for (const auto& u : tones) for (size_t k = (size_t)(u.s * 16000); k < (size_t)(u.e * 16000) && k < x.size(); ++k) x[k] = toneAt(k);
+            for (const auto& u : sfx)   for (size_t k = (size_t)(u.s * 16000); k < (size_t)(u.e * 16000) && k < x.size(); ++k) x[k] = sfxAt(k);
+            const std::string wav = buildWav16k(x);
+            return writeBytes(path, std::vector<unsigned char>(wav.begin(), wav.end()));
+        };
+        uint64_t id = 8500;
+        auto fileOf = [&](const std::wstring& path, uint64_t jid, const std::string& have) {
+            trpipe::WireFile f;
+            f.jobId = jid; f.path = wideToUtf8L(path); f.langA = "en"; f.langB = "zh"; f.mode = "auto"; f.quality = "auto";
+            f.have = have; f.focusMs = 0;
+            return f;
+        };
+        // the stand-in whisper of request number n (0-based): every utterance the request hears, DTW-timed -- except
+        // those `drop(i, n, s, e)` says it writes nothing for; `edit` may rewrite the answer (n, s, e, doc)
+        using Drop = std::function<bool(size_t, size_t, uint64_t, uint64_t)>;
+        using Edit = std::function<void(size_t, uint64_t, uint64_t, std::string&)>;
+        auto whisperOf = [](const std::vector<UttMark>& marks, size_t& n, Drop drop, Edit edit) {
+            return [&marks, &n, drop, edit](uint64_t s, uint64_t e, const std::string&) {
+                std::vector<UttMark> m = marks;
+                if (drop) for (size_t i = 0; i < m.size(); ++i) if (drop(i, n, s, e)) { m[i].s = -2.0; m[i].e = -1.0; }
+                std::string doc = standInWhisper(m, s, e, true);
+                if (edit) edit(n, s, e, doc);
+                ++n;
+                return doc;
+            };
+        };
+        auto textOfRun = [](const std::vector<std::string>& lines) {
+            std::string all;
+            for (const auto& c : cuesOfRun(lines)) all += c.src + " ";
+            return all;
+        };
+        auto missingIn = [](const std::vector<UttMark>& m, const std::string& all) {
+            std::vector<std::string> miss;
+            for (size_t i = 0; i < m.size(); ++i)
+                if (all.find("u" + std::to_string(i) + "a") == std::string::npos) miss.push_back(m[i].name);
+            return miss;
+        };
+        auto joinNames = [](const std::vector<std::string>& v) {
+            std::string s;
+            for (const auto& x : v) s += " " + x;
+            return v.empty() ? std::string(" none") : s;
+        };
+        auto subsetOf = [](const std::vector<std::string>& a, const std::vector<std::string>& b) {
+            for (const auto& x : a) if (std::find(b.begin(), b.end(), x) == b.end()) return false;
+            return true;
+        };
+        // a word written twice into the cues: every "u<i><letter>" counted
+        auto duplicates = [](const std::string& all) {
+            std::map<std::string, int> n;
+            std::string w;
+            for (size_t i = 0; i <= all.size(); ++i) {
+                const char c = i < all.size() ? all[i] : ' ';
+                if (c == ' ' || c == '.') { if (w.size() >= 3 && w[0] == 'u') ++n[w]; w.clear(); }
+                else w += c;
+            }
+            int d = 0;
+            for (const auto& kv : n) if (kv.second > 1) d += kv.second - 1;
+            return d;
+        };
+        struct Probe { V2Run fix, pre; std::vector<std::string> missFix, missPre; int dupFix = 0; };
+        auto runBoth = [&](const char* label, const std::wstring& film, const std::vector<UttMark>& m, uint64_t totalMs,
+                           const std::function<std::function<std::string(uint64_t, uint64_t, const std::string&)>(size_t&)>& mk) {
+            Probe p;
+            for (int pass = 0; pass < 2; ++pass) {
+                size_t n = 0;
+                g_fileNoHearCheckForTest = pass == 1;
+                const uint64_t jid = ++id;
+                V2Run r = driveV2(srv, cfg, m, fileOf(film, jid, ""), {}, 20000, nullptr, mk(n));
+                g_fileNoHearCheckForTest = false;
+                failures += checkV2Wire(r.lines, jid, label, {}, true, totalMs);
+                (pass == 0 ? p.fix : p.pre) = std::move(r);
+            }
+            p.missFix = missingIn(m, textOfRun(p.fix.lines));
+            p.missPre = missingIn(m, textOfRun(p.pre.lines));
+            p.dupFix  = duplicates(textOfRun(p.fix.lines));
+            std::printf("    %s: requests %zu (before F-RESUME %zu), missing%s (before%s), duplicated words %d; %u early stop / "
+                        "nothing-heard sent back, %u vouched after a second empty hearing\n", label, p.fix.asr.size(),
+                        p.pre.asr.size(), joinNames(p.missFix).c_str(), joinNames(p.missPre).c_str(), p.dupFix,
+                        p.fix.st.reheard, p.fix.st.unheardKept);
+            if (std::getenv("F_RESUME_CUES")) {          // (the cues and requests of a case, to read one by hand)
+                for (const auto& a : p.fix.asr) std::printf("      request %.2f-%.2f s\n", a.s / 16000.0, a.e / 16000.0);
+                for (const auto& c : cuesOfRun(p.fix.lines))
+                    std::printf("      cue %6.2f-%6.2f %s\n", c.startMs / 1000.0, c.endMs / 1000.0, c.src.c_str());
+            }
+            return p;
+        };
+        // was `ms` inside an FPROG range BEFORE the first cue holding `needle` went out (or at all, if none)?
+        auto vouchedBefore = [](const std::vector<std::string>& lines, const std::string& needle, uint64_t ms) {
+            for (const auto& l : lines) {
+                const auto t = trpipe::split(l);
+                trpipe::WireCue c; trpipe::WireFileProg p;
+                if (trpipe::unpackCue(t, c) && c.src.find(needle) != std::string::npos) return false;
+                if (trpipe::unpackFileProg(t, p)) {
+                    std::vector<trpipe::MsRange> r;
+                    trpipe::parseRanges(p.ranges, r);
+                    for (const auto& x : r) if (x.s <= ms && ms < x.e) return true;
+                }
+            }
+            return false;
+        };
+        // FILM A: twelve utterances of 2.6 s, 0.9 s apart (44 s; windows 0.80-10.85 pause, 11.30-38.85 pause, 39.30-44.00 eof)
+        const std::wstring filmA = std::wstring(tmpDir) + L"SuVtitle_selftest_fresume_A.wav";
+        std::vector<UttMark> um;
+        for (int i = 0; i < 12; ++i) { const double s = 1.0 + 3.5 * i; um.push_back({ "U" + std::to_string(i), s, s + 2.6 }); }
+        if (!writeFilm(filmA, 44.0, um, {})) {
+            ok(false, "F-RESUME: the synthetic film could not be written to %TEMP%");
+        } else {
+            const uint64_t u4s = (uint64_t)(um[4].s * 16000);
+            // A -- AN EARLY STOP (the measured defect): the second request writes U3 and stops
+            {
+                const Probe p = runBoth("A early stop", filmA, um, 44000, [&](size_t& n) {
+                    return whisperOf(um, n, [](size_t i, size_t k, uint64_t, uint64_t) { return k == 1 && i >= 4; }, {}); });
+                const bool early = vouchedBefore(p.fix.lines, "u4a", 15500);
+                ok(p.missFix.empty() && p.fix.asr.size() == p.pre.asr.size() && p.fix.st.reheard == 1 && !early,
+                   "F-RESUME A: whisper stops after U3 -- everything heard kept, the next window starts after it: every "
+                   "utterance gets its cue (before: U4-U10 lost, vouched), for no extra request, never vouched before its cue");
+            }
+            // B -- NOTHING HEARD: the first request writes nothing (an empty answer; then a credits line the nets drop)
+            for (int kind = 0; kind < 2; ++kind) {
+                const Probe p = runBoth(kind ? "B a credits line, dropped" : "B no word at all", filmA, um, 44000, [&](size_t& n) {
+                    return whisperOf(um, n, [](size_t, size_t k, uint64_t, uint64_t) { return k == 0; },
+                                     [kind](size_t k, uint64_t, uint64_t, std::string& doc) {
+                        if (k != 0 || !kind) return;
+                        doc = "{\"text\":\" Subtitles by the Amara.org community\",\"language\":\"english\",\"segments\":[{\"id\":0,"
+                              "\"text\":\" Subtitles by the Amara.org community\",\"start\":0.2,\"end\":9.0,\"words\":["
+                              "{\"word\":\" Subtitles\",\"start\":0.2,\"end\":1.0,\"t_dtw\":100,\"probability\":0.9},"
+                              "{\"word\":\" by\",\"start\":1.0,\"end\":1.4,\"t_dtw\":140,\"probability\":0.9},"
+                              "{\"word\":\" the\",\"start\":1.4,\"end\":1.8,\"t_dtw\":180,\"probability\":0.9},"
+                              "{\"word\":\" Amara.org\",\"start\":1.8,\"end\":3.0,\"t_dtw\":300,\"probability\":0.9},"
+                              "{\"word\":\" community\",\"start\":3.0,\"end\":4.0,\"t_dtw\":400,\"probability\":0.9}],"
+                              "\"temperature\":0.0,\"avg_logprob\":-0.2}],\"detected_language\":\"english\","
+                              "\"detected_language_probability\":0.99}";
+                    }); });
+                const bool same = p.fix.asr.size() >= 2 && p.fix.asr[0].s == p.fix.asr[1].s && p.fix.asr[0].e == p.fix.asr[1].e;
+                ok(p.missFix.empty() && same && p.fix.asr.size() == p.pre.asr.size() + 1 && subsetOf(p.missFix, p.missPre),
+                   std::string("F-RESUME B: a window whose speech yields ") + (kind ? "only a credits line (dropped)" : "no word")
+                   + " is heard once more -- the same window, one extra request -- and its speech gets its cues (before: U0-U2 lost)");
+            }
+            // C -- THE BOUND: whisper never writes a word (all music): every window heard exactly twice, the job ends
+            {
+                const Probe p = runBoth("C nothing ever written", filmA, um, 44000, [&](size_t& n) {
+                    return whisperOf(um, n, [](size_t, size_t, uint64_t, uint64_t) { return true; }, {}); });
+                std::set<std::pair<uint64_t, uint64_t>> distinct;
+                for (const auto& a : p.fix.asr) distinct.insert({ a.s, a.e });
+                ok(p.fix.asr.size() == 2 * distinct.size() && p.fix.asr.size() == 2 * p.pre.asr.size()
+                   && p.fix.st.unheardKept == distinct.size(),
+                   "F-RESUME C: a film whisper never writes a word of -- every window heard exactly twice, then vouched for: no loop");
+            }
+            // D -- CANCEL + RESUME (the reported shape): job 1 cancelled after its first window's cues; job 2 resumes with
+            //      `have` = job 1's last ranges, and whisper stops early in job 2's first window
+            {
+                std::vector<trpipe::MsRange> partial;
+                const uint64_t id1 = ++id;
+                bool cancelled = false;
+                size_t n1 = 0;
+                const V2Run r1 = driveV2(srv, cfg, um, fileOf(filmA, id1, ""), [&](Shared& sh, const V2Run& cur, int) {
+                    if (!cancelled && countKind(cur.lines, "FCUE") >= 3) {
+                        std::lock_guard<std::mutex> lk(sh.mx);
+                        sh.fileCancels.push_back(id1);
+                        cancelled = true;
+                    }
+                }, 20000, nullptr, whisperOf(um, n1, {}, {}));
+                failures += checkV2Wire(r1.lines, id1, "8e cancel", {}, false, 44000, &partial);
+                const std::string have = trpipe::packRanges(partial);
+                const uint64_t id2 = ++id;
+                size_t n2 = 0;
+                const V2Run r2 = driveV2(srv, cfg, um, fileOf(filmA, id2, have), {}, 20000, nullptr,
+                                         whisperOf(um, n2, [](size_t i, size_t k, uint64_t, uint64_t) { return k == 0 && i >= 4; }, {}));
+                failures += checkV2Wire(r2.lines, id2, "8e resume", partial, true, 44000);
+                const std::vector<std::string> miss = missingIn(um, textOfRun(r1.lines) + textOfRun(r2.lines));
+                std::printf("    D cancelled with ranges %s; the resume: %zu request(s), %u sent back; missing%s\n",
+                            have.c_str(), r2.asr.size(), r2.st.reheard, joinNames(miss).c_str());
+                ok(!partial.empty() && miss.empty() && r2.st.reheard == 1,
+                   "F-RESUME D: cancelled then resumed, whisper stopping early in the resumed job's window -- every utterance "
+                   "still gets its cue, the hole is heard again instead of recorded DONE");
+            }
+            // E -- WHAT THE RECORD SAYS: an early stop in the second window; the job is cancelled at the FIRST FPROG whose
+            //      ranges claim U4 (what a tray records as analysed) and resumed with those ranges as `have`
+            {
+                std::vector<trpipe::MsRange> partial;
+                const uint64_t id1 = ++id;
+                bool cancelled = false;
+                size_t n1 = 0;
+                const V2Run r1 = driveV2(srv, cfg, um, fileOf(filmA, id1, ""), [&](Shared& sh, const V2Run& cur, int) {
+                    if (cancelled) return;
+                    for (const auto& l : cur.lines) {
+                        trpipe::WireFileProg p;
+                        std::vector<trpipe::MsRange> rr;
+                        if (!trpipe::unpackFileProg(trpipe::split(l), p) || !trpipe::parseRanges(p.ranges, rr)) continue;
+                        for (const auto& x : rr) if (x.s <= 15500 && 15500 < x.e) cancelled = true;
+                    }
+                    if (cancelled) {
+                        std::lock_guard<std::mutex> lk(sh.mx);
+                        sh.fileCancels.push_back(id1);
+                    }
+                }, 20000, nullptr, whisperOf(um, n1, [](size_t i, size_t k, uint64_t, uint64_t) { return k == 1 && i >= 4; }, {}));
+                failures += checkV2Wire(r1.lines, id1, "8e cancel at U4", {}, false, 44000, &partial);
+                const std::string have = trpipe::packRanges(partial);
+                const uint64_t id2 = ++id;
+                size_t n2 = 0;
+                const V2Run r2 = driveV2(srv, cfg, um, fileOf(filmA, id2, have), {}, 20000, nullptr, whisperOf(um, n2, {}, {}));
+                failures += checkV2Wire(r2.lines, id2, "8e resume after U4", partial, true, 44000);
+                const std::vector<std::string> miss = missingIn(um, textOfRun(r1.lines) + textOfRun(r2.lines));
+                std::printf("    E cancelled at the first range claiming U4: ranges %s; with the resume, missing%s\n",
+                            have.c_str(), joinNames(miss).c_str());
+                ok(cancelled && miss.empty(),
+                   "F-RESUME E: the first range claiming what whisper skipped comes only once it was heard -- cancelled there "
+                   "and resumed, every utterance has its cue (the record never says analysed over unheard speech)");
+            }
+            // F1 -- review HIGH: whisper skips U4 in the second request (a gap between heard words), and every later request
+            //       holding U4's start hears nothing at all
+            {
+                const Probe p = runBoth("F1 a gap at U4, later hearings of it empty", filmA, um, 44000, [&](size_t& n) {
+                    return whisperOf(um, n, [u4s](size_t i, size_t k, uint64_t s, uint64_t e) {
+                        if (k == 1) return i == 4;
+                        return k >= 2 && s <= u4s && u4s < e;
+                    }, {}); });
+                ok(subsetOf(p.missFix, p.missPre) && p.missFix.size() == 1 && p.fix.asr.size() == p.pre.asr.size(),
+                   "F-RESUME F1: never more loss than before -- a gap between heard words is not sent back, so no later hearing "
+                   "can lose what the first had (before: U4 lost; the first design lost U4-U11)");
+            }
+            // F2 -- review HIGH: the first hearing skips U0 (the window's head); a second hearing would skip U0 AND U1
+            {
+                const Probe p = runBoth("F2 the head U0 skipped", filmA, um, 44000, [&](size_t& n) {
+                    return whisperOf(um, n, [](size_t i, size_t k, uint64_t, uint64_t) {
+                        if (k == 0) return i == 0;
+                        if (k == 1) return i == 0 || i == 1;
+                        return false;
+                    }, {}); });
+                ok(subsetOf(p.missFix, p.missPre) && p.missFix.size() == 1 && p.fix.asr.size() == p.pre.asr.size(),
+                   "F-RESUME F2: never more loss than before -- a window's head is never sent back, nothing the first hearing "
+                   "wrote is replaced (before: U0 lost; the first design lost U0 and U1)");
+            }
+            // F2b -- review HIGH: a gap at U4; a later hearing would skip U4 and U5
+            {
+                const Probe p = runBoth("F2b a gap at U4, a later hearing worse", filmA, um, 44000, [&](size_t& n) {
+                    return whisperOf(um, n, [](size_t i, size_t k, uint64_t, uint64_t) {
+                        if (k == 1) return i == 4;
+                        if (k == 2) return i == 4 || i == 5;
+                        return false;
+                    }, {}); });
+                ok(subsetOf(p.missFix, p.missPre) && p.missFix.size() == 1 && p.fix.asr.size() == p.pre.asr.size(),
+                   "F-RESUME F2b: never more loss than before (before: U4 lost; the first design lost U4 and U5)");
+            }
+            // F6 -- review MEDIUM 4: an early stop after U3 closed by a " ." segment ending 0.3 s before the window's end
+            {
+                const Probe p = runBoth("F6 an early stop closed by \" .\" to the window's end", filmA, um, 44000, [&](size_t& n) {
+                    return whisperOf(um, n, [](size_t i, size_t k, uint64_t, uint64_t) { return k == 1 && i >= 4; },
+                                     [](size_t k, uint64_t s, uint64_t e, std::string& doc) {
+                        if (k != 1) return;
+                        const double ws = (double)s / 16000.0, a = 14.1 - ws, z = (double)(e - s) / 16000.0 - 0.3;
+                        char seg[400];
+                        std::snprintf(seg, sizeof(seg), ",{\"id\":9,\"text\":\" .\",\"start\":%.2f,\"end\":%.2f,\"words\":["
+                                      "{\"word\":\" .\",\"start\":%.2f,\"end\":%.2f,\"t_dtw\":%lld,\"probability\":0.5}],"
+                                      "\"temperature\":0.0,\"avg_logprob\":-0.6}", a, z, a, a + 0.1, (long long)std::llround((a + 0.1) * 100));
+                        const size_t at = doc.find("],\"detected_language\"");
+                        if (at != std::string::npos) doc.insert(at, seg);
+                    }); });
+                ok(p.missFix.empty() && p.missPre.size() == 7 && p.fix.asr.size() == p.pre.asr.size(),
+                   "F-RESUME F6: CLOSED -- a \" .\" after the last heard word covers nothing: the early stop is heard again "
+                   "and U4-U10 get their cues (before: lost)");
+            }
+            // F7 -- the first request hears nothing and the job is cancelled before its second hearing; then resumed
+            {
+                std::vector<trpipe::MsRange> partial;
+                const uint64_t jid = ++id;
+                bool cancelled = false;
+                size_t n = 0;
+                const V2Run r1 = driveV2(srv, cfg, um, fileOf(filmA, jid, ""), [&](Shared& sh, const V2Run& cur, int) {
+                    if (!cancelled && cur.asr.size() == 1) { std::lock_guard<std::mutex> lk(sh.mx); sh.fileCancels.push_back(jid); cancelled = true; }
+                }, 20000, nullptr, whisperOf(um, n, [](size_t, size_t k, uint64_t, uint64_t) { return k == 0; }, {}));
+                failures += checkV2Wire(r1.lines, jid, "F7 cancel", {}, false, 44000, &partial);
+                bool u0In = false;
+                for (const auto& x : partial) u0In = u0In || (x.s <= 2000 && 2000 < x.e);
+                const uint64_t id2 = ++id;
+                size_t n2 = 0;
+                const V2Run r2 = driveV2(srv, cfg, um, fileOf(filmA, id2, trpipe::packRanges(partial)), {}, 20000, nullptr,
+                                         whisperOf(um, n2, {}, {}));
+                failures += checkV2Wire(r2.lines, id2, "F7 resume", partial, true, 44000);
+                const std::vector<std::string> miss = missingIn(um, textOfRun(r1.lines) + textOfRun(r2.lines));
+                std::printf("    F7 nothing heard, cancelled before the second hearing: ranges \"%s\" (U0 inside: %s); resumed, missing%s\n",
+                            trpipe::packRanges(partial).c_str(), u0In ? "YES" : "no", joinNames(miss).c_str());
+                ok(cancelled && !u0In && miss.empty(),
+                   "F-RESUME F7: a window waiting for its second hearing is never reported analysed; the resume subtitles it");
+            }
+            // F8b -- review MEDIUM 3 at a REAL seam: an early stop after U3 whose last word DTW ends 0.15 s early, so the
+            //        window after the cut starts INSIDE it and whisper writes it again as its first word -- the same audio
+            //        (round 3: dropped only within kSeamCopySec of the seam; further away a word may be said twice)
+            {
+                const Probe p = runBoth("F8b the same word heard again at an early stop's seam", filmA, um, 44000, [&](size_t& n) {
+                    return whisperOf(um, n, [](size_t i, size_t k, uint64_t, uint64_t) { return k == 1 && i >= 4; },
+                                     [](size_t k, uint64_t s, uint64_t, std::string& doc) {
+                        if (k == 1) {                                     // the last word's DTW end, 0.15 s early
+                            const size_t t = doc.rfind("\"t_dtw\":");
+                            if (t == std::string::npos) return;
+                            const size_t v0 = t + 8, v1 = doc.find(',', v0);
+                            const long long dt = std::atoll(doc.substr(v0, v1 - v0).c_str());
+                            doc.replace(v0, v1 - v0, std::to_string(dt - 15));
+                        } else if (k == 2) {                              // the window after the seam: that word's rest, again
+                            const double z = 14.1 - (double)s / 16000.0;
+                            if (z <= 0.0 || z > 1.0) return;
+                            char seg[300];
+                            std::snprintf(seg, sizeof(seg), "{\"id\":99,\"text\":\" u3g.\",\"start\":0.00,\"end\":%.2f,\"words\":["
+                                          "{\"word\":\" u3g.\",\"start\":0.00,\"end\":%.2f,\"t_dtw\":%lld,\"probability\":0.9}],"
+                                          "\"temperature\":0.0,\"avg_logprob\":-0.1},", z, z, (long long)std::llround(z * 100.0));
+                            const size_t at = doc.find("\"segments\":[");
+                            if (at != std::string::npos) doc.insert(at + 12, seg);
+                        }
+                    }); });
+                ok(p.missFix.empty() && p.dupFix == 0,
+                   "F-RESUME F8b: the last word heard again AT an early stop's seam is dropped -- no word twice");
+            }
+            // F9 -- review round 2, MEDIUM 1: an early stop after U3; the window that hears U4 again answers NOTHING
+            {
+                const Probe p = runBoth("F9 early stop after U3, the next hearing empty", filmA, um, 44000, [&](size_t& n) {
+                    return whisperOf(um, n, [u4s](size_t i, size_t k, uint64_t s, uint64_t e) {
+                        if (k == 1) return i >= 4;
+                        return k >= 2 && s <= u4s && u4s < e;
+                    }, {}); });
+                ok(subsetOf(p.missFix, p.missPre) && p.fix.asr.size() <= p.pre.asr.size() + 1,
+                   "F-RESUME F9: an empty second hearing vouches only what was heard twice -- never more loss than before "
+                   "(U11, heard once, gets its own hearing; round 2 lost it)");
+            }
+            // F9b -- review round 2, MEDIUM 1: the FIRST window writes U0 and stops; the window hearing U1 again answers nothing
+            {
+                const uint64_t u1s = (uint64_t)(um[1].s * 16000);
+                const Probe p = runBoth("F9b early stop after U0, the next hearing empty", filmA, um, 44000, [&](size_t& n) {
+                    return whisperOf(um, n, [u1s](size_t i, size_t k, uint64_t s, uint64_t e) {
+                        if (k == 0) return i >= 1;
+                        return k >= 1 && s <= u1s && u1s < e;
+                    }, {}); });
+                ok(p.missFix == p.missPre && p.fix.asr.size() <= p.pre.asr.size() + 1,
+                   "F-RESUME F9b: the same loss as before (U1 U2; round 2 lost U1-U8), one extra request at most");
+            }
+            // F13 -- review round 2: a RESUMED job (have = 20-44 s) whose run ends at its LIMIT 20.0 s, U5 running across it
+            //        (a post-roll); whisper stops early (after U3) in that limit window
+            {
+                Probe p;
+                const std::string have = "20000-44000";
+                std::vector<trpipe::MsRange> haveR;
+                trpipe::parseRanges(have, haveR);
+                for (int pass = 0; pass < 2; ++pass) {
+                    size_t n = 0;
+                    g_fileNoHearCheckForTest = pass == 1;
+                    const uint64_t jid = ++id;
+                    V2Run r = driveV2(srv, cfg, um, fileOf(filmA, jid, have), {}, 20000, nullptr,
+                                      whisperOf(um, n, [](size_t i, size_t k, uint64_t, uint64_t) { return k == 0 && i >= 4; }, {}));
+                    g_fileNoHearCheckForTest = false;
+                    failures += checkV2Wire(r.lines, jid, "F13", haveR, true, 44000);
+                    (pass == 0 ? p.fix : p.pre) = std::move(r);
+                }
+                const std::vector<UttMark> before20(um.begin(), um.begin() + 6);       // U0-U5 (U5 straddles the limit)
+                p.missFix = missingIn(before20, textOfRun(p.fix.lines));
+                p.missPre = missingIn(before20, textOfRun(p.pre.lines));
+                std::printf("    F13 resumed, an early stop in the limit window: requests %zu (before %zu), missing before the limit%s "
+                            "(before%s)\n", p.fix.asr.size(), p.pre.asr.size(), joinNames(p.missFix).c_str(), joinNames(p.missPre).c_str());
+                ok(p.missFix.empty() && !p.missPre.empty() && p.fix.asr.size() == p.pre.asr.size() + 1,
+                   "F-RESUME F13: an early stop in a run's LIMIT window (with its post-roll) is heard again up to the limit -- "
+                   "U4 U5 get their cues (before: lost)");
+            }
+        }
+        // F3 -- review MEDIUM 2: FILM B, twelve lines of 2.0 s, each followed by 0.7 s of floor, a 1.5 s sound effect, 0.7 s;
+        //       whisper writes every line and nothing over the effects (the cost on film-like audio)
+        {
+            const std::wstring filmB = std::wstring(tmpDir) + L"SuVtitle_selftest_fresume_B.wav";
+            std::vector<UttMark> lines, fx;
+            for (int i = 0; i < 12; ++i) {
+                const double s = 1.0 + 4.9 * i;
+                lines.push_back({ "L" + std::to_string(i), s, s + 2.0 });
+                fx.push_back({ "X" + std::to_string(i), s + 2.7, s + 4.2 });
+            }
+            if (writeFilm(filmB, 61.0, lines, fx)) {
+                const Probe p = runBoth("F3 a 1.5 s effect after every line", filmB, lines, 61000, [&](size_t& n) {
+                    return whisperOf(lines, n, {}, {}); });
+                ok(p.missFix.empty() && p.fix.asr.size() <= p.pre.asr.size() + 1,
+                   "F-RESUME F3: effects between lines cost at most one extra request (the first design: 13 requests for 3)");
+            } else ok(false, "F-RESUME: film B could not be written to %TEMP%");
+            ::DeleteFileW(filmB.c_str());
+        }
+        // F4 -- review MEDIUM 2: FILM C, 20 s of loud music; whisper hears it as Portuguese ("E ai! E ai!", p 0.6), and
+        //       forced into the pair writes a credits line
+        {
+            const std::wstring filmC = std::wstring(tmpDir) + L"SuVtitle_selftest_fresume_C.wav";
+            const std::vector<UttMark> mus = { { "M", 1.0, 21.0 } };
+            if (writeFilm(filmC, 23.0, mus, {})) {
+                const Probe p = runBoth("F4 music heard as pt, forced = a credits line", filmC, mus, 23000, [&](size_t&) {
+                    return [](uint64_t, uint64_t, const std::string&) -> std::string {
+                        if (g_fileAsrLangSentForTest == "auto")
+                            return "{\"text\":\" E a\xc3\xad! E a\xc3\xad!\",\"language\":\"portuguese\",\"segments\":[{\"id\":0,"
+                                   "\"text\":\" E a\xc3\xad! E a\xc3\xad!\",\"start\":0.3,\"end\":2.3,\"words\":["
+                                   "{\"word\":\" E\",\"start\":0.3,\"end\":0.6,\"t_dtw\":60,\"probability\":0.9},"
+                                   "{\"word\":\" a\xc3\xad!\",\"start\":0.6,\"end\":1.2,\"t_dtw\":120,\"probability\":0.9},"
+                                   "{\"word\":\" E\",\"start\":1.2,\"end\":1.6,\"t_dtw\":160,\"probability\":0.9},"
+                                   "{\"word\":\" a\xc3\xad!\",\"start\":1.6,\"end\":2.3,\"t_dtw\":230,\"probability\":0.9}],"
+                                   "\"temperature\":0.0,\"avg_logprob\":-0.3}],\"detected_language\":\"portuguese\","
+                                   "\"detected_language_probability\":0.6}";
+                        return "{\"text\":\" Sous-titrage Soci\xc3\xa9t\xc3\xa9 Radio-Canada\",\"language\":\"english\",\"segments\":[{\"id\":0,"
+                               "\"text\":\" Sous-titrage Soci\xc3\xa9t\xc3\xa9 Radio-Canada\",\"start\":0.3,\"end\":2.3,\"words\":["
+                               "{\"word\":\" Sous-titrage\",\"start\":0.3,\"end\":1.0,\"t_dtw\":100,\"probability\":0.9},"
+                               "{\"word\":\" Soci\xc3\xa9t\xc3\xa9\",\"start\":1.0,\"end\":1.6,\"t_dtw\":160,\"probability\":0.9},"
+                               "{\"word\":\" Radio-Canada\",\"start\":1.6,\"end\":2.3,\"t_dtw\":230,\"probability\":0.9}],"
+                               "\"temperature\":0.0,\"avg_logprob\":-0.3}],\"detected_language\":\"english\","
+                               "\"detected_language_probability\":0.6}";
+                    }; });
+                ok(p.fix.asr.size() == p.pre.asr.size() && cuesOfRun(p.fix.lines).empty() && p.fix.st.unheardKept == 1,
+                   "F-RESUME F4: music heard outside the pair then forced into it -- the forced decode IS its second hearing: "
+                   "no further request (the first design: 4 decodes for 2)");
+            } else ok(false, "F-RESUME: film C could not be written to %TEMP%");
+            ::DeleteFileW(filmC.c_str());
+        }
+        // F5 -- review LOW: FILM D, a line, then four 0.8 s replies 0.7 s apart that whisper skips (a gap between heard lines)
+        {
+            const std::wstring filmD = std::wstring(tmpDir) + L"SuVtitle_selftest_fresume_D.wav";
+            const std::vector<UttMark> m = { { "U0", 1.0, 3.6 }, { "S1", 4.3, 5.1 }, { "S2", 5.8, 6.6 }, { "S3", 7.3, 8.1 },
+                                             { "S4", 8.8, 9.6 }, { "U5", 12.0, 14.6 }, { "U6", 15.5, 18.1 }, { "U7", 19.0, 21.6 } };
+            if (writeFilm(filmD, 24.0, m, {})) {
+                const Probe p = runBoth("F5 four short replies skipped between two lines", filmD, m, 24000, [&](size_t& n) {
+                    return whisperOf(m, n, [](size_t i, size_t k, uint64_t, uint64_t) { return k == 0 && i >= 1 && i <= 4; }, {}); });
+                ok(p.missFix == p.missPre && p.fix.asr.size() == p.pre.asr.size(),
+                   "F-RESUME F5: ACCEPTED, by design -- replies skipped BETWEEN two heard lines are a gap, never sent back "
+                   "(F3: that is what effects, music and laughter between lines look like); the same loss as before, no request");
+            } else ok(false, "F-RESUME: film D could not be written to %TEMP%");
+            ::DeleteFileW(filmD.c_str());
+        }
+        // F8 -- review MEDIUM 3: FILM E, 8.3 s of music, then five lines; DTW puts a window's FIRST word (one token) 0.6 s
+        //       into the window when the window opens on the music
+        {
+            const std::wstring filmE = std::wstring(tmpDir) + L"SuVtitle_selftest_fresume_E.wav";
+            std::vector<UttMark> m;
+            for (int i = 0; i < 5; ++i) { const double s = 10.0 + 3.5 * i; m.push_back({ "U" + std::to_string(i), s, s + 2.6 }); }
+            if (writeFilm(filmE, 30.0, m, { { "MUS", 1.0, 9.3 } })) {
+                const Probe p = runBoth("F8 a first word DTW puts over the music intro", filmE, m, 30000, [&](size_t& n) {
+                    return whisperOf(m, n, {}, [](size_t, uint64_t s, uint64_t, std::string& doc) {
+                        if ((double)s / 16000.0 >= 9.3 - 1.0) return;
+                        const size_t a = doc.find("\"t_dtw\":", doc.find("\"words\":["));
+                        const size_t te = a == std::string::npos ? std::string::npos : doc.find(',', a);
+                        if (te != std::string::npos) doc.replace(a, te - a, "\"t_dtw\":60");
+                    }); });
+                ok(p.missFix.empty() && p.dupFix == 0 && p.fix.asr.size() <= p.pre.asr.size() + 1,
+                   "F-RESUME F8: a misplaced first word is never a reason to cut -- no word twice (the first design: \"u0a\" x12)");
+            } else ok(false, "F-RESUME: film E could not be written to %TEMP%");
+            ::DeleteFileW(filmE.c_str());
+        }
+        // ---- review round 2's films: a whisper document from explicit words (media seconds, one segment per entry, DTW =
+        //      each word's end) -- the words a request HEARS are those that start inside it ----
+        struct PW { std::string t; double s, e; };
+        auto docFrom = [](const std::vector<std::vector<PW>>& segsIn, uint64_t s, uint64_t e) {
+            const double ws = (double)s / 16000.0, we = (double)e / 16000.0;
+            std::string out, text;
+            int sid = 0;
+            char b[300];
+            for (const auto& sg : segsIn) {
+                std::string words, st;
+                double first = -1, last = -1;
+                for (const auto& w : sg) {
+                    if (w.s < ws - 1e-9 || w.s >= we - 0.02) continue;
+                    const double zz = std::min(w.e, we);
+                    std::snprintf(b, sizeof(b), "%s{\"word\":\"%s\",\"start\":%.2f,\"end\":%.2f,\"t_dtw\":%lld,\"probability\":0.9}",
+                                  words.empty() ? "" : ",", w.t.c_str(), w.s - ws, zz - ws, (long long)std::llround((zz - ws) * 100.0));
+                    words += b;
+                    st += w.t;
+                    if (first < 0) first = w.s - ws;
+                    last = zz - ws;
+                }
+                if (words.empty()) continue;
+                std::snprintf(b, sizeof(b), "%s{\"id\":%d,\"text\":\"", out.empty() ? "" : ",", sid++);
+                out += b + st;
+                std::snprintf(b, sizeof(b), "\",\"start\":%.2f,\"end\":%.2f,\"tokens\":[],\"words\":[", first, last);
+                out += b + words + "],\"temperature\":0.0,\"avg_logprob\":-0.1,\"no_speech_prob\":0.0}";
+                text += st;
+            }
+            return "{\"task\":\"transcribe\",\"language\":\"english\",\"duration\":" + std::to_string(we - ws) + ",\"text\":\"" + text
+                 + "\",\"segments\":[" + out + "],\"detected_language\":\"english\",\"detected_language_probability\":0.99}";
+        };
+        // F10 / F10b -- review round 2, LOW 4: FILM F, eight lines of 2.6 s, each followed AT ONCE by a 3.5 s applause then
+        //               0.6 s of floor; whisper writes every line -- and (b) its own " [Applause]" over every applause
+        {
+            const std::wstring filmF = std::wstring(tmpDir) + L"SuVtitle_selftest_fresume_F.wav";
+            std::vector<UttMark> lines, fx;
+            for (int i = 0; i < 8; ++i) {
+                const double s = 1.0 + 6.7 * i;
+                lines.push_back({ "L" + std::to_string(i), s, s + 2.6 });
+                fx.push_back({ "X" + std::to_string(i), s + 2.6, s + 6.1 });
+            }
+            if (writeFilm(filmF, 56.0, lines, fx)) {
+                for (int tags = 0; tags < 2; ++tags) {
+                    std::vector<std::vector<PW>> segsIn;
+                    for (size_t i = 0; i < lines.size(); ++i) {
+                        std::vector<PW> sg;
+                        for (int k = 0; k < 6; ++k)
+                            sg.push_back({ " u" + std::to_string(i) + (char)('a' + k) + (k == 5 ? "." : ""),
+                                           lines[i].s + 0.4 * k, lines[i].s + 0.4 * (k + 1) });
+                        segsIn.push_back(sg);
+                        if (tags) segsIn.push_back({ { " [Applause]", fx[i].s + 0.1, fx[i].e - 0.1 } });
+                    }
+                    const Probe p = runBoth(tags ? "F10b a 3.5 s applause after every line, TAGGED \" [Applause]\""
+                                                 : "F10 a 3.5 s applause after every line, untagged", filmF, lines, 56000, [&](size_t&) {
+                        return [segsIn, &docFrom](uint64_t s, uint64_t e, const std::string&) { return docFrom(segsIn, s, e); }; });
+                    if (tags)
+                        ok(p.missFix.empty() && p.fix.asr.size() == p.pre.asr.size(),
+                           "F-RESUME F10b: whisper's own \" [Applause]\" after a line's last word covers its span -- no request more "
+                           "(round 2: 5 for 3)");
+                    else
+                        ok(p.missFix.empty() && p.fix.asr.size() <= p.pre.asr.size() + 2 && p.fix.st.cutCapped >= 1,
+                           "F-RESUME F10: an UNTAGGED 3.5 s applause after a line looks like an early stop: heard again, two extra "
+                           "requests at most, the chain capped at kMaxCutChain");
+                }
+            } else ok(false, "F-RESUME: film F could not be written to %TEMP%");
+            ::DeleteFileW(filmF.c_str());
+        }
+        // F11 -- review round 2, LOW 3: FILM G, continuous sound (HARD windows); the hard cut falls between "...Well I said
+        //        no." and "No, I won't do it now." -- a word really said twice, 0.3 s apart
+        {
+            const std::wstring filmG = std::wstring(tmpDir) + L"SuVtitle_selftest_fresume_G.wav";
+            const std::vector<UttMark> tone = { { "T", 0.5, 62.0 } };
+            if (writeFilm(filmG, 63.0, tone, {})) {
+                std::vector<std::vector<PW>> segsIn;
+                for (int j = 0; j < 5; ++j) {
+                    std::vector<PW> sg;
+                    for (int k = 0; k < 12; ++k) {
+                        const double a = 0.5 + 5.0 * j + 0.4 * k;
+                        sg.push_back({ " a" + std::to_string(j) + (char)('a' + k) + (k == 11 ? "." : ""), a, a + 0.4 });
+                    }
+                    segsIn.push_back(sg);
+                }
+                segsIn.push_back({ { " Well", 25.5, 25.9 }, { " I", 25.9, 26.3 }, { " said", 26.3, 26.7 }, { " no.", 26.7, 27.1 } });
+                segsIn.push_back({ { " No,", 27.4, 27.8 }, { " I", 27.8, 28.2 }, { " won't", 28.2, 28.6 }, { " do", 28.6, 29.0 },
+                                   { " it", 29.0, 29.4 }, { " now.", 29.4, 29.8 } });
+                for (int j = 0; j < 6; ++j) {
+                    std::vector<PW> sg;
+                    for (int k = 0; k < 12; ++k) {
+                        const double a = 30.5 + 5.0 * j + 0.4 * k;
+                        sg.push_back({ " b" + std::to_string(j) + (char)('a' + k) + (k == 11 ? "." : ""), a, a + 0.4 });
+                    }
+                    segsIn.push_back(sg);
+                }
+                const Probe p = runBoth("F11 a hard cut between \"no.\" and \"No,\"", filmG, tone, 63000, [&](size_t&) {
+                    return [segsIn, &docFrom](uint64_t s, uint64_t e, const std::string&) { return docFrom(segsIn, s, e); }; });
+                const std::string all = textOfRun(p.fix.lines);
+                ok(all.find("No, I won't do it now.") != std::string::npos && all == textOfRun(p.pre.lines),
+                   "F-RESUME F11: a word said twice across a HARD cut stays (\"No, I won't do it now.\"; round 2 dropped \"No,\")");
+            } else ok(false, "F-RESUME: film G could not be written to %TEMP%");
+            ::DeleteFileW(filmG.c_str());
+        }
+        // F12c -- review round 2, MEDIUM 2: FILM H, 60 s of loud music with a 0.5 s break every 10 s, then 40 s of near-silence;
+        //         whisper writes ONE short word 0.3 s into every request it is sent ("Whoa", then "you") and nothing else
+        for (int word = 0; word < 2; ++word) {
+            const std::wstring filmH = std::wstring(tmpDir) + L"SuVtitle_selftest_fresume_H.wav";
+            std::vector<UttMark> mus;
+            for (int j = 0; j < 6; ++j) mus.push_back({ "M" + std::to_string(j), 1.0 + 10.0 * j, 10.5 + 10.0 * j });
+            if (writeFilm(filmH, 102.0, {}, mus)) {
+                const std::string wtxt = word ? " you" : " Whoa";
+                const Probe p = runBoth(word ? "F12c music with breaks, \" you\" at every request's start"
+                                             : "F12c music with breaks, \" Whoa\" at every request's start", filmH, mus, 102000, [&](size_t&) {
+                    return [wtxt, &docFrom](uint64_t s, uint64_t e, const std::string&) {
+                        const double ws = (double)s / 16000.0;
+                        if (ws > 62.0) return docFrom({}, s, e);
+                        return docFrom({ { { wtxt, ws + 0.3, ws + 0.7 } } }, s, e);
+                    }; });
+                ok(p.fix.asr.size() <= 2 * p.pre.asr.size() && p.fix.st.cutCapped == 0,
+                   std::string("F-RESUME F12c (") + wtxt + "): no crawl -- every window heard twice at most (round 2: 34 and 18 "
+                   "requests for 4)");
+            } else ok(false, "F-RESUME: film H could not be written to %TEMP%");
+            ::DeleteFileW(filmH.c_str());
+        }
+        ::DeleteFileW(filmA.c_str());
+        std::printf("    %s\n", failures == before ? "the rules / early stop / nothing heard / the bound / cancel + resume / the record "
+                                                    "/ review F1-F8 OK" : "SEE FAILURES ABOVE");
+    }
+
     // ---------------------------------------------------------------- [8d]
     std::printf("\n[8d] FILE MODE v2 -- live (the real models)\n");
     if (!live) { std::printf("    NOT RUN: offline pass\n"); return; }
@@ -7031,7 +10478,7 @@ void seedSelftest(int& failures) {
 
     // 1. the first start: seeded -- the pair, the direction (zh2en read as b2a), the alias, the preset; ONLY those
     const std::string kApb = "# AudioPB Translator config v2\nPRESET\tquality\nMODE\tzh2en\nLANGA\ten\nLANGB\tzh-TW\n"
-                             "MTCONTEXT\t3\nSPKON\t1\nWINPOS\t10 20 800 600\n";
+                             "MTCONTEXT\t3\nSPKON\t0\nSPKTHRESH\t0.6\nWINPOS\t10 20 800 600\n";
     ::DeleteFileW(own.c_str());
     put(apb, kApb);
     std::string why;
@@ -7045,8 +10492,13 @@ void seedSelftest(int& failures) {
        && e1.find("\nPRESET\tquality\n") != std::string::npos,
        "... engine.txt is written with them, under its own header");
     ok(e1.find("MTCONTEXT\t3") == std::string::npos && e1.find("WINPOS") == std::string::npos
-       && e1.find("SPKON") == std::string::npos,
-       "... and ONLY them: nothing else of AudioPB's file comes along (MTCONTEXT, WINPOS, SPKON)");
+       && e1.find("\nSPKON\t1\n") != std::string::npos && e1.find("\nSPKTHRESH\t0.5\n") != std::string::npos,
+       "... and ONLY them: nothing else of AudioPB's file comes along (MTCONTEXT, WINPOS; its live TUNING SPKON 0 / "
+       "SPKTHRESH 0.6 neither -- engine.txt writes its own defaults, SuVtitle 1.1.0)");
+    ok(c1.liveLangA == "en" && c1.liveLangB == "zh-tw" && c1.liveMode == "b2a"
+       && e1.find("\nLIVELANGA\ten\n") != std::string::npos && e1.find("\nLIVELANGB\tzh-tw\n") != std::string::npos
+       && e1.find("\nLIVEMODE\tb2a\n") != std::string::npos,
+       "first start: the LIVE pair seeded from the same file too (SuVtitle 1.1.0), and written");
     ok(get(apb) == kApb, "AudioPB's translator.txt is untouched (read only)");
 
     // 2. the second start: engine.txt exists -> never again, whatever AudioPB's file says by then
@@ -7227,6 +10679,55 @@ void seedSelftest(int& failures) {
            "RV3-2: a 100 MB newline-less engine.txt -> 1 MB read at most, the defaults, the file rewritten small");
     }
 
+    // 9. SuVtitle 1.1.0, THE LIVE PAIR: an engine.txt WITHOUT one (a 1.0.0 file) takes AudioPB's live pair -- read only,
+    //    all or nothing -- else the player's; one WITH it is never re-seeded, and is validated like the player's; a test
+    //    engine copies the player's pair and reads nothing.
+    {
+        const std::string v100 = "# SuVtitle Engine config v1\nPRESET\tbalanced\nMODE\tauto\nLANGA\tes\nLANGB\tfr\nDEVICE\tauto\n";
+        const std::string kApbLive = "# AudioPB Translator config v2\nPRESET\tlight\nMODE\ta2b\nLANGA\tfr\nLANGB\tzh-TW\nSPKON\t0\n";
+        std::string lw;
+        put(own, v100);
+        put(apb, kApbLive);
+        const TrConfig a = startConfig(false, "", "", &why, &lw);
+        std::printf("    1.0.0 engine.txt    -> %s\n", lw.c_str());
+        const std::string ea = get(own);
+        ok(a.liveLangA == "fr" && a.liveLangB == "zh-tw" && a.liveMode == "a2b" && a.langA == "es" && a.langB == "fr"
+           && a.mode == "auto" && a.preset == "balanced" && why.empty() && lw.find("AudioPB") != std::string::npos
+           && ea.find("\nLIVELANGB\tzh-tw\n") != std::string::npos && ea.find("\nLANGB\tfr\n") != std::string::npos,
+           "1.0.0 engine.txt: the LIVE pair from AudioPB's translator.txt (fr/zh-tw a2b), the player's untouched (es/fr), written");
+        ok(get(apb) == kApbLive && ea.find("\nSPKON\t1\n") != std::string::npos,
+           "... AudioPB's file untouched (read only), and none of its live tuning taken (SPKON 0 -> the engine's 1)");
+        put(apb, "# AudioPB Translator config v2\nLANGA\tde\nLANGB\tit\n");
+        const TrConfig b = startConfig(false, "", "", &why, &lw);
+        ok(lw.empty() && b.liveLangA == "fr" && b.liveLangB == "zh-tw" && get(own) == ea,
+           "... and never again: the live pair is in engine.txt now (the file byte for byte)");
+
+        put(own, v100);
+        put(apb, "# AudioPB Translator config v2\nPRESET\tlight\nMODE\tb2a\n");
+        const TrConfig c = startConfig(false, "", "", &why, &lw);
+        std::printf("    no AudioPB pair     -> %s\n", lw.c_str());
+        ok(c.liveLangA == "es" && c.liveLangB == "fr" && c.liveMode == "auto" && lw.find("the player's") != std::string::npos,
+           "translator.txt with no pair: the live pair = the player's (es/fr auto)");
+
+        put(own, v100);
+        put(apb, "# AudioPB Translator config v2\nLANGA\tfr\nLANGB\tklingon\n");
+        const TrConfig d = startConfig(false, "", "", &why, &lw);
+        ok(d.liveLangA == "es" && d.liveLangB == "fr" && lw.find("klingon") != std::string::npos,
+           "translator.txt whose pair does not read: the player's, all or nothing, and the log line says why");
+
+        put(own, v100 + "LIVEMODE\tsideways\nLIVELANGA\tde\nLIVELANGB\tDE\n");
+        const TrConfig e = startConfig(false, "", "", &why, &lw);
+        ok(lw.empty() && e.liveLangA == TrConfig{}.liveLangA && e.liveLangB == TrConfig{}.liveLangB && e.liveMode == "auto"
+           && e.langA == "es",
+           "engine.txt's own LIVE* lines are read like LANGA / LANGB / MODE (one language twice, a bad direction: the "
+           "defaults), and never re-seeded");
+
+        ::DeleteFileW(own.c_str());
+        put(apb, kApbLive);
+        const TrConfig f = startConfig(true, "", "", &why, &lw);
+        ok(lw.empty() && f.liveLangA == f.langA && f.liveLangB == f.langB && f.liveMode == f.mode && !exists(own),
+           "a test engine: the live pair = the player's, nothing of AudioPB's read, nothing written");
+    }
     ::DeleteFileW(own.c_str());
     ::DeleteFileW(apb.c_str());
     ::RemoveDirectoryW(recDir.c_str());
@@ -7383,31 +10884,1326 @@ void payloadSelftest(int& failures) {
         ok(p3.ok() && p3.devPayload && under(p3.whisperExe, base + L"\\full\\") && under(p3.llamaExe, d + L"\\"),
            "WHISPERBIN in engine.txt fills the dev payload's missing whisper");
     }
+    {   // SuVtitle 1.1.0, THE DIARIZATION RUNTIME: from the same source as the rest (never a mix), optional, under either name
+        const std::wstring r = layout(L"spk_bundle", 2, 2, 1);
+        mkdir(r + L"engine\\sherpa");
+        touch(r + L"engine\\sherpa\\sherpa-onnx-c-api.dll");
+        touch(r + L"models\\3dspeaker_campplus_zh_en_advanced.onnx");
+        const std::wstring d = devLayout(L"spk_dev", 2, 2, 1);
+        mkdir(d + L"\\sherpa");
+        touch(d + L"\\sherpa\\sherpa-onnx-c-api.dll");
+        touch(d + L"\\models\\3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx");   // Hugging Face's name only
+        const TrPaths pb = resolvePathsAt(none, r, d);
+        ok(pb.ok() && under(pb.sherpaDir, r) && under(pb.spkModel, r)
+           && pb.spkModel.find(L"3dspeaker_campplus_zh_en_advanced.onnx") != std::wstring::npos,
+           "the bundle's sherpa and speaker model (the dev payload beside it is not consulted)");
+        const TrPaths pd = resolvePathsAt(none, layout(L"spk_empty", 0, 0, 0), d);
+        ok(pd.ok() && pd.devPayload && under(pd.sherpaDir, d + L"\\")
+           && pd.spkModel.find(L"16k-common_advanced.onnx") != std::wstring::npos,
+           "the dev payload's sherpa, and the speaker model under Hugging Face's own name");
+        const TrPaths pn = resolvePathsAt(none, layout(L"spk_none", 2, 2, 1), d);
+        ok(pn.ok() && pn.missing.empty() && pn.sherpaDir.empty() && !under(pn.spkModel, d + L"\\"),
+           "a bundle with no sherpa: no diarization runtime (never borrowed from the dev payload), the payload still whole");
+        const std::wstring rh = layout(L"spk_half", 2, 2, 1);
+        mkdir(rh + L"engine\\sherpa");                                  // the folder, not its DLL
+        ok(resolvePathsAt(none, rh, noPayload).sherpaDir.empty(), "an engine\\sherpa folder without its DLL is no runtime");
+        TrConfig sm;
+        sm.spkModel = base + L"\\elsewhere.onnx";
+        ok(resolvePathsAt(sm, r, noPayload).spkModel == sm.spkModel, "SPKMODEL in engine.txt wins, path and all");
+        std::printf("    diarization runtime: bundle / dev payload / absent (never a mix) / SPKMODEL\n");
+    }
     for (auto it = made.rbegin(); it != made.rend(); ++it)
         if (!::DeleteFileW(it->c_str())) ::RemoveDirectoryW(it->c_str());
     ::RemoveDirectoryW(base.c_str());
-    std::printf("    %s\n", failures == before ? "bundle / dev payload / part-staged named / overrides OK" : "SEE FAILURES ABOVE");
+    std::printf("    %s\n", failures == before ? "bundle / dev payload / part-staged named / overrides / diarization runtime OK"
+                                               : "SEE FAILURES ABOVE");
 }
 
 // ===========================================================================
-// THE ENGINE'S WHOLE SELFTEST:  --selftest [offline]
-// SUVTITLE SPLIT: AudioPB's --selftest minus its LIVE sections -- [1] the decimator (the fabric front end),
-// [2] the live servers, [2bis] diarization, [3] / [3bis] the live pipeline and its commit engine, [3ter] the
-// `auto` probe, [3quater] the MT drivers on the live pair, [4] / [4bis] / [4ter] / [5] the live finals, [6]
-// Traditional Chinese end to end through the live path. Left: what a FILE job stands on -- [0] the wire
-// contract (the whole of TrPipe.h, its live messages included: the header is shared with the app and its
-// packers are proved here), [0bis] [0ter] [0quater] the languages, scripts, routing and filters offline --
-// then [7] [8] [9], the file selftests (each also runs alone: --selftest-filemode / -v2 / -wh).
-// `offline` (new; AudioPB's --selftest had none): [7] [8] [9] stop where they would start a model, exactly
-// as their own `offline` does.
+// [C8] LIVE AND FILE NEVER RUN TOGETHER (SuVtitle 1.1.0, LIVE_PLAN section 2), offline -- the SHIPPING pipeline thread
+// (pipelineMain) behind the SHIPPING door (servantHandle), with no model at all: FILE jobs on [8]'s stand-ins (a whisper
+// that takes a quarter of a second per window, so a job can be caught running), a Servers with NO payload (the live
+// pair never comes up: STATE says so and retries -- the exclusivity does not need it up), and the capture hub this
+// engine was built with (L0's stub, or the real one on a silent wav: input). What is proved, on the wire the servant
+// would send:
+//   LIVE 1 during a job -> that job's ONE FDONE "cancelled", its ranges sent before it; then STATE live 1;
+//   FILE during the live -> ONE FDONE "error" with the live sentence, at once (a malformed one: its own reason);
+//   FPROXY during the live -> answered as ever (a playback copy is not an analysis);
+//   CTL scope=live moves the LIVE pair only; no scope / scope=file the player's only; an unknown scope nothing;
+//   a refused LIVE (n = 0, an ain: key, a wav: key on a non-test engine) -> one STATE err, the live state unchanged;
+//   the same LIVE twice -> nothing moves; SRCLIST -> SRC lines and one SRCEND that counts them;
+//   LIVE 0 -> STATE live 0, no END (nothing was said), FILE jobs run again; QUIT -> the running job's FDONE "cancelled";
+//   a running job's servers BELOW_NORMAL, the live path's NORMAL (a stand-in child: its class, its log lines in order).
+// The END a stop owes an utterance already partly on screen needs speech and real models: --selftest-live [C8b].
 // ===========================================================================
-int runSelftest(bool offline) {
-    ::SetConsoleOutputCP(CP_UTF8);        // the transcripts are UTF-8 and half of them are Han
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::printf("=== SuVtitle Engine selftest%s%s ===\n", offline ? " (offline)" : "",
-                g_forceCpu ? " (CPU forced)" : "");
-    int failures = 0;
+// A test file, written whole (the selftests' material under %TEMP%).
+bool writeBytesFile(const std::wstring& path, const std::string& bytes) {
+    HANDLE h = ::CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD wr = 0;
+    const BOOL w = bytes.empty() ? TRUE : ::WriteFile(h, bytes.data(), (DWORD)bytes.size(), &wr, nullptr);
+    ::CloseHandle(h);
+    return w && wr == (DWORD)bytes.size();
+}
 
+// 16 kHz mono 16-bit PCM, the samples AS THEY ARE (buildWav16k normalises, which would move a level the VAD judges).
+std::string pcm16Wav(const std::vector<float>& mono) {
+    std::string w;
+    auto put = [&](uint32_t v, int bytes) { for (int i = 0; i < bytes; ++i) w += (char)((v >> (8 * i)) & 0xff); };
+    const uint32_t data = (uint32_t)mono.size() * 2u;
+    w += "RIFF"; put(36u + data, 4); w += "WAVE";
+    w += "fmt "; put(16u, 4); put(1u, 2); put(1u, 2); put((uint32_t)kAsrRate, 4); put((uint32_t)kAsrRate * 2u, 4);
+    put(2u, 2); put(16u, 2);
+    w += "data"; put(data, 4);
+    for (float v : mono) {
+        const float c = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+        put((uint32_t)(uint16_t)(int16_t)std::lround(c * 32767.0f), 2);
+    }
+    return w;
+}
+
+// What the servant would send, in its order: the never-dropped queue (FPROG/FCUE/FDONE/FPROXYDONE, INPUT/SRC/SRCEND, a
+// refused LIVE's STATE), then the live outbox. Drained by the test's own thread, as runHost's loop drains them.
+void drainWire(Shared& sh, std::vector<std::string>& wire) {
+    std::lock_guard<std::mutex> lk(sh.mx);
+    while (!sh.fileOut.empty()) { wire.push_back(std::move(sh.fileOut.front())); sh.fileOut.pop_front(); }
+    while (!sh.outbox.empty()) {
+        const Out& o = sh.outbox.front();
+        wire.push_back(o.kind == Out::kEnd ? trpipe::packEnd(o.end)
+                     : o.kind == Out::kPartial ? trpipe::packPartial(o.part) : trpipe::packLine(o.line));
+        sh.outbox.pop_front();
+    }
+}
+
+// [0r] / [C8]: a child whose scheduling class can be set and read like a server's, and that does nothing that matters
+// -- Windows' own PING.EXE on the loopback (five minutes at most), no window, inside a job that kills it if the
+// selftest dies first (ChildServer::spawn's way). It never opens a GPU device, so the GPU half of setProcessPriority
+// fails on it: the case of a FILE job's child before its model is on the GPU.
+struct StandInChild {
+    HANDLE proc = nullptr, job = nullptr;
+    bool start() {
+        wchar_t sys[MAX_PATH] = {};
+        const UINT n = ::GetSystemDirectoryW(sys, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH) return false;
+        job = ::CreateJobObjectW(nullptr, nullptr);
+        if (job) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+            li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            ::SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof(li));
+        }
+        std::wstring cmd = L"\"" + std::wstring(sys) + L"\\PING.EXE\" -n 300 127.0.0.1";
+        STARTUPINFOW si{}; si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        // SUSPENDED until it is inside the job, as ChildServer::spawn does.
+        if (!::CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
+                              nullptr, nullptr, &si, &pi))
+            return false;
+        if (job) ::AssignProcessToJobObject(job, pi.hProcess);
+        ::ResumeThread(pi.hThread);
+        ::CloseHandle(pi.hThread);
+        proc = pi.hProcess;
+        return true;
+    }
+    void stop() {
+        if (proc) { ::TerminateProcess(proc, 0); ::WaitForSingleObject(proc, 3000); ::CloseHandle(proc); proc = nullptr; }
+        if (job) { ::CloseHandle(job); job = nullptr; }
+    }
+    ~StandInChild() { stop(); }
+};
+
+// ===========================================================================
+// [0r] A FILE JOB'S SERVERS RUN BELOW_NORMAL, CPU AND GPU (SuVtitle 1.1.0), offline, on a stand-in child: each change
+// of class is applied (read back with GetPriorityClass) and written as ONE engine-log line naming the child, the class
+// and both results; the GPU half failing on a process with no GPU device costs that line, never an error (the CPU half
+// stands); Servers::setBackground changes a class once, not once per lap, and leaves a child that is down alone. WHEN
+// the pipeline applies it (a job's run: low; a live start, idle: normal) is [C8]'s.
+// ===========================================================================
+void prioritySelftest(int& failures) {
+    std::printf("\n[0r] a FILE job's servers run BELOW_NORMAL, CPU and GPU -- NORMAL otherwise (a stand-in child)\n");
+    const int before = failures;
+    auto ok = [&](bool cond, const std::string& what) {
+        if (!cond) { std::printf("    ASSERT FAIL: %s\n", what.c_str()); ++failures; }
+    };
+    auto has = [](const std::string& s, const char* w) { return s.find(w) != std::string::npos; };
+    std::vector<std::string> lines;
+    g_prioLogForTest = [&lines](const std::string& l) { lines.push_back(l); };
+    StandInChild child;
+    ok(child.start(), "a stand-in child (PING.EXE on the loopback, in a kill-on-close job)");
+    if (child.proc) {
+        std::printf("    stand-in pid %lu; the GPU half: %s\n", (unsigned long)::GetProcessId(child.proc),
+                    kmtSetPrio() ? "gdi32 exports D3DKMTSetProcessSchedulingPriorityClass"
+                                 : "NOT exported by this gdi32 (the CPU half alone)");
+        // 1. the helper, both ways: the class read back, one line each with both results
+        const PrioResult lo = setProcessPriority(child.proc, true, "the stand-in");
+        std::printf("    %s", lines.empty() ? "(no line)\n" : lines.back().c_str());
+        ok(lo.cpuOk && ::GetPriorityClass(child.proc) == (DWORD)BELOW_NORMAL_PRIORITY_CLASS,
+           "low: the CPU class reads BELOW_NORMAL");
+        ok(lines.size() == 1 && has(lines[0], "the stand-in (pid ") && has(lines[0], "-> BELOW_NORMAL -- CPU ok, GPU "),
+           "... and ONE engine-log line names the child, the class and both results");
+        if (!lo.gpuCalled) {
+            ok(has(lines[0], "GPU not available"), "... the GPU half missing is said, not an error");
+        } else if (lo.gpuStatus != 0) {
+            char st[16];
+            std::snprintf(st, sizeof(st), "0x%08lX", (unsigned long)lo.gpuStatus);
+            std::printf("    the GPU half failed on a process with no GPU device (status %s): tolerated\n", st);
+            ok(lo.cpuOk && has(lines[0], st) && has(lines[0], "left as it was"),
+               "... the GPU half failing: that line says so, the CPU half stands, no error");
+        } else {
+            std::printf("    NOT CHECKED: the GPU half did not fail here (status 0) -- its tolerated failure\n");
+        }
+        const PrioResult no = setProcessPriority(child.proc, false, "the stand-in");
+        ok(no.cpuOk && ::GetPriorityClass(child.proc) == (DWORD)NORMAL_PRIORITY_CLASS && lines.size() == 2
+           && has(lines[1], "-> NORMAL -- CPU ok, GPU "), "normal: the CPU class reads NORMAL again, ONE more line");
+        // 2. Servers::setBackground, as the pipeline calls it: a lap that changes nothing writes nothing
+        Servers srv;                                  // no payload: no server of its own, the stand-in alone
+        g_prioStandInForTest = child.proc;
+        lines.clear();
+        srv.setBackground(true);                      // a job's run, lap after lap
+        srv.setBackground(true);
+        ok(::GetPriorityClass(child.proc) == (DWORD)BELOW_NORMAL_PRIORITY_CLASS && lines.size() == 1,
+           "setBackground(true) on two laps: BELOW_NORMAL, ONE line");
+        srv.setBackground(false);                     // a live start, then idle laps
+        srv.setBackground(false);
+        ok(::GetPriorityClass(child.proc) == (DWORD)NORMAL_PRIORITY_CLASS && lines.size() == 2,
+           "setBackground(false) on two laps: NORMAL, ONE more line");
+        // 3. a child that is down is left alone
+        child.stop();
+        g_prioStandInForTest = nullptr;
+        StandInChild gone;
+        if (gone.start()) {
+            ::TerminateProcess(gone.proc, 0);
+            ::WaitForSingleObject(gone.proc, 3000);
+            g_prioStandInForTest = gone.proc;
+            srv.setBackground(true);
+            ok(lines.size() == 2, "a child that is down: left alone, no line");
+            g_prioStandInForTest = nullptr;
+        }
+    }
+    g_prioLogForTest = nullptr;
+    std::printf("    %s\n", failures == before ? "low / normal / one line per change / GPU failure tolerated / down child left alone OK"
+                                               : "SEE FAILURES ABOVE");
+}
+
+void liveExclusivityTests(int& failures) {
+    std::printf("\n[C8] live and file never run together: the pipeline thread + the door, offline (stand-in jobs, no payload)\n");
+    const int before = failures;
+    auto ok = [&](bool cond, const std::string& what) {
+        if (!cond) { std::printf("    ASSERT FAIL: %s\n", what.c_str()); ++failures; }
+    };
+    // ---- material: three minutes with an "utterance" (a 220 Hz tone) every 4 s, and a second of silence ----------
+    wchar_t tmp[MAX_PATH] = {};
+    ::GetTempPathW(MAX_PATH, tmp);
+    const std::wstring dir = std::wstring(tmp) + L"SuVtitle_selftest_c8";
+    ::CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring jobWav = dir + L"\\job.wav", silWav = dir + L"\\silence.wav";
+    std::vector<UttMark> marks;
+    {
+        std::vector<float> pcm((size_t)kAsrRate * 180, 0.0f);
+        for (int u = 0; u < 44; ++u) {
+            const double s = 1.0 + 4.0 * u, e = s + 2.0;
+            marks.push_back({ "u" + std::to_string(u), s, e });
+            for (size_t i = (size_t)(s * kAsrRate); i < (size_t)(e * kAsrRate) && i < pcm.size(); ++i)
+                pcm[i] = (float)(0.3 * std::sin(2.0 * 3.14159265358979 * 220.0 * (double)i / kAsrRate));
+        }
+        ok(writeBytesFile(jobWav, pcm16Wav(pcm)) && writeBytesFile(silWav, pcm16Wav(std::vector<float>((size_t)kAsrRate, 0.0f))),
+           "the test material is written (%TEMP%)");
+    }
+    g_fileNoModelsForTest = true;
+    g_fileAsrForTest = [&marks](uint64_t s, uint64_t e, const std::string&) {
+        ::Sleep(250);                                 // a window takes a while: the job can be caught running
+        return standInWhisper(marks, s, e);
+    };
+    g_fileMtForTest = [](const std::string& src, const std::string&, const std::string&, size_t) {
+        return std::string("T(") + src + ")";
+    };
+
+    Shared sh;
+    sh.testSources = true;
+    SharedFileSink proxySink(sh);
+    ProxyWorker    proxy(proxySink);
+    proxy.start();
+    TrAudio        audio;
+    HostLiveEvents events(sh);
+    HubOptions     ho;
+    ho.testSources = true;
+    TrCaptureHub   hub(&events, ho);
+    Servers        srv;                               // NO payload (setPaths never called): the live pair cannot come up
+    const TrConfig cfg;                               // the defaults: nothing read, nothing written (persist = false)
+    // 1.1.0: a stand-in for a FILE job's server (these jobs bring none up), so WHEN the pipeline changes their class
+    // is seen -- [0r]'s child, its engine-log lines collected in their order.
+    StandInChild             prioChild;
+    std::mutex               prioMx;
+    std::vector<std::string> prioLines;
+    if (prioChild.start()) g_prioStandInForTest = prioChild.proc;
+    g_prioLogForTest = [&prioMx, &prioLines](const std::string& l) {
+        std::lock_guard<std::mutex> lk(prioMx);
+        prioLines.push_back(l);
+    };
+    auto prioNow = [&prioChild] { return prioChild.proc ? ::GetPriorityClass(prioChild.proc) : (DWORD)0; };
+    std::thread pipe(pipelineMain, std::ref(sh), std::ref(audio), std::ref(hub), std::ref(srv), cfg, false);
+
+    std::vector<std::string> wire;
+    auto send = [&](const std::string& m) { servantHandle(sh, &proxy, trpipe::split(m), &hub); };
+    auto waitFor = [&](const std::function<bool()>& cond, DWORD ms) {
+        const ULONGLONG t0 = ::GetTickCount64();
+        for (;;) {
+            drainWire(sh, wire);
+            if (cond()) return true;
+            if (::GetTickCount64() - t0 > ms) return false;
+            ::Sleep(10);
+        }
+    };
+    auto stateNow = [&] { std::lock_guard<std::mutex> lk(sh.mx); return sh.state; };
+    auto genNow = [&] { std::lock_guard<std::mutex> lk(sh.mx); return sh.liveGen; };
+    auto donesOf = [&](uint64_t id) {
+        std::vector<trpipe::WireFileDone> d;
+        for (const auto& m : wire) {
+            trpipe::WireFileDone x;
+            if (trpipe::unpackFileDone(trpipe::split(m), x) && x.jobId == id) d.push_back(x);
+        }
+        return d;
+    };
+    auto indexOf = [&](const std::function<bool(const std::vector<std::string>&)>& is) {
+        for (size_t i = 0; i < wire.size(); ++i) if (is(trpipe::split(wire[i]))) return (long)i;
+        return -1L;
+    };
+    auto analyzing = [&](uint64_t id) {
+        return indexOf([id](const std::vector<std::string>& t) {
+            trpipe::WireFileProg p;
+            return trpipe::unpackFileProg(t, p) && p.jobId == id && p.phase == "analyzing";
+        }) >= 0;
+    };
+    auto stateErrs = [&](const std::string& what) {
+        int n = 0;
+        for (const auto& m : wire) {
+            trpipe::WireState s;
+            const auto t = trpipe::split(m);
+            if (!t.empty() && t[0] == "STATE" && trpipe::unpackState(t, s) && s.err.find(what) != std::string::npos) ++n;
+        }
+        return n;
+    };
+    auto fileMsg = [](uint64_t id, const std::wstring& path) {
+        trpipe::WireFile f;
+        f.jobId = id; f.path = wideToUtf8L(path); f.quality = "auto";
+        return trpipe::packFile(f);
+    };
+    trpipe::WireLive live;
+    live.on = true;
+    const std::string key = "wav:" + wideToUtf8L(silWav);
+    live.inputs.push_back({ key, "Me", 0, 0.0 });
+    const std::string liveOn = trpipe::packLive(live);
+
+    // 1. a job runs; LIVE 1 -> its ONE FDONE "cancelled", its ranges first; then the live path, STATE live 1
+    send(fileMsg(81, jobWav));
+    const bool ran = waitFor([&] { return analyzing(81); }, 10000);
+    ok(ran, "a FILE job runs on the stand-ins (FPROG analyzing)");
+    ok(waitFor([&] { return prioNow() == (DWORD)BELOW_NORMAL_PRIORITY_CLASS; }, 5000),
+       "... and its server runs BELOW_NORMAL while it does (the stand-in)");
+    send(liveOn);
+    const bool cancelled = waitFor([&] { return !donesOf(81).empty(); }, 5000);
+    const auto d81 = donesOf(81);
+    std::printf("    LIVE 1 during job 81 -> FDONE %s, %zu FDONE(s)\n", d81.empty() ? "(none)" : d81[0].result.c_str(), d81.size());
+    ok(cancelled && d81.size() == 1 && d81[0].result == "cancelled", "LIVE 1 during a job: its ONE FDONE, \"cancelled\"");
+    {
+        const long iDone = indexOf([](const std::vector<std::string>& t) {
+            trpipe::WireFileDone x; return trpipe::unpackFileDone(t, x) && x.jobId == 81; });
+        long iProg = -1;
+        for (long i = 0; i < iDone; ++i) {
+            trpipe::WireFileProg p;
+            if (trpipe::unpackFileProg(trpipe::split(wire[(size_t)i]), p) && p.jobId == 81) iProg = i;
+        }
+        ok(iDone > 0 && iProg >= 0 && iProg < iDone, "... and its ranges went out before it (FPROG, then FDONE: the app resumes it after the live)");
+    }
+    ok(waitFor([&] { return stateNow().live; }, 5000), "STATE live 1 once the job is gone");
+    ok(prioNow() == (DWORD)NORMAL_PRIORITY_CLASS, "... and the live path runs NORMAL: the job's server was put back first");
+    ok(waitFor([&] { return indexOf([&key](const std::vector<std::string>& t) {
+                                 trpipe::WireInput in; return trpipe::unpackInput(t, in) && in.key == key; }) >= 0; }, 5000),
+       "the capture hub's word on the input reaches the wire (INPUT)");
+
+    // 2. FILE during the live -> ONE FDONE error, the sentence, AT ONCE (no lap needed); a malformed one: its own reason
+    send(fileMsg(82, jobWav));
+    drainWire(sh, wire);
+    const auto d82 = donesOf(82);
+    ok(d82.size() == 1 && d82[0].result == "error" && d82[0].err == kLiveFileRefusal && d82[0].count == 0,
+       "FILE during the live: ONE FDONE error, at once -- \"" + std::string(kLiveFileRefusal) + "\"");
+    send("FILE\t83\t");
+    drainWire(sh, wire);
+    const auto d83 = donesOf(83);
+    ok(d83.size() == 1 && d83[0].result == "error" && d83[0].err == "The request names no file.",
+       "a malformed FILE during the live: ONE FDONE error, at once, with its own reason");
+    // 3. FPROXY during the live: answered as ever (here: the file does not exist -- its own error, not the live one)
+    {
+        trpipe::WireProxy px;
+        px.jobId = 84; px.src = wideToUtf8L(dir + L"\\no_such_file.mkv"); px.out = wideToUtf8L(dir + L"\\px.wav");
+        send(trpipe::packProxy(px));
+        trpipe::WireProxyDone pd;
+        const bool got = waitFor([&] {
+            for (const auto& m : wire) if (trpipe::unpackProxyDone(trpipe::split(m), pd) && pd.jobId == 84) return true;
+            return false; }, 5000);
+        ok(got && !pd.ok && pd.err != kLiveFileRefusal, "FPROXY during the live is accepted (its FPROXYDONE is its own: " + pd.err + ")");
+    }
+
+    // 4. CTL: whose pair
+    send("CTL\tb2a\t\t0\tde\tit\tlive");
+    ok(waitFor([&] { const auto s = stateNow(); return s.liveLangA == "de" && s.liveLangB == "it" && s.liveMode == "b2a"; }, 2000),
+       "CTL scope=live: the LIVE pair and direction move (de/it b2a) ...");
+    {
+        const auto s = stateNow();
+        ok(s.langA == "en" && s.langB == "zh" && s.mode == "auto", "... and the player's do not (en/zh auto)");
+    }
+    send("CTL\ta2b\t\t0\tfr\tja");
+    ok(waitFor([&] { const auto s = stateNow(); return s.langA == "fr" && s.langB == "ja" && s.mode == "a2b"; }, 2000),
+       "CTL with no scope: the PLAYER's pair and direction move (fr/ja a2b) ...");
+    {
+        const auto s = stateNow();
+        ok(s.liveLangA == "de" && s.liveLangB == "it" && s.liveMode == "b2a", "... and the live ones do not");
+    }
+    send("CTL\tb2a\t\t0\tes\tpt\tfile");
+    ok(waitFor([&] { const auto s = stateNow(); return s.langA == "es" && s.langB == "pt"; }, 2000)
+       && stateNow().liveLangA == "de", "CTL scope=file: the player's pair, as with no scope");
+    send("CTL\tauto\tlight\t1\tko\tru\tvideo");
+    ::Sleep(150);
+    drainWire(sh, wire);
+    {
+        const auto s = stateNow();
+        std::string preset;
+        { std::lock_guard<std::mutex> lk(sh.mx); preset = sh.preset; }
+        ok(s.langA == "es" && s.liveLangA == "de" && s.mode == "b2a" && s.liveMode == "b2a" && preset == "balanced",
+           "CTL with an UNKNOWN scope: ignored whole (no pair, no direction, no preset)");
+    }
+
+    // 5. LIVE refused whole -> one STATE err each, the live state unchanged
+    const uint64_t g0 = genNow();
+    const int e0 = stateErrs("could not be read");
+    send("LIVE\t1\t0");
+    send(std::string("LIVE\t1\t1\tain:card\tAudioPB\t0\t0"));
+    drainWire(sh, wire);
+    ok(stateErrs("could not be read") == e0 + 2 && genNow() == g0 && stateNow().live,
+       "LIVE 1 with no input, and with an ain: key: refused whole (one STATE err each), still live on the same set");
+    { std::lock_guard<std::mutex> lk(sh.mx); sh.testSources = false; }
+    trpipe::WireLive lw2 = live;
+    lw2.inputs[0].label = "Other";
+    send(trpipe::packLive(lw2));
+    drainWire(sh, wire);
+    { std::lock_guard<std::mutex> lk(sh.mx); sh.testSources = true; }
+    ok(stateErrs("test engine only") == 1 && genNow() == g0, "a wav: input on a NON-test engine: refused whole, said once");
+    send(liveOn);
+    ok(genNow() == g0, "the same LIVE twice: nothing moves (idempotent)");
+    send(trpipe::packLive(lw2));
+    ok(genNow() == g0 + 1, "... a renamed strip is a new set (the hub keeps its unchanged inputs: TrCaptureApi.h)");
+
+    // 6. SRCLIST -> SRC lines + one SRCEND that counts them
+    send(trpipe::packSrcList());
+    trpipe::WireSrcEnd se;
+    const bool listed = waitFor([&] {
+        for (const auto& m : wire) if (trpipe::unpackSrcEnd(trpipe::split(m), se)) return true;
+        return false; }, 10000);
+    uint32_t srcN = 0;
+    for (const auto& m : wire) { trpipe::WireSrc s; if (trpipe::unpackSrc(trpipe::split(m), s) && s.gen == se.gen) ++srcN; }
+    std::printf("    SRCLIST -> generation %u, %u source(s)\n", se.gen, srcN);
+    ok(listed && se.gen >= 1 && srcN == se.n, "SRCLIST: SRC lines and ONE SRCEND whose count matches them");
+
+    // 7. LIVE 0 -> STATE live 0, no END (nothing was said); the live children down; FILE jobs run again
+    send("LIVE\t0");
+    ok(waitFor([&] { return !stateNow().live; }, 5000), "LIVE 0: STATE live 0");
+    ok(indexOf([](const std::vector<std::string>& t) { return !t.empty() && t[0] == "END"; }) < 0,
+       "... and no END: no utterance was open");
+    ok(!srv.up(), "... the live whisper children are not up");
+    send(fileMsg(85, jobWav));
+    ok(waitFor([&] { return analyzing(85); }, 10000), "after the live, a FILE job runs again");
+    ok(waitFor([&] { return prioNow() == (DWORD)BELOW_NORMAL_PRIORITY_CLASS; }, 5000), "... BELOW_NORMAL again");
+
+    // 8. QUIT with a job running -> its FDONE "cancelled"; exactly one FDONE per FILE, all along
+    sh.quit.store(true, std::memory_order_release);
+    sh.abortJob.store(kAbortAll, std::memory_order_release);
+    pipe.join();
+    hub.stop();
+    proxy.stop();
+    drainWire(sh, wire);
+    const auto d85 = donesOf(85);
+    ok(d85.size() == 1 && d85[0].result == "cancelled", "QUIT with a job running: its ONE FDONE, \"cancelled\"");
+    ok(donesOf(81).size() == 1 && donesOf(82).size() == 1 && donesOf(83).size() == 1,
+       "exactly one FDONE per FILE (81 cancelled by the live, 82 / 83 refused during it)");
+    g_prioLogForTest = nullptr;
+    g_prioStandInForTest = nullptr;
+    {
+        std::string order;
+        for (const auto& l : prioLines)
+            order += l.find("-> BELOW_NORMAL") != std::string::npos ? "low " : l.find("-> NORMAL") != std::string::npos ? "normal " : "? ";
+        std::printf("    the engine log's priority lines, in order: %s(%zu)\n", order.c_str(), prioLines.size());
+        ok(prioChild.proc && order == "low normal low ",
+           "... job 81 runs -> BELOW_NORMAL, LIVE 1 -> NORMAL, job 85 runs -> BELOW_NORMAL, and nothing else (no line per lap)");
+    }
+    prioChild.stop();
+
+    g_fileAsrForTest = nullptr;
+    g_fileMtForTest = nullptr;
+    g_fileNoModelsForTest = false;
+    ::DeleteFileW(jobWav.c_str());
+    ::DeleteFileW(silWav.c_str());
+    ::DeleteFileW((dir + L"\\px.wav").c_str());
+    ::RemoveDirectoryW(dir.c_str());
+    std::printf("    %s\n", failures == before ? "live wins / FILE refused during it / FPROXY kept / CTL scopes / refusals / SRCLIST / stop OK"
+                                               : "SEE FAILURES ABOVE");
+}
+// ===========================================================================
+// [C8c] LIVE 0 = STOP LISTENING, THEN FINISH (fix round RVA-1 / RVA-6 / RVA-7: LIVE_PLAN's ADDENDUM FIX ROUND), offline
+// -- the SHIPPING pipeline thread behind the SHIPPING door, the real hub on a wav: input (tone "utterances" played in
+// real time), and the live pair played by a STAND-IN: one loopback HTTP server that answers whisper-server's
+// /inference and llama-server's /v1/chat/completions the way they do, so the shipping transport and parsers run as
+// they ship (no model at all). Its FINALs can be held at a GATE: the pipeline thread then sits in a model call while the
+// VAD queues the next utterances -- a backlog, on cue. Proved, on the wire the servant would send:
+//   A. LIVE 0 with finals queued: the hub is stopped when the door returns (the devices released) while the pipeline
+//      thread is still in its model call; STATE live stays 1 and a FILE is refused as during the live; EVERY queued
+//      final is finished -- its LINE comes after the LIVE 0 and before STATE live 0 --; the queue ends empty, the pair
+//      down, and no END (each utterance had its closing LINE).
+//  A2. A LIVE 1 during the drain RESUMES: the capture runs again, STATE live never went to 0, the queued finals are
+//      finished as live processing -- even when the pipeline thread, in a model call, never saw the LIVE 0 / LIVE 1 apart.
+//   B. LIVE 0 while a draft (PART) is on screen and its utterance says nothing more: ONE END for it, after the LIVE 0 and
+//      before STATE live 0, and nothing else. Listen off / on KEPT the conversation's memory (the next final's prompt
+//      carries the last session's sentence) and STATE's voice count.
+//   C. CTL clear = a new session: the voice count 0 and the memory gone (the next final's prompt without that
+//      sentence). QUIT with finals queued: NO drain -- at most the final in flight gets its LINE, the queue is left.
+// ===========================================================================
+// The stand-in's sentences: distinct words, so no final quotes four words of the one before it (the prompt's echo
+// rule would rightly drop it).
+const char* const kStandInSentences[] = {
+    "Apples grow on tall green trees.",     "The river runs north this morning.",
+    "Seven small boats left the harbour.",   "My cousin plays the violin badly.",
+    "Please close the kitchen window now.",  "Our train arrives before noon tomorrow.",
+    "Blue paint covers the garden fence.",   "Two owls watched the empty road.",
+    "Fresh bread smells wonderful at dawn.", "Snow fell quietly over the village.",
+    "The library opens late on Sundays.",    "Her bicycle needs a new chain.",
+    "Warm soup helps after long walks.",     "A red kite circled above us.",
+    "Nobody answered the second bell.",      "Grandfather repaired that clock himself.",
+};
+constexpr int kStandInSentenceCount = (int)(sizeof(kStandInSentences) / sizeof(kStandInSentences[0]));
+
+class StandInPair {
+public:
+    struct Req { bool draft = false; std::string prompt; };
+    StandInPair() = default;
+    StandInPair(const StandInPair&) = delete;
+    StandInPair& operator=(const StandInPair&) = delete;
+    ~StandInPair() { stop(); }
+
+    bool start() {
+        WSADATA wd;
+        if (::WSAStartup(MAKEWORD(2, 2), &wd) != 0) return false;
+        wsa_ = true;
+        const SOCKET ls = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (ls == INVALID_SOCKET) return false;
+        sockaddr_in a = {};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = 0;                                   // any free port
+        int alen = (int)sizeof(a);
+        if (::bind(ls, reinterpret_cast<sockaddr*>(&a), (int)sizeof(a)) != 0 || ::listen(ls, 4) != 0
+            || ::getsockname(ls, reinterpret_cast<sockaddr*>(&a), &alen) != 0) {
+            ::closesocket(ls);
+            return false;
+        }
+        ls_ = ls;
+        port_ = ntohs(a.sin_port);
+        th_ = std::thread([this, ls] { loop(ls); });
+        return true;
+    }
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            quit_ = true;
+        }
+        cv_.notify_all();
+        if (ls_ != INVALID_SOCKET) { ::closesocket(ls_); ls_ = INVALID_SOCKET; }   // its accept() returns
+        if (th_.joinable()) th_.join();
+        if (wsa_) { ::WSACleanup(); wsa_ = false; }
+    }
+    uint16_t port() const { return port_; }
+    // FINALs wait at the gate while it is closed (drafts never do).
+    void setGate(bool closed) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            gate_ = closed;
+        }
+        cv_.notify_all();
+    }
+    // FINALs answer an empty transcript (the "nothing was said" case): a draft is then all the screen gets.
+    void setFinalEmpty(bool empty) { std::lock_guard<std::mutex> lk(mu_); empty_ = empty; }
+    // [0h] (RESUME 11): the next answers SCRIPTED, oldest first -- a transcript, whisper's language NAME and its
+    // detection probability (< 0 = not sent) -- for a final or a draft. None queued: the answers above.
+    struct Say { std::string text, language; double langProb = -1.0; };
+    void sayNext(bool draft, const Say& s) {
+        std::lock_guard<std::mutex> lk(mu_);
+        (draft ? draftSays_ : finalSays_).push_back(s);
+    }
+    int held() const { std::lock_guard<std::mutex> lk(mu_); return held_; }
+    std::vector<Req> requests() const { std::lock_guard<std::mutex> lk(mu_); return reqs_; }
+    // What each answered FINAL said, in order ("" = nothing).
+    std::vector<std::string> finalTexts() const { std::lock_guard<std::mutex> lk(mu_); return texts_; }
+
+private:
+    // The value of one multipart field (asrTranscribe's body), "" when absent.
+    static std::string fieldOf(const std::string& body, const std::string& name) {
+        const std::string tag = "name=\"" + name + "\"\r\n\r\n";
+        const size_t at = body.find(tag);
+        if (at == std::string::npos) return std::string();
+        const size_t from = at + tag.size();
+        const size_t to = body.find("\r\n--", from);
+        return body.substr(from, to == std::string::npos ? std::string::npos : to - from);
+    }
+    void loop(SOCKET ls) {
+        for (;;) {
+            const SOCKET c = ::accept(ls, nullptr, nullptr);
+            if (c == INVALID_SOCKET) {
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    if (quit_) return;
+                }
+                ::Sleep(1);
+                continue;
+            }
+            serve(c);
+            ::closesocket(c);
+        }
+    }
+    void serve(SOCKET c) {
+        const DWORD rcvMs = 10000;
+        ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rcvMs), (int)sizeof(rcvMs));
+        std::string in;
+        size_t hdrEnd = std::string::npos, need = 0;
+        char buf[16384];
+        for (;;) {
+            const int n = ::recv(c, buf, (int)sizeof(buf), 0);
+            if (n <= 0) return;
+            in.append(buf, (size_t)n);
+            if (hdrEnd == std::string::npos) {
+                hdrEnd = in.find("\r\n\r\n");
+                if (hdrEnd == std::string::npos) {
+                    if (in.size() > ((size_t)1 << 20)) return;
+                    continue;
+                }
+                std::string h = in.substr(0, hdrEnd);
+                for (char& ch : h) if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+                const size_t cl = h.find("content-length:");
+                need = cl == std::string::npos ? 0 : (size_t)std::strtoul(h.c_str() + cl + 15, nullptr, 10);
+            }
+            if (in.size() >= hdrEnd + 4 + need) break;
+        }
+        const std::string head = in.substr(0, in.find("\r\n"));
+        const std::string body = in.substr(hdrEnd + 4, need);
+        std::string json;
+        if (head.find(" /inference ") != std::string::npos) {
+            Req r;
+            r.draft  = body.find("name=\"temperature_inc\"") != std::string::npos;   // only a draft sends it
+            r.prompt = fieldOf(body, "prompt");
+            std::string text, language = "english";
+            double langProb = -1.0;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                reqs_.push_back(r);
+                std::deque<Say>& script = r.draft ? draftSays_ : finalSays_;
+                if (!script.empty()) {
+                    text     = script.front().text;
+                    language = script.front().language;
+                    langProb = script.front().langProb;
+                    script.pop_front();
+                    if (!r.draft) texts_.push_back(text);
+                } else if (r.draft) {
+                    text = "drafted words so far";
+                } else {
+                    ++held_;
+                    cv_.wait(lk, [this] { return !gate_ || quit_; });
+                    --held_;
+                    text = empty_ ? std::string() : std::string(kStandInSentences[next_++ % kStandInSentenceCount]);
+                    texts_.push_back(text);
+                }
+            }
+            json = "{\"task\":\"transcribe\",\"language\":\"" + language + "\",\"duration\":1.4,\"text\":\"" + text + "\""
+                 + (langProb >= 0.0 ? ",\"detected_language_probability\":" + std::to_string(langProb) : std::string())
+                 + ",\"segments\":[]}";
+        } else {
+            json = "{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"translated\"}}]}";
+        }
+        const std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                               + std::to_string(json.size()) + "\r\nConnection: close\r\n\r\n" + json;
+        for (size_t sent = 0; sent < resp.size();) {
+            const int n = ::send(c, resp.data() + sent, (int)(resp.size() - sent), 0);
+            if (n <= 0) break;
+            sent += (size_t)n;
+        }
+        ::shutdown(c, SD_SEND);
+    }
+
+    SOCKET                   ls_ = INVALID_SOCKET;
+    bool                     wsa_ = false;
+    uint16_t                 port_ = 0;
+    std::thread              th_;
+    mutable std::mutex       mu_;
+    std::condition_variable  cv_;
+    bool                     quit_ = false, gate_ = false, empty_ = false;
+    int                      held_ = 0, next_ = 0;
+    std::vector<Req>         reqs_;
+    std::vector<std::string> texts_;
+    std::deque<Say>          finalSays_, draftSays_;
+};
+
+void liveDrainTests(int& failures) {
+    std::printf("\n[C8c] LIVE 0 = stop listening, then finish: the drain, its END, QUIT, the session's memory "
+                "(offline: a stand-in pair)\n");
+    const int before = failures;
+    auto ok = [&](bool cond, const std::string& what) {
+        if (!cond) { std::printf("    ASSERT FAIL: %s\n", what.c_str()); ++failures; }
+    };
+    // ---- material: a 1.4 s tone "utterance" every 2.4 s (the VAD closes each one: kHangoverMs is 300) ----------
+    wchar_t tmp[MAX_PATH] = {};
+    ::GetTempPathW(MAX_PATH, tmp);
+    const std::wstring dir = std::wstring(tmp) + L"SuVtitle_selftest_c8c", wav = dir + L"\\utterances.wav";
+    ::CreateDirectoryW(dir.c_str(), nullptr);
+    {
+        std::vector<float> pcm((size_t)kAsrRate * 24, 0.0f);
+        for (int u = 0; u < 10; ++u) {
+            const size_t s = (size_t)(2.4 * u * kAsrRate), e = s + (size_t)(1.4 * kAsrRate);
+            for (size_t i = s; i < e && i < pcm.size(); ++i)
+                pcm[i] = (float)(0.3 * std::sin(2.0 * 3.14159265358979 * 220.0 * (double)i / kAsrRate));
+        }
+        ok(writeBytesFile(wav, pcm16Wav(pcm)), "the test material is written (%TEMP%)");
+    }
+    StandInPair si;
+    const bool listening = si.start();
+    ok(listening, "the stand-in pair listens on the loopback");
+    if (!listening) {
+        ::DeleteFileW(wav.c_str());
+        ::RemoveDirectoryW(dir.c_str());
+        return;
+    }
+
+    Shared sh;
+    sh.testSources = true;
+    TrAudio audio;
+    audio.setPartialSec(0.6);                     // the live line on, at 1.1.0's default cadence
+    HostLiveEvents events(sh);
+    HubOptions ho;
+    ho.testSources = true;
+    TrCaptureHub hub(&events, ho);
+    Servers srv;                                  // no payload: the stand-in IS the live pair
+    srv.standInLiveForTest(si.port());
+    TrConfig pc;                                  // the defaults, nothing read or written (persist = false)
+    pc.commit = true;
+    pc.partialMt = true;
+    std::thread pipe(pipelineMain, std::ref(sh), std::ref(audio), std::ref(hub), std::ref(srv), pc, false);
+
+    std::vector<std::string> wire;
+    auto stateNow = [&] { std::lock_guard<std::mutex> lk(sh.mx); return sh.state; };
+    auto send = [&](const std::string& m) { servantHandle(sh, nullptr, trpipe::split(m), &hub); };
+    auto waitFor = [&](const std::function<bool()>& cond, DWORD ms) {
+        const ULONGLONG t0 = ::GetTickCount64();
+        for (;;) {
+            drainWire(sh, wire);
+            if (cond()) return true;
+            if (::GetTickCount64() - t0 > ms) return false;
+            ::Sleep(10);
+        }
+    };
+    struct Ev { char kind; uint64_t seg; bool closes; size_t at; };
+    auto evsFrom = [&](size_t i0) {
+        std::vector<Ev> v;
+        for (size_t i = i0; i < wire.size(); ++i) {
+            const auto t = trpipe::split(wire[i]);
+            if (t.empty()) continue;
+            trpipe::WireLine l; trpipe::WirePartial p; trpipe::WireEnd e;
+            if (t[0] == "LINE" && trpipe::unpackLine(t, l))         v.push_back({ 'L', l.segId, l.closes, i });
+            else if (t[0] == "PART" && trpipe::unpackPartial(t, p)) v.push_back({ 'P', p.segId, false, i });
+            else if (t[0] == "END" && trpipe::unpackEnd(t, e))      v.push_back({ 'E', e.segId, true, i });
+        }
+        return v;
+    };
+    auto firstFinalPrompt = [&](size_t r0, bool& found) {
+        found = false;
+        const auto r = si.requests();
+        for (size_t i = r0; i < r.size(); ++i) if (!r[i].draft) { found = true; return r[i].prompt; }
+        return std::string();
+    };
+    trpipe::WireLive lv;
+    lv.on = true;
+    lv.inputs.push_back({ "wav:" + wideToUtf8L(wav) + "@loop", "Tone", 0, 0.0 });
+    const std::string liveOn = trpipe::packLive(lv);
+
+    // ---- A. LIVE 0 with finals queued: the capture goes at once, the queue is FINISHED --------------------------
+    si.setGate(true);
+    send(liveOn);
+    const bool inFlight = waitFor([&] { return si.held() == 1; }, 20000);
+    ok(inFlight, "A: a final reaches the pair and is held there (the pipeline thread is in a model call)");
+    const bool queued = waitFor([&] { return audio.finalWaiting(); }, 15000);
+    if (queued) waitFor([] { return false; }, 2600);           // ... and one more utterance cut and queued
+    ok(queued, "A: ... while the VAD queues the next utterance(s) behind it");
+    drainWire(sh, wire);
+    const size_t aStop = wire.size();
+    send("LIVE\t0");
+    const bool aReleased = !hub.running();
+    const bool aStillLive = stateNow().live;
+    ok(aReleased, "A: LIVE 0 -> the hub is stopped when the door returns (RVA-7: the devices released at once) while "
+                  "the pipeline thread is still in its model call");
+    ok(aStillLive, "A: ... and STATE live stays 1: the queued finals are still to be finished (the drain)");
+    {
+        trpipe::WireFile f;
+        f.jobId = 91; f.path = wideToUtf8L(wav); f.quality = "auto";
+        send(trpipe::packFile(f));
+        drainWire(sh, wire);
+        int n = 0;
+        bool liveWords = false;
+        for (const auto& m : wire) {
+            trpipe::WireFileDone d;
+            if (trpipe::unpackFileDone(trpipe::split(m), d) && d.jobId == 91) {
+                ++n;
+                liveWords = d.result == "error" && d.err == kLiveFileRefusal;
+            }
+        }
+        ok(n == 1 && liveWords, "A: a FILE during the drain: ONE FDONE error with the live sentence, at once");
+    }
+    const ULONGLONG a0 = ::GetTickCount64();
+    si.setGate(false);
+    size_t aOff = 0;
+    const bool aEnded = waitFor([&] {
+        if (stateNow().live) return false;
+        aOff = wire.size();
+        return true;
+    }, 30000);
+    const double aSec = (double)(::GetTickCount64() - a0) / 1000.0;
+    drainWire(sh, wire);
+    int aLines = 0, aLate = 0, aEnds = 0;
+    for (const Ev& e : evsFrom(aStop)) {
+        if (e.kind == 'L') { ++aLines; if (e.at >= aOff) ++aLate; }
+        if (e.kind == 'E') ++aEnds;
+    }
+    const auto aTexts = si.finalTexts();
+    std::printf("    A: drained in %.1f s: %d final(s) answered after the stop, %d LINE(s) between LIVE 0 and STATE live 0, "
+                "%d after it, %d END\n", aSec, (int)aTexts.size(), aLines - aLate, aLate, aEnds);
+    ok(aEnded, "A: STATE live 0 once the queue is finished");
+    ok(aLines >= 2 && aLines == (int)aTexts.size(),
+       "A: EVERY final queued at the stop is finished, the one in flight AND the queued one(s): one LINE each");
+    ok(aLate == 0, "A: ... each of them after the LIVE 0 and BEFORE STATE live 0");
+    ok(aEnds == 0, "A: no END: every utterance had its closing LINE");
+    ok(!audio.finalWaiting(), "A: the queue is empty after the drain");
+    ok(!srv.up(), "A: the live pair is down once STATE says live 0");
+
+    // ---- A2. LIVE 1 during the drain: it resumes --------------------------------------------------------------------
+    si.setGate(true);
+    srv.standInLiveForTest(si.port());
+    send(liveOn);
+    const bool a2Held = waitFor([&] { return si.held() == 1; }, 20000);
+    const bool a2Queued = a2Held && waitFor([&] { return audio.finalWaiting(); }, 15000);
+    ok(a2Held && a2Queued, "A2: a final in flight, another queued behind it");
+    send("LIVE\t0");
+    const bool a2Stopped = !hub.running();
+    send(liveOn);                                     // ... and LIVE 1 again, the pipeline thread still in its model call
+    drainWire(sh, wire);
+    const size_t a2Go = wire.size();
+    si.setGate(false);
+    bool a2Off = false;
+    const bool a2Resumed = waitFor([&] {
+        if (!stateNow().live) a2Off = true;
+        return hub.running();
+    }, 10000);
+    const bool a2Lines = waitFor([&] {
+        if (!stateNow().live) a2Off = true;
+        int n = 0;
+        for (const Ev& e : evsFrom(a2Go)) if (e.kind == 'L') ++n;
+        return n >= 2;
+    }, 15000);
+    ok(a2Stopped, "A2: LIVE 0 stopped the capture at once");
+    ok(a2Resumed && a2Lines && !a2Off,
+       "A2: the LIVE 1 RESUMED it -- the hub runs again, the queued finals got their LINEs, STATE live never went to 0");
+    drainWire(sh, wire);
+    send("LIVE\t0");
+    ok(waitFor([&] { return !stateNow().live; }, 30000), "A2: ... and the next LIVE 0 drains and ends it");
+    ok(!srv.up(), "A2: the live pair is down");
+    std::string tA;
+    for (const auto& t : si.finalTexts()) if (!t.empty()) tA = t;
+
+    // ---- B. the END a draft on screen is owed; Listen off / on keeps the session's memory -----------------------
+    const trpipe::WireState sA = stateNow();
+    si.setFinalEmpty(true);                         // every final says nothing now: a draft is all the screen gets
+    srv.standInLiveForTest(si.port());
+    drainWire(sh, wire);
+    const size_t bStart = wire.size();
+    const size_t bReq0 = si.requests().size();
+    send(liveOn);
+    const bool bOn = waitFor([&] { return stateNow().live; }, 5000);
+    ok(bOn && stateNow().spkCount == sA.spkCount,
+       "B: LIVE 1 again: STATE's voice count is not reset by Listen off / on (" + std::to_string(sA.spkCount) + ")");
+    bool bFinal = false;
+    waitFor([&] { firstFinalPrompt(bReq0, bFinal); return bFinal; }, 20000);
+    const std::string bPrompt = firstFinalPrompt(bReq0, bFinal);
+    const std::string tAWords = tA.empty() ? std::string() : tA.substr(0, tA.size() - 1);   // without its full stop
+    std::printf("    B: the first final's prompt after Listen off / on: \"%s\"\n", bPrompt.c_str());
+    ok(bFinal && !tAWords.empty() && bPrompt.find(tAWords) != std::string::npos,
+       "B: Listen off / on KEEPS the conversation's memory: the next final's prompt carries the last session's sentence");
+    drainWire(sh, wire);
+    const size_t bMark = wire.size();
+    const bool bPart = waitFor([&] {
+        for (const Ev& e : evsFrom(bMark)) if (e.kind == 'P') return true;
+        return false;
+    }, 20000);
+    ok(bPart, "B: a draft (PART) of an open utterance reaches the wire");
+    drainWire(sh, wire);
+    const size_t bStop = wire.size();
+    send("LIVE\t0");
+    size_t bOff = 0;
+    const bool bEnded = waitFor([&] {
+        if (stateNow().live) return false;
+        bOff = wire.size();
+        return true;
+    }, 30000);
+    drainWire(sh, wire);
+    uint64_t lastPart = 0;
+    int bEnds = 0, bLines = 0, bEndsLate = 0, bEndsBeforeStop = 0;
+    for (const Ev& e : evsFrom(bStart)) {
+        if (e.kind == 'P' && (bOff == 0 || e.at < bOff)) lastPart = e.seg;
+        if (e.kind == 'L') ++bLines;
+        if (e.kind == 'E') {
+            ++bEnds;
+            if (e.at >= bOff) ++bEndsLate;
+            if (e.at < bStop) ++bEndsBeforeStop;
+        }
+    }
+    int bEndsForIt = 0;
+    for (const Ev& e : evsFrom(bStop)) if (e.kind == 'E' && e.seg == lastPart) ++bEndsForIt;
+    std::printf("    B: the last draft on screen is utterance #%llu; after LIVE 0: %d END(s), %d for it; %d LINE(s)\n",
+                (unsigned long long)lastPart, bEnds, bEndsForIt, bLines);
+    ok(bEnded, "B: STATE live 0");
+    ok(bEndsForIt == 1 && bEnds == 1 && bEndsLate == 0 && bEndsBeforeStop == 0,
+       "B: LIVE 0 owes the draft on screen ONE END -- after the LIVE 0, before STATE live 0 -- and nothing else");
+    ok(bLines == 0, "B: no LINE (every final said nothing)");
+
+    // ---- C. CTL clear = a new session; QUIT does not drain ------------------------------------------------------
+    send("CTL\t\t\t1");
+    const bool cCleared = waitFor([&] { return stateNow().spkCount == 0; }, 3000);
+    waitFor([] { return false; }, 200);           // a lap of the pipeline: the clear is applied at its top
+    ok(cCleared, "C: CTL clear -> STATE's voice count 0 (the voice clusters reset: a new session)");
+    if (!sA.spkOn)
+        std::printf("    NOT CHECKED: the voice clusters themselves (diarization is off here: no speaker model found); "
+                    "only STATE's count\n");
+    si.setFinalEmpty(false);
+    si.setGate(true);
+    srv.standInLiveForTest(si.port());
+    const size_t cReq0 = si.requests().size();
+    send(liveOn);
+    const bool cHeld = waitFor([&] { return si.held() == 1; }, 20000);
+    bool cFinal = false;
+    const std::string cPrompt = firstFinalPrompt(cReq0, cFinal);
+    std::printf("    C: the first final's prompt after the clear: \"%s\"\n", cPrompt.c_str());
+    ok(cHeld && cFinal && !tAWords.empty() && cPrompt.find(tAWords) == std::string::npos,
+       "C: ... and the conversation's memory is gone: the next final's prompt no longer carries the last sentence");
+    const bool cQueued = waitFor([&] { return audio.finalWaiting(); }, 15000);
+    ok(cQueued, "C: finals queued behind the one in flight when QUIT comes");
+    drainWire(sh, wire);
+    const size_t cQuit = wire.size();
+    sh.quit.store(true, std::memory_order_release);
+    sh.abortJob.store(kAbortAll, std::memory_order_release);
+    si.setGate(false);
+    pipe.join();
+    drainWire(sh, wire);
+    int cLines = 0, cEnds = 0;
+    for (const Ev& e : evsFrom(cQuit)) {
+        if (e.kind == 'L') ++cLines;
+        if (e.kind == 'E') ++cEnds;
+    }
+    std::printf("    C: after QUIT: %d LINE(s), %d END(s); the queue %s\n", cLines, cEnds,
+                audio.finalWaiting() ? "still holds finals (not drained)" : "is EMPTY");
+    ok(cLines <= 1 && cEnds == 0, "C: QUIT does not drain: at most the final in flight gets its LINE, no END");
+    ok(audio.finalWaiting(), "C: ... the queued finals are left in the queue");
+
+    hub.stop();
+    si.stop();
+    ::DeleteFileW(wav.c_str());
+    ::RemoveDirectoryW(dir.c_str());
+    std::printf("    %s\n", failures == before ? "capture released at once / queue finished before live 0 / the owed END / "
+                                                "memory kept off-on, reset on clear / QUIT without drain OK"
+                                              : "SEE FAILURES ABOVE");
+}
+
+
+// ===========================================================================
+// [0h] THE LIVE PHANTOM NETS (SuVtitle 1.1.0, RESUME 11) -- offline. The user's first live session (26/10/2026, French
+// <-> Taiwanese, "Show: both") put two lines nobody said on screen:
+//   Input 1/2 (3- Steinberg UR44C) . 2   <its translation>  EN 2.9 s   / Thank you for watching. Please subscribe.
+//   Firefox . 2                          <its translation>  EN 375 ms  / I don't know what I'm saying. I don't know what I'm saying.
+// The badge names the language SPOKEN and the line under the translation is the ORIGINAL: whisper heard English -- a
+// third language, which a two-way session sends into its B half (the Traditional on top) -- and every gate let it by:
+// the quiet shortlist compared ONE caption exactly and only on quiet audio, the file job's credits list never ran on a
+// live line, and nothing knew whisper's loop inside one line. Proved here: (1) the nets alone -- the Simplified fold,
+// the credits list read as a CHAIN, the quiet shortlist GLUED, a loop said ONCE ("non non" kept), the doubt; (2) the
+// SHIPPING finaliseAudio (a closed utterance, a committed sentence) and draftTranscribe behind them, on the [C8c]
+// stand-in pair answering scripted transcripts (no model).
+// ===========================================================================
+void livePhantomTests(int& failures) {
+    std::printf("\n[0h] the LIVE phantom nets: stock outros, whisper's loops, the doubt (offline: a stand-in pair)\n");
+    const int before = failures;
+    auto ok = [&](bool cond, const std::string& what) {
+        if (!cond) { std::printf("    ASSERT FAIL: %s\n", what.c_str()); ++failures; }
+    };
+    // The two phantoms as heard, and their variants. (The Traditional and Simplified texts are UTF-8 escapes.)
+    const std::string kEnOutro  = "Thank you for watching. Please subscribe.";
+    const std::string kEnLoop   = "I don't know what I'm saying. I don't know what I'm saying.";
+    const std::string kEnOnce   = "I don't know what I'm saying.";
+    // U+8B1D,8B1D,89C0,770B U+8ACB,8A02,95B1 -- phantom 1's caption pair in Traditional, as the screen showed it (spaced), then glued
+    const std::string kTwOutro  = "\xe8\xac\x9d\xe8\xac\x9d\xe8\xa7\x80\xe7\x9c\x8b \xe8\xab\x8b\xe8\xa8\x82\xe9\x96\xb1";
+    const std::string kTwOutroG = "\xe8\xac\x9d\xe8\xac\x9d\xe8\xa7\x80\xe7\x9c\x8b\xe8\xab\x8b\xe8\xa8\x82\xe9\x96\xb1";
+    // U+8C22,8C22,89C2,770B U+8BF7,8BA2,9605 -- the same in Simplified, spaced then glued
+    const std::string kCnOutro  = "\xe8\xb0\xa2\xe8\xb0\xa2\xe8\xa7\x82\xe7\x9c\x8b \xe8\xaf\xb7\xe8\xae\xa2\xe9\x98\x85";
+    const std::string kCnOutroG = "\xe8\xb0\xa2\xe8\xb0\xa2\xe8\xa7\x82\xe7\x9c\x8b\xe8\xaf\xb7\xe8\xae\xa2\xe9\x98\x85";
+    // U+6211,4E0D,77E5,9053,6211,5728,8AAA,4EC0,9EBC -- phantom 2's sentence in Traditional: twice spaced (as shown), twice glued, once
+    const std::string kTwOnce   = "\xe6\x88\x91\xe4\xb8\x8d\xe7\x9f\xa5\xe9\x81\x93\xe6\x88\x91\xe5\x9c\xa8\xe8\xaa\xaa\xe4\xbb\x80\xe9\xba\xbc";
+    const std::string kTwLoop   = kTwOnce + " " + kTwOnce;
+    const std::string kTwLoopG  = kTwOnce + kTwOnce;
+    // U+6211,4E0D,77E5,9053,6211,5728,8BF4,4EC0,4E48 -- the same in Simplified
+    const std::string kCnOnce   = "\xe6\x88\x91\xe4\xb8\x8d\xe7\x9f\xa5\xe9\x81\x93\xe6\x88\x91\xe5\x9c\xa8\xe8\xaf\xb4\xe4\xbb\x80\xe4\xb9\x88";
+    const std::string kCnLoop   = kCnOnce + " " + kCnOnce;
+    const std::string kBonjour  = "Bonjour \xc3\xa0 tous.";
+
+    // ---- (1) the nets alone ----------------------------------------------------------------------------------------
+    ok(hanFoldSimplified(kTwOutro) == kCnOutro && hanFoldSimplified(kCnOutro) == kCnOutro
+       && hanFoldSimplified(kEnOutro) == kEnOutro && hanFoldSimplified(kBonjour) == kBonjour,
+       "hanFoldSimplified: the Traditional caption pair folds to the Simplified one; Simplified, Latin, accents as written");
+    ok(creditsHallucination(kEnOutro) == 2 && creditsHallucination(kTwOutro) == 2 && creditsHallucination(kTwOutroG) == 2
+       && creditsHallucination(kCnOutro) == 2 && creditsHallucination(kCnOutroG) == 2,
+       "credits: phantom 1's caption pair is ONE stock line -- English, Traditional, Simplified, spaced or glued (a chain)");
+    ok(creditsHallucination("Thank you for watching.") == 2 && creditsHallucination("Thank you for watching over her.") == 0
+       && creditsHallucination("Thank you for watching. I loved the film.") == 0
+       && creditsHallucination("Thank you for watching. Subtitles by the community.") == 1,
+       "...a chain needs EVERY word to be a phrase's ('... over her.' / '... I loved the film.' are dialogue); a credits phrase in it = 1");
+    // U+8ACB,4E0D,541D,9EDE,8D0A U+8A02,95B1 U+8F49,767C / U+5B57,5E55,5FD7,9858,8005 U+674E,5B97,76DB / U+611F,8B1D,89C0,770B: the Traditional rows the list no
+    // longer holds; U+8B1D,8B1D,6536,770B / U+8ACB,8A02,95B1,6211,7684,983B,9053: the new rows, met in Traditional
+    ok(creditsHallucination("\xe8\xab\x8b\xe4\xb8\x8d\xe5\x90\x9d\xe9\xbb\x9e\xe8\xb4\x8a \xe8\xa8\x82\xe9\x96\xb1 \xe8\xbd\x89\xe7\x99\xbc") == 1
+       && creditsHallucination("\xe5\xad\x97\xe5\xb9\x95\xe5\xbf\x97\xe9\xa1\x98\xe8\x80\x85 \xe6\x9d\x8e\xe5\xae\x97\xe7\x9b\x9b") == 1
+       && creditsHallucination("\xe6\x84\x9f\xe8\xac\x9d\xe8\xa7\x80\xe7\x9c\x8b") == 2
+       && creditsHallucination("\xe8\xac\x9d\xe8\xac\x9d\xe6\x94\xb6\xe7\x9c\x8b") == 2
+       && creditsHallucination("\xe8\xab\x8b\xe8\xa8\x82\xe9\x96\xb1\xe6\x88\x91\xe7\x9a\x84\xe9\xa0\xbb\xe9\x81\x93") == 2,
+       "...ONE row per Chinese phrase: the Traditional rows the list dropped still match through the fold, and so do the new ones");
+    ok(looksLikeHallucination(kEnOutro, -40.0) && looksLikeHallucination(kTwOutro, -40.0)
+       && looksLikeHallucination(kCnOutroG, -40.0) && looksLikeHallucination("Thank you. Thank you.", -40.0)
+       && looksLikeHallucination("\xe8\xac\x9d\xe8\xac\x9d \xe8\xac\x9d\xe8\xac\x9d", -40.0),
+       "the quiet shortlist takes captions GLUED end to end, in either script (it compared ONE, exactly)");
+    ok(!looksLikeHallucination(kEnOutro, -12.0) && !looksLikeHallucination(kTwOutro, -12.0)
+       && !looksLikeHallucination("Thank you for coming.", -40.0) && !looksLikeHallucination("Good morning everyone.", -40.0),
+       "...on QUIET audio only, and only when the whole line is captions ('Thank you for coming.', quiet, is kept)");
+    ok(wholeLineRepeat(kEnLoop) == kEnOnce && wholeLineRepeat(kTwLoop) == kTwOnce && wholeLineRepeat(kTwLoopG) == kTwOnce
+       && wholeLineRepeat(kCnLoop) == kCnOnce && wholeLineRepeat(kEnOnce + " " + kEnOnce + " I don't know") == kEnOnce,
+       "whisper's loop: a sentence said twice -- or more, the last cut short -- is ONE sentence, as written, spaced or glued");
+    ok(wholeLineRepeat("Non, non.").empty() && wholeLineRepeat("No, no, no, no!").empty()
+       && wholeLineRepeat("\xe5\xa5\xbd\xe5\xa5\xbd\xe5\xa5\xbd\xe5\xa5\xbd").empty()
+       && wholeLineRepeat("Go go go go go go go go.").empty() && wholeLineRepeat("Is it on? Is it on? Is it on?").empty()
+       && wholeLineRepeat(kEnOnce).empty() && wholeLineRepeat("").empty(),
+       "...a person insisting is not one: 'Non, non.', 'No, no, no, no!', U+597D x4, 'go' x8, a 3-word question x3 (period < 4 atoms)");
+    const HeardHow clean{ -12.0, -0.3, 0.97, false };
+    HeardHow outside = clean, unsure = clean, quiet = clean, shaky = clean;
+    outside.outsidePair = true;
+    unsure.langProb     = 0.45;
+    quiet.peakDbfs      = -40.0;
+    shaky.confidence    = -1.4;
+    ok(heardWithDoubt(clean).empty() && !heardWithDoubt(outside).empty() && !heardWithDoubt(unsure).empty()
+       && !heardWithDoubt(quiet).empty() && !heardWithDoubt(shaky).empty()
+       && heardWithDoubt(HeardHow{ -12.0, 0.0, -1.0, false }).empty(),
+       "the doubt: outside the pair, detection unsure, quiet, whisper's confidence failed; no confidence / no probability = no doubt");
+    {
+        const PhantomVerdict a = livePhantomNet(kEnOutro, outside), b = livePhantomNet(kEnOutro, clean),
+                             c = livePhantomNet(kEnOutro, unsure), d = livePhantomNet(kTwOutro, quiet);
+        ok(a.junk && !b.junk && !b.loop && b.text == kEnOutro && c.junk && d.junk,
+           "phantom 1's net: the stock outro is junk heard with doubt (English in a French <-> Taiwanese session...), a line heard cleanly");
+    }
+    {
+        const PhantomVerdict a = livePhantomNet(kEnLoop, outside), b = livePhantomNet(kEnLoop, clean),
+                             c = livePhantomNet(kTwLoop, shaky), d = livePhantomNet(kTwLoopG, clean),
+                             e = livePhantomNet("Non, non.", outside);
+        ok(a.junk && !b.junk && b.loop && b.text == kEnOnce && c.junk && !d.junk && d.loop && d.text == kTwOnce
+           && !e.junk && !e.loop && e.text == "Non, non.",
+           "phantom 2's net: the loop is junk heard with doubt, ONE sentence heard cleanly; 'Non, non.' stays as said (doubt alone drops nothing)");
+    }
+    ok(livePhantomNet("Sous-titrage Soci\xc3\xa9t\xc3\xa9 Radio-Canada", clean).junk, "a credits line is junk however cleanly it was heard");
+
+    // ---- (2) the shipping stages behind them, on the stand-in pair ------------------------------------------------
+    StandInPair si;
+    const bool listening = si.start();
+    ok(listening, "the stand-in pair listens on the loopback");
+    if (!listening) return;
+    Servers srv;                                  // no payload: the stand-in IS the live pair
+    srv.standInLiveForTest(si.port());
+    TrSpeaker spk;                                // not begun: lines are labelled by input, as with SPKON 0
+    auto routing = [](const char* a, const char* b) {
+        Routing rt;
+        rt.mode = "auto"; rt.langA = a; rt.langB = b;
+        return rt;
+    };
+    const Routing frTw = routing("fr", "zh-tw"), enTw = routing("en", "zh-tw");
+    std::vector<float> tone((size_t)(1.4 * kAsrRate));            // 1.4 s at -13 dBFS of hop RMS: LOUD
+    for (size_t i = 0; i < tone.size(); ++i)
+        tone[i] = (float)(0.3 * std::sin(2.0 * 3.14159265358979 * 220.0 * (double)i / kAsrRate));
+    uint64_t sid = 880000;
+    int transport = 0;                            // a call the stand-in did not answer (a dropped line must not be one)
+    auto report = [](const char* what, const Routing& rt, const char* language, double lp, bool said,
+                     const trpipe::WireLine& line, const std::string& why) {
+        std::printf("    %-9s %s<->%-5s %-7s %.2f  %s\n", what, rt.langA.c_str(), rt.langB.c_str(), language, lp,
+                    said ? ("LINE " + line.lang + "->" + line.dstLang + "  " + line.src).c_str()
+                         : ("no line: " + why).c_str());
+    };
+    // ONE CLOSED UTTERANCE through processSegment, its final answered `text` in `language`.
+    auto closed = [&](const Routing& rt, const std::string& text, const char* language, double lp, trpipe::WireLine& line) {
+        si.sayNext(false, StandInPair::Say{ text, language, lp });
+        TrContext ctx;
+        Segment s;
+        s.mono16k  = tone;
+        s.segId    = ++sid;
+        s.peakDbfs = hopPeakDbfs(tone);
+        StageTimes tm;
+        std::string skip, perr;
+        line = trpipe::WireLine{};
+        const bool said = processSegment(srv, spk, rt, ctx, s, line, tm, skip, perr);
+        if (!perr.empty()) ++transport;
+        report("final", rt, language, lp, said, line, skip + perr);
+        return said;
+    };
+    trpipe::WireLine l;
+    ok(!closed(frTw, kEnOutro, "english", 0.97, l),
+       "LIVE phantom 1 as heard (English, French <-> Taiwanese, loud, detection sure): NO line");
+    ok(closed(enTw, kEnOutro, "english", 0.97, l) && l.lang == "en" && l.src == kEnOutro,
+       "...the same words in an English <-> Taiwanese session, heard cleanly: a line (a person may say them)");
+    ok(!closed(enTw, kEnOutro, "english", 0.45, l), "...and with whisper unsure of the language: no line");
+    ok(!closed(frTw, kTwOutro, "chinese", 0.45, l), "...its Traditional caption pair, detection unsure: no line");
+    ok(closed(frTw, kTwOutro, "chinese", 0.97, l) && l.lang == "zh-tw" && l.src == kTwOutro,
+       "...the Traditional pair heard cleanly, in the pair: a line");
+    ok(!closed(frTw, kEnLoop, "english", 0.97, l),
+       "LIVE phantom 2 as heard (whisper's loop, English, French <-> Taiwanese): NO line");
+    ok(closed(enTw, kEnLoop, "english", 0.97, l) && l.src == kEnOnce, "...the loop heard cleanly, in the pair: ONE sentence");
+    ok(closed(frTw, kTwLoop, "chinese", 0.97, l) && l.lang == "zh-tw" && l.src == kTwOnce,
+       "...its Traditional loop heard cleanly: ONE sentence");
+    ok(closed(frTw, "Non, non.", "french", 0.97, l) && l.lang == "fr" && l.src == "Non, non." && l.dstLang == "zh-tw",
+       "'Non, non.' is a line, as said");
+    // A DRAFT through draftTranscribe: true = the live line and the commit engine get it.
+    auto draft = [&](const Routing& rt, const std::string& text, const char* language, double lp) {
+        si.sayNext(true, StandInPair::Say{ text, language, lp });
+        TrContext ctx;
+        PartialSnap snap;
+        snap.mono16k  = tone;
+        snap.segId    = ++sid;
+        snap.peakDbfs = hopPeakDbfs(tone);
+        AsrResult a;
+        std::string perr;
+        const bool got = draftTranscribe(srv, rt, ctx, snap, a, perr);
+        if (!perr.empty()) ++transport;
+        std::printf("    draft     %s<->%-5s %-7s %.2f  %s\n", rt.langA.c_str(), rt.langB.c_str(), language, lp,
+                    got ? ("kept: " + a.text).c_str() : "no draft");
+        return got;
+    };
+    ok(!draft(frTw, kEnOutro, "english", 0.97) && !draft(frTw, kEnLoop, "english", 0.97),
+       "drafts: a phantom is no draft -- the commit engine never sees its words");
+    ok(!draft(enTw, kEnLoop, "english", 0.97), "...nor is a loop heard cleanly (its WORDS would still say it twice)");
+    ok(draft(frTw, kBonjour, "french", 0.97) && draft(enTw, kEnOutro, "english", 0.97),
+       "...speech is a draft, and so is a stock line heard cleanly in the pair");
+    // A COMMITTED SENTENCE through processCommitted: the final answers `text`, the draft had said `draftSrc`.
+    auto committed = [&](const Routing& rt, const std::string& text, const char* language, double lp,
+                         const std::string& draftSrc, const char* draftLang, trpipe::WireLine& line) {
+        si.sayNext(false, StandInPair::Say{ text, language, lp });
+        TrContext ctx;
+        PartialSnap snap;
+        snap.mono16k  = tone;
+        snap.segId    = ++sid;
+        snap.peakDbfs = hopPeakDbfs(tone);
+        StageTimes tm;
+        std::string skip, perr;
+        line = trpipe::WireLine{};
+        const bool said = processCommitted(srv, spk, rt, ctx, snap, snap.mono16k.size(), draftSrc, draftLang,
+                                           line, tm, skip, perr);
+        if (!perr.empty()) ++transport;
+        report("committed", rt, language, lp, said, line, skip + perr);
+        return said;
+    };
+    ok(committed(frTw, kEnOutro, "english", 0.97, kBonjour, "fr", l) && l.src == kBonjour && l.lang == "fr",
+       "a committed sentence whose FINAL is a phantom: the draft's words stand in (never refused: the commit engine would ask again)");
+    ok(committed(frTw, kEnLoop, "english", 0.97, kEnLoop, "en", l) && l.src == kEnOnce,
+       "...and when those words are a loop, they are said ONCE");
+    ok(committed(enTw, kEnLoop, "english", 0.97, kEnOnce, "en", l) && l.src == kEnOnce,
+       "a committed sentence whose final is a loop heard cleanly: ONE sentence");
+    ok(transport == 0, "the stand-in answered every call (" + std::to_string(transport) + " transport error(s))");
+    si.stop();
+    std::printf("    %s\n", failures == before ? "fold / credits chain / glued shortlist / loops / doubt / finals / drafts / commits OK"
+                                               : "SEE FAILURES ABOVE");
+}
+
+// ===========================================================================
+// [0] THE WIRE CONTRACT -- the whole of TrPipe.h (the header is shared with the app; its packers are proved here),
+// since SuVtitle 1.1.0 its LIVE messages included. A function of its own (1.1.0) so --selftest-live runs the very same
+// section, as AudioPB's --selftest did.
+// ===========================================================================
+// [0] U2 (2026-11-02): THE USER'S OWN MODELS, offline -- FILE's asrModel / mtModel (round trips: the pre-U2 line unchanged,
+// both, one; the path rule's refusals), the HEADER classifier both ends use (whisper.cpp ggml / GGUF / junk / cut short),
+// and the engine's checks on REAL files (in %TEMP%, deleted after): makeFileJob, chooseFileModels, the malformed-FILE
+// door's sentence, bringFile's failed child. Each assertion is one the shipping code could break (mutations: PROGRESS_U2).
+void u2ModelTests(int& failures) {
+    auto ok = [&](bool cond, const char* what) {
+        if (!cond) { std::printf("    ASSERT FAIL: %s\n", what); ++failures; }
+        else std::printf("    ok: %s\n", what);
+    };
+    std::printf("\n[0] U2 -- the user's own models (FILE asrModel / mtModel, the header, the checks)\n");
+    // ---- the wire
+    trpipe::WireFile f, g;
+    f.jobId = 7; f.path = "C:\\m\\film.mkv"; f.langA = "en"; f.langB = "fr";
+    const std::string line0 = trpipe::packFile(f);
+    ok(trpipe::split(line0).size() == 9 && trpipe::unpackFile(trpipe::split(line0), g) && g.asrModel.empty() && g.mtModel.empty(),
+       "a FILE naming no model is the pre-U2 line (9 fields) and reads back with none");
+    f.asrModel = "D:\\My models\\ggml-base.bin";
+    f.mtModel = "\\\\nas\\share\\qwen2.5-1.5b-instruct-q4_k_m.gguf";
+    const std::vector<std::string> t2 = trpipe::split(trpipe::packFile(f));
+    ok(t2.size() == 12 && t2[9].empty() && trpipe::unpackFile(t2, g) && g.asrModel == f.asrModel && g.mtModel == f.mtModel
+       && g.audio.empty(), "both models: fields 11 and 12 (an empty `audio` before them), read back exactly (a drive, a UNC path)");
+    f.mtModel.clear();
+    f.audio = "1:2";
+    ok(trpipe::unpackFile(trpipe::split(trpipe::packFile(f)), g) && g.asrModel == f.asrModel && g.mtModel.empty() && g.audio == "1:2",
+       "one model and a sound track: each in its own field");
+    f.audio.clear();
+    const char* bads[] = { "ggml-base.bin", "models\\ggml-base.bin", "C:ggml.bin", "C:\\a\\..\\b.bin", "C:\\a\\.\\b.bin",
+                           "C:\\m\\x.bin:zone", "C:/m/x.bin", "\\\\?\\C:\\m\\x.bin", "\\\\.\\pipe\\x", "C:\\m\\", "C:\\m\\x|y.bin",
+                           "C:\\m\\a\x01" "b.bin", "C:\\m\\\\x.bin", "\\\\", "C:\\" };
+    int wrong = 0;
+    for (const char* b : bads) {
+        trpipe::WireFile w = f;
+        w.asrModel = b;
+        if (trpipe::unpackFile(trpipe::split(trpipe::packFile(w)), g)) { std::printf("    WRONG: asrModel \"%s\" taken\n", b); ++wrong; }
+        w.asrModel.clear();
+        w.mtModel = b;
+        if (trpipe::unpackFile(trpipe::split(trpipe::packFile(w)), g)) { std::printf("    WRONG: mtModel \"%s\" taken\n", b); ++wrong; }
+    }
+    std::string longOk = "C:\\" + std::string(trpipe::kModelPathMax - 7, 'm') + ".bin", longBad = longOk + "x";
+    trpipe::WireFile lw = f;
+    lw.asrModel = longOk;
+    const bool l1 = trpipe::unpackFile(trpipe::split(trpipe::packFile(lw)), g) && longOk.size() == trpipe::kModelPathMax;
+    lw.asrModel = longBad;
+    const bool l2 = !trpipe::unpackFile(trpipe::split(trpipe::packFile(lw)), g);
+    ok(wrong == 0 && l1 && l2, "a model path that is not a full path to a file refuses the WHOLE FILE (15 forms x 2 fields; 1024 bytes ok, 1025 not)");
+    // ---- the header (TrPipe.h modelKindOfHeader -- the ONE classifier; never the name)
+    auto put32 = [](std::string& b, uint32_t v) { for (int i = 0; i < 4; ++i) b += static_cast<char>((v >> (8 * i)) & 0xff); };
+    auto whisperHead = [&](int vocab, int state, int head, int alayer, int tlayer, int mels, int nfft) {
+        std::string b;
+        put32(b, 0x67676d6cu);
+        const int h[13] = { vocab, 1500, state, head, alayer, 448, state, head, tlayer, mels, 1, mels, nfft };
+        for (int v : h) put32(b, static_cast<uint32_t>(v));
+        return b;
+    };
+    auto ggufHead = [&](uint32_t ver, uint32_t tensors, uint32_t keys) {
+        std::string b = "GGUF";
+        put32(b, ver); put32(b, tensors); put32(b, 0); put32(b, keys); put32(b, 0);
+        return b;
+    };
+    auto kindOf = [](const std::string& b, std::string* why = nullptr) {
+        return trpipe::modelKindOfHeader(reinterpret_cast<const unsigned char*>(b.data()), b.size(), why);
+    };
+    using MK = trpipe::ModelKind;
+    std::string oldLlama;
+    put32(oldLlama, 0x67676d6cu);
+    for (int v : { 32000, 4096, 256, 32, 32, 128, 2, 0, 0, 0, 0, 0, 0 }) put32(oldLlama, static_cast<uint32_t>(v));
+    const std::string base = whisperHead(51865, 512, 8, 6, 6, 80, 201);
+    std::string whyCut, whyOld, whyJunk;
+    const bool h1 = kindOf(base) == MK::Asr && kindOf(whisperHead(51866, 1280, 20, 32, 32, 128, 201)) == MK::Asr
+                 && kindOf(whisperHead(51866, 1280, 20, 32, 4, 128, 201)) == MK::Asr && kindOf(whisperHead(51864, 384, 6, 4, 4, 80, 201)) == MK::Asr;
+    const bool h2 = kindOf(ggufHead(3, 291, 24)) == MK::Mt && kindOf(ggufHead(2, 291, 24)) == MK::Mt;
+    const bool h3 = kindOf(oldLlama, &whyOld) == MK::None && kindOf(whisperHead(51865, 512, 8, 6, 6, 80, 200)) == MK::None
+                 && kindOf(whisperHead(51865, 512, 8, 6, 6, 81, 201)) == MK::None && kindOf(whisperHead(51865, 512, 8, 6, 5, 80, 201)) == MK::Asr;
+    const bool h4 = kindOf(ggufHead(1, 291, 24)) == MK::None && kindOf(ggufHead(4, 291, 24)) == MK::None
+                 && kindOf(ggufHead(3, 0, 24)) == MK::None && kindOf(ggufHead(3, 291, 0)) == MK::None;
+    const bool h5 = kindOf(base.substr(0, 40), &whyCut) == MK::None && kindOf(ggufHead(3, 291, 24).substr(0, 20)) == MK::None
+                 && kindOf("GG") == MK::None && kindOf(std::string()) == MK::None && kindOf(std::string("tjgg") + std::string(60, '\0')) == MK::None
+                 && kindOf(std::string("RIFF") + std::string(60, 'x'), &whyJunk) == MK::None;
+    ok(h1, "whisper.cpp models by their header: base, large-v3 (128 mels), large-v3-turbo (4 text layers), tiny.en (51864)");
+    ok(h2, "GGUF v3 and v2 by their header");
+    ok(h3 && whyOld.find("not a whisper.cpp model") != std::string::npos,
+       "the SAME magic in llama.cpp's first files is NOT a whisper model; n_fft 200 or 81 mels neither");
+    ok(h4, "GGUF v1 / v4 (llama.cpp reads neither), no tensor, no key: refused");
+    ok(h5 && whyCut.find("cut short") != std::string::npos && whyJunk.find("neither") != std::string::npos,
+       "cut short (40 bytes of a whisper header, 20 of a GGUF, 2, 0), an older ggml (\"ggjt\"), a WAV: none, said why");
+    // ---- the checks, on real files
+    wchar_t tmp[MAX_PATH] = {};
+    ::GetTempPathW(MAX_PATH, tmp);
+    const std::wstring dir = std::wstring(tmp) + L"suvtitle_u2_" + std::to_wstring(::GetCurrentProcessId());
+    ::CreateDirectoryW(dir.c_str(), nullptr);
+    std::vector<std::wstring> made;
+    auto write = [&](const wchar_t* leaf, const std::string& bytes) {
+        const std::wstring p = dir + L"\\" + leaf;
+        HANDLE h = ::CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD wr = 0;
+            ::WriteFile(h, bytes.data(), static_cast<DWORD>(bytes.size()), &wr, nullptr);
+            ::CloseHandle(h);
+            made.push_back(p);
+        }
+        return wideToUtf8L(p);
+    };
+    const std::string wsp = write(L"u2 whisper.bin", base + std::string(64, '\0'));
+    const std::string ggp = write(L"u2 model.gguf", ggufHead(3, 291, 24) + std::string(64, '\0'));
+    const std::string jkp = write(L"u2 junk.gguf", std::string("RIFF") + std::string(60, 'x'));
+    const std::string gone = wideToUtf8L(dir + L"\\u2 gone.bin");
+    TrConfig cfg;
+    std::unique_ptr<FileJob> job;
+    std::string err;
+    auto make = [&](const std::string& asr, const std::string& mt) {
+        trpipe::WireFile w;
+        w.jobId = 9; w.path = "C:\\m\\film.mkv"; w.langA = "en"; w.langB = "fr"; w.mode = "auto";
+        w.asrModel = asr; w.mtModel = mt;
+        err.clear();
+        job.reset();
+        return makeFileJob(w, "en", "fr", "auto", cfg, job, err);
+    };
+    Servers noPayload;
+    const bool c1 = make(wsp, "") && job && job->asrCustom == wsp && job->mtCustom.empty() && chooseFileModels(*job, noPayload, err)
+                 && job->asrModel == wsp;
+    ok(c1, "an imported whisper.cpp model: the job takes it, and its whisper runs on THAT path (quality unread)");
+    const bool c2 = make("", ggp) && job && job->mtCustom == ggp && job->mtModel == ggp && job->asrCustom.empty();
+    ok(c2, "an imported GGUF: the job's MT is THAT file");
+    const bool c3 = !make(ggp, "") && trpipe::fileModelErrKind(err) == "asr" && err.find("\"u2 model.gguf\"") != std::string::npos
+                 && err.find("GGUF") != std::string::npos && !job;
+    ok(c3, "a GGUF named as the transcription model: refused before anything loads, the sentence an imported ASR's, naming it");
+    std::printf("      (%s)\n", err.c_str());
+    const bool c4 = !make("", wsp) && trpipe::fileModelErrKind(err) == "mt" && err.find("whisper.cpp") != std::string::npos;
+    ok(c4, "a whisper.cpp model named as the translation model: refused, an imported MT's sentence");
+    const bool c5 = !make(jkp, "") && trpipe::fileModelErrKind(err) == "asr" && err.find("neither") != std::string::npos;
+    ok(c5, "junk named \".gguf\": its header decides (neither), never its name");
+    const bool c6 = !make(gone, "") && trpipe::fileModelErrKind(err) == "asr" && err.find("not there") != std::string::npos;
+    std::printf("      (%s)\n", err.c_str());
+    ok(c6, "a model file that is gone: refused, \"the file is not there\"");
+    const bool c7 = !make("", "relative.gguf") && trpipe::fileModelErrKind(err) == "mt";
+    ok(c7, "a relative path (a FILE built without unpackFile): refused by the path rule, an imported MT's sentence");
+    ok(make("", "") && job && job->asrCustom.empty() && job->mtCustom.empty() && trpipe::fileModelErrKind(err).empty(),
+       "no model named: the shipping choice, untouched");
+    // the malformed-FILE door (the servant): a model path that does not parse = ONE refusal, an imported model's sentence
+    {
+        Shared sh;
+        trpipe::WireFile w = f;
+        w.asrModel = "x.bin";
+        servantHandle(sh, nullptr, trpipe::split(trpipe::packFile(w)));
+        w.asrModel.clear();
+        w.mtModel = "C:\\m\\..\\x.gguf";
+        servantHandle(sh, nullptr, trpipe::split(trpipe::packFile(w)));
+        w.mtModel = "C:\\m\\ok.gguf";
+        w.audio = "1:2:3";
+        servantHandle(sh, nullptr, trpipe::split(trpipe::packFile(w)));
+        const bool d = sh.fileReqs.size() == 3 && trpipe::fileModelErrKind(sh.fileReqs[0].refuse) == "asr"
+                    && trpipe::fileModelErrKind(sh.fileReqs[1].refuse) == "mt"
+                    && trpipe::fileModelErrKind(sh.fileReqs[2].refuse).empty() && sh.fileReqs[2].refuse.find("sound track") != std::string::npos;
+        ok(d, "the door: a bad asrModel / mtModel path = one refusal each, an imported model's sentence; a bad audio keeps its own");
+    }
+    // bringFile's failed child: nothing to blame on a model when the payload itself is missing
+    {
+        Servers s;
+        const bool b = !s.bringFile(wsp, ggp, false, {}, true, true) && s.lastFailKind() == 0;
+        ok(b, "no payload: bringFile fails with no model to blame (lastFailKind 0 -- the payload's sentence stands)");
+    }
+    const std::string sent = importedModelSentence(false, "C:\\models\\my model.gguf", "it would not start");
+    ok(sent == std::string(trpipe::kFileModelErrMt) + "my model.gguf\" could not be used: it would not start."
+       && trpipe::fileModelErrKind(sent) == "mt" && trpipe::fileModelErrKind("ASR model missing: ggml-large-v3-turbo.bin").empty(),
+       "the sentence: the kind's head, the FILE's name (not its folder), why -- and a shipping model's failure is no imported one's");
+    for (const auto& p : made) ::DeleteFileW(p.c_str());
+    ::RemoveDirectoryW(dir.c_str());
+}
+
+void wireContractTests(int& failures) {
     // ---- 0. THE WIRE CONTRACT ------------------------------------------------
     // Cheap, offline, and first on purpose: every field added in this wave is OPTIONAL and
     // APPENDED, and the only way that claim stays true is if something asserts it. Two
@@ -7545,6 +12341,7 @@ int runSelftest(bool offline) {
         ok(!trpipe::unpackFile(trpipe::split("FILE\t0\tC:\\a.mp4"), rwf2)
            && !trpipe::unpackFile(trpipe::split("FILE\t7\t"), rwf2),
            "FILE with id 0 or no path is refused");
+        u2ModelTests(failures);             // U2 (2026-11-02): the user's own models -- the wire, the header, the checks
         uint64_t cid = 0;
         ok(trpipe::unpackFileCancel(trpipe::split(trpipe::packFileCancel(9)), cid) && cid == 9
            && !trpipe::unpackFileCancel(trpipe::split("FCANCEL\t0"), cid),
@@ -7588,10 +12385,175 @@ int runSelftest(bool offline) {
         ok(trpipe::unpackProxyDone(trpipe::split(trpipe::packProxyDone(wpd)), rpd) && rpd.jobId == 4
            && !rpd.ok && rpd.out == wpd.out && rpd.err == "superseded",
            "FPROXYDONE round-trip");
-        std::printf("    STATE/LINE/PART/CTL + FILE/FCANCEL/FPROXY/FPROG/FCUE/FDONE/FPROXYDONE: %s\n",
+        // ---- SUVTITLE LIVE (1.1.0): STATE's live fields, CTL's scope, LIVE / SRCLIST / SRC / SRCEND / INPUT / LEVELS --
+        // Through the SHARED packers (common/TrPipe.h), like every message above. LIVE is the strict one (capturing the
+        // wrong device, or the right one at the wrong gain, is worse than not starting): each of its refusals is
+        // asserted ONE BY ONE, against a message that is otherwise valid -- a refusal proved on a message that is wrong
+        // twice proves nothing about either rule.
+        {
+            trpipe::WireState ls = s;
+            ls.live = true; ls.liveMode = "b2a"; ls.liveLangA = "fr"; ls.liveLangB = "zh-tw";
+            trpipe::WireState lr;
+            ok(trpipe::unpackState(trpipe::split(trpipe::packState(ls)), lr) && lr.live && lr.liveMode == "b2a"
+               && lr.liveLangA == "fr" && lr.liveLangB == "zh-tw" && lr.langA == "fr" && lr.langB == "ja" && lr.mode == "a2b",
+               "STATE round-trip with live + the LIVE pair, the player's pair beside it untouched");
+            trpipe::WireState l13;
+            ok(trpipe::unpackState(shorten(trpipe::packState(ls), 13), l13) && !l13.live && l13.liveMode.empty()
+               && l13.liveLangA.empty() && l13.liveLangB.empty() && l13.langB == "ja",
+               "a 1.0.0 STATE (13 fields): not live, and NO live pair (empty -- never a language)");
+            trpipe::WireState l14;
+            ok(trpipe::unpackState(shorten(trpipe::packState(ls), 14), l14) && l14.live && l14.liveLangA.empty(),
+               "STATE with `live` alone: live, no pair reported");
+
+            // CTL: a player's CTL is byte-for-byte the 1.0.0 one; scope=live round-trips; the scope rules
+            trpipe::WireCtl cp;
+            cp.mode = "a2b"; cp.langA = "es"; cp.langB = "fr";
+            ok(trpipe::split(trpipe::packCtl(cp)).size() == 6, "a player's CTL (no scope) packs to the 1.0.0 six fields");
+            trpipe::WireCtl cl = cp;
+            cl.scope = trpipe::kCtlScopeLive;
+            trpipe::WireCtl rcl, rcp, rcf, rcx;
+            ok(trpipe::unpackCtl(trpipe::split(trpipe::packCtl(cl)), rcl) && rcl.scope == "live" && trpipe::ctlIsLive(rcl)
+               && trpipe::ctlScopeKnown(rcl) && rcl.langA == "es" && rcl.mode == "a2b",
+               "CTL scope=live round-trip: the live pair, a known scope");
+            ok(trpipe::unpackCtl(trpipe::split(trpipe::packCtl(cp)), rcp) && rcp.scope.empty() && !trpipe::ctlIsLive(rcp)
+               && trpipe::ctlScopeKnown(rcp)
+               && trpipe::unpackCtl(trpipe::split("CTL\ta2b\t\t0\ten\tfr\tfile"), rcf) && !trpipe::ctlIsLive(rcf)
+               && trpipe::ctlScopeKnown(rcf),
+               "CTL with no scope, and scope=file: the PLAYER's pair, known scopes");
+            ok(trpipe::unpackCtl(trpipe::split("CTL\ta2b\t\t0\ten\tfr\tvideo"), rcx) && !trpipe::ctlScopeKnown(rcx)
+               && !trpipe::ctlIsLive(rcx),
+               "CTL with an unknown scope parses -- and is NOT known (the reader ignores it whole)");
+
+            // LIVE: a full one round-trips, field by field
+            trpipe::WireLive lv;
+            lv.on = true;
+            lv.inputs.push_back({ "in:{0.0.1.00000000}.{6f1c0e2a-1}", "Moi", 1, -3.5 });
+            lv.inputs.push_back({ "in:{0.0.1.00000000}.{6f1c0e2a-1}", "L'invit\xc3\xa9", 2, 6.0 });
+            lv.inputs.push_back({ "app:Zoom.exe", "Zoom\tcall", 0, 0.0 });
+            lv.inputs.push_back({ "out:{0.0.0.00000000}.{a4}", "", 0, -24.0 });
+            const std::string mLv = trpipe::packLive(lv);
+            trpipe::WireLive rlv;
+            bool same = trpipe::unpackLive(trpipe::split(mLv), rlv) && rlv.on && rlv.inputs.size() == 4;
+            for (size_t i = 0; same && i < 4; ++i)
+                same = rlv.inputs[i].key == lv.inputs[i].key && rlv.inputs[i].label == lv.inputs[i].label
+                    && rlv.inputs[i].chan == lv.inputs[i].chan && rlv.inputs[i].gainDb == lv.inputs[i].gainDb;
+            ok(same, "LIVE round-trip: 4 inputs, keys / labels (a tab, UTF-8) / channels / trims intact");
+            trpipe::WireLive off;
+            ok(trpipe::unpackLive(trpipe::split(trpipe::packLive(trpipe::WireLive{})), off) && !off.on && off.inputs.empty()
+               && trpipe::unpackLive(trpipe::split("LIVE\t0"), off) && !off.on
+               && trpipe::unpackLive(trpipe::split("LIVE\t0\t0"), off) && !off.on,
+               "LIVE 0 (packed, bare, and with its count 0) reads as off");
+            // ... and refused, one rule at a time. `base` is a valid one-input LIVE; each case breaks ONE field.
+            auto liveOf = [](const char* key, const char* label, const char* chan, const char* gain) {
+                return std::string("LIVE\t1\t1\t") + key + "\t" + label + "\t" + chan + "\t" + gain;
+            };
+            trpipe::WireLive lx;
+            ok(trpipe::unpackLive(trpipe::split(liveOf("in:dev", "Me", "0", "0.0")), lx) && lx.inputs.size() == 1,
+               "LIVE: the base case of the refusals below is valid");
+            struct Bad { std::string msg; const char* why; };
+            const std::string k64(64, 'x'), k65(65, 'x'), keyLong = "wav:" + std::string(509, 'p');
+            const Bad kBadLive[] = {
+                { "LIVE",                                         "no on/off field" },
+                { "LIVE\t2\t1\tin:dev\tMe\t0\t0",                  "on is neither 0 nor 1" },
+                { "LIVE\t0\t1",                                   "LIVE 0 with a count of 1" },
+                { "LIVE\t1",                                      "LIVE 1 with no count" },
+                { "LIVE\t1\t0",                                   "LIVE 1 with NO input (n = 0)" },
+                { "LIVE\t1\t5\ta:1\tA\t0\t0\tb:1\tB\t0\t0\tc:1\tC\t0\t0\td:1\tD\t0\t0\te:1\tE\t0\t0", "5 inputs (> kMaxLiveInputs)" },
+                { "LIVE\t1\t2\tin:dev\tMe\t0\t0",                  "the count says 2, one input follows" },
+                { "LIVE\t1\t1\tin:dev\tMe\t0\t0\textra",           "a field too many" },
+                { "LIVE\t1\t1x\tin:dev\tMe\t0\t0",                 "a count that is not a number" },
+                { "LIVE\t1\t\tin:dev\tMe\t0\t0",                   "an empty count" },
+                { "LIVE\t1\t001\tin:dev\tMe\t0\t0",                "a count of three digits" },
+                { liveOf("", "Me", "0", "0"),                     "an empty key" },
+                { liveOf("ain:card", "Me", "0", "0"),             "an ain: key (AudioIn: reserved, refused until it exists)" },
+                { liveOf("sys:all", "Me", "0", "0"),              "a sys: key (out of v1)" },
+                { liveOf("dev", "Me", "0", "0"),                  "a key with no kind" },
+                { liveOf("in:", "Me", "0", "0"),                  "a key with nothing after its kind" },
+                { liveOf("in:dev|1", "Me", "0", "0"),             "a key holding '|' (the lane separator: fix round RVA-10)" },
+                { liveOf(keyLong.c_str(), "Me", "0", "0"),        "a key over 512 bytes" },
+                { liveOf("in:dev", k65.c_str(), "0", "0"),        "a label of 65 bytes" },
+                { liveOf("in:dev", "Me", "9", "0"),               "channel 9 (1..8)" },
+                { liveOf("in:dev", "Me", "10", "0"),              "channel 10" },
+                { liveOf("in:dev", "Me", "mix", "0"),             "channel 'mix' (0 is the mix)" },
+                { liveOf("in:dev", "Me", "", "0"),                "an empty channel" },
+                { liveOf("in:dev", "Me", "-1", "0"),              "channel -1" },
+                { liveOf("in:dev", "Me", "0", "24.1"),            "a trim of +24.1 dB" },
+                { liveOf("in:dev", "Me", "0", "-24.5"),           "a trim of -24.5 dB" },
+                { liveOf("in:dev", "Me", "0", "nan"),             "a trim of NaN" },
+                { liveOf("in:dev", "Me", "0", "1e3"),             "a trim of 1e3" },
+                { liveOf("in:dev", "Me", "0", ""),                "an empty trim" },
+                { liveOf("in:dev", "Me", "0", "3dB"),             "a trim with a unit" },
+                { "LIVE\t1\t2\tin:dev\tA\t1\t0\tin:dev\tB\t1\t0",   "one device twice on the SAME channel" },
+                { "LIVE\t1\t2\tin:dev\tA\t0\t0\tin:dev\tB\t2\t0",   "one device as a mix AND as one of its channels" },
+            };
+            int refusedOk = 0;
+            for (const Bad& b : kBadLive) {
+                trpipe::WireLive r;
+                const bool read = trpipe::unpackLive(trpipe::split(b.msg), r);
+                if (read) std::printf("    ASSERT FAIL: LIVE accepted with %s\n", b.why);
+                else ++refusedOk;
+                if (read) ++failures;
+            }
+            std::printf("    LIVE refusals: %d of %d malformed messages refused whole\n", refusedOk,
+                        (int)(sizeof(kBadLive) / sizeof(kBadLive[0])));
+            ok(trpipe::unpackLive(trpipe::split(liveOf("in:dev", k64.c_str(), "8", "24")), lx)
+               && trpipe::unpackLive(trpipe::split(liveOf("in:dev", "", "0", "-24")), lx)
+               && trpipe::unpackLive(trpipe::split("LIVE\t1\t2\tin:dev\tA\t1\t0\tin:dev\tB\t2\t-6.5"), lx)
+               && lx.inputs.size() == 2 && lx.inputs[1].gainDb == -6.5,
+               "LIVE accepts the edges: a 64-byte label, channel 8, +24 / -24 dB, an empty label, one device on two channels");
+
+            // SRCLIST / SRC / SRCEND / INPUT / LEVELS
+            ok(trpipe::isSrcList(trpipe::split(trpipe::packSrcList())) && !trpipe::isSrcList(trpipe::split("SRCLISTX"))
+               && !trpipe::isSrcList(trpipe::split("")),
+               "SRCLIST is recognised, and only SRCLIST");
+            trpipe::WireSrc sr;
+            sr.gen = 7; sr.kind = "in"; sr.key = "in:{0.0.1}.{9}"; sr.label = "Micro (Interface)\tch"; sr.state = "busy";
+            sr.rate = 48000; sr.ch = 2; sr.flags = "default,comm";
+            trpipe::WireSrc rsr, rsr6, rbad;
+            ok(trpipe::unpackSrc(trpipe::split(trpipe::packSrc(sr)), rsr) && rsr.gen == 7 && rsr.kind == "in"
+               && rsr.key == sr.key && rsr.label == sr.label && rsr.state == "busy" && rsr.rate == 48000 && rsr.ch == 2
+               && rsr.flags == "default,comm",
+               "SRC round-trip (a tab in the label, both flags)");
+            ok(trpipe::unpackSrc(shorten(trpipe::packSrc(sr), 6), rsr6) && rsr6.rate == 0 && rsr6.ch == 0 && rsr6.flags.empty(),
+               "SRC without rate / channels / flags parses (lenient: unknown, none)");
+            ok(!trpipe::unpackSrc(trpipe::split("SRC\t0\tin\tin:x\tX\tok"), rbad)
+               && !trpipe::unpackSrc(trpipe::split("SRC\t3\tin\t\tX\tok"), rbad),
+               "SRC with gen 0 or no key is refused");
+            trpipe::WireSrcEnd se;
+            se.gen = 7; se.n = 12;
+            trpipe::WireSrcEnd rse;
+            ok(trpipe::unpackSrcEnd(trpipe::split(trpipe::packSrcEnd(se)), rse) && rse.gen == 7 && rse.n == 12
+               && !trpipe::unpackSrcEnd(trpipe::split("SRCEND\t0\t3"), rse),
+               "SRCEND round-trip; gen 0 refused");
+            trpipe::WireInput wi;
+            wi.key = "app:Teams.exe"; wi.state = "denied"; wi.why = "Windows blocks microphone access for desktop apps.";
+            trpipe::WireInput rwi, rwi3;
+            ok(trpipe::unpackInput(trpipe::split(trpipe::packInput(wi)), rwi) && rwi.key == wi.key && rwi.state == "denied"
+               && rwi.why == wi.why
+               && trpipe::unpackInput(trpipe::split("INPUT\tin:x\topen"), rwi3) && rwi3.why.empty()
+               && !trpipe::unpackInput(trpipe::split("INPUT\t\topen"), rwi3)
+               && !trpipe::unpackInput(trpipe::split("INPUT\tin:x\t"), rwi3),
+               "INPUT round-trip; `why` optional; an empty key or state refused");
+            trpipe::WireLevels lvl;
+            lvl.peaks = { { "in:a", -12.34f }, { "app:Zoom.exe", -120.0f } };
+            trpipe::WireLevels rl1, rl2;
+            ok(trpipe::unpackLevels(trpipe::split(trpipe::packLevels(lvl)), rl1) && rl1.peaks.size() == 2
+               && rl1.peaks[0].first == "in:a" && std::fabs(rl1.peaks[0].second - (-12.3f)) < 1e-4f
+               && rl1.peaks[1].second == -120.0f,
+               "LEVELS round-trip (one decimal)");
+            ok(trpipe::unpackLevels(trpipe::split("LEVELS\tin:a\t-200\tin:b\t99\tin:c\tnan\t\t-3\tin:d\tx\tin:e\t-6.5"), rl2)
+               && rl2.peaks.size() == 3 && rl2.peaks[0].second == -120.0f && rl2.peaks[1].second == 24.0f
+               && rl2.peaks[2].first == "in:e",
+               "LEVELS is lenient: clamped to [-120, +24], an unreadable pair skipped, never refused");
+        }
+        std::printf("    STATE/LINE/PART/CTL + FILE/FCANCEL/FPROXY/FPROG/FCUE/FDONE/FPROXYDONE"
+                    " + LIVE/SRCLIST/SRC/SRCEND/INPUT/LEVELS: %s\n",
                     failures ? "SEE FAILURES ABOVE" : "round-trip + back-compat OK");
     }
+}
 
+// [0bis] (WA): Traditional Chinese, offline -- a function of its own for the same reason as [0].
+void tradChineseTests(int& failures) {
     // ---- 0bis. TRADITIONAL CHINESE (wave WA): the parts that need no server -------------
     // Offline and up front, for the same reason [0] is: these are the decisions the live
     // section [6] depends on, and a routing mistake here would show up there only as "the
@@ -7918,12 +12880,408 @@ int runSelftest(bool offline) {
         std::printf("    %s\n", failures == before ? "codes / votes / routing / prompts OK"
                                                    : "SEE FAILURES ABOVE");
     }
+}
+
+// ===========================================================================
+// [0v] U3 (2026-11-02): THE TRANSCRIPT'S VOICE PASS, offline -- FVOICE / FSPK as the engine reads them, clusterOffline
+// against the naive loop it reproduces (OnlineClusterer::reclusterNow's), the labelling rules (the short pieces, the known
+// changes of speaker), and WHOLE voice jobs through the pipeline's own fileRequests + fileJobLap on a WAV written in TEMP
+// with a STAND-IN voiceprint (g_voiceEmbedForTest): the labels, the snap of a dialogue dash's boundary, the seek, the audio
+// held, FCANCEL, the FILE jobs' one slot shared both ways, the live refusal, a malformed FVOICE, the stage off, a file gone.
+// The REAL CAM++ is --selftest-spk's [7] [8].
+// ===========================================================================
+void u3VoiceTests(int& failures) {
+    auto ok = [&](bool cond, const char* what) {
+        if (!cond) { std::printf("    ASSERT FAIL: %s\n", what); ++failures; }
+        else std::printf("    ok: %s\n", what);
+    };
+    std::printf("\n[0v] U3 -- the transcript's voice pass (FVOICE / FSPK, the clustering, the labels, the job)\n");
+    // ---- the wire, as the engine reads it (app_smoke [10] holds every refusal one by one)
+    {
+        trpipe::WireVoice v, r;
+        v.jobId = 5; v.path = "C:\\m\\a b.wav"; v.spans = "0-1000,1000-1800,3000-5000"; v.changes = "1";
+        trpipe::WireSpk s, sr;
+        s.jobId = 5; s.speakers = 2; s.labels = { 1, 2, 1 }; s.model = "campplus";
+        ok(trpipe::unpackVoice(trpipe::split(trpipe::packVoice(v)), r) && r.spans == v.spans && r.changes == "1"
+           && trpipe::unpackSpk(trpipe::split(trpipe::packSpk(s)), sr) && sr.labels == s.labels,
+           "FVOICE (touching pieces, a change) and FSPK read back exactly");
+        r.changes = "0";
+        ok(!voiceRefusal(r).empty() && voiceRefusal(v).empty(), "voiceRefusal: a change on the first piece refused, a good one not");
+    }
+    uint32_t rng = 20261102u;
+    auto frand = [&]() { rng = rng * 1664525u + 1013904223u; return (double)(rng >> 8) / 16777216.0; };
+    auto unit = [](std::vector<float> v) {
+        double s = 0.0;
+        for (float x : v) s += (double)x * x;
+        s = std::sqrt(s);
+        if (s > 0.0) for (auto& x : v) x = (float)(x / s);
+        return v;
+    };
+    auto seed = [&](int dim) {
+        std::vector<float> v((size_t)dim);
+        for (auto& x : v) x = (float)(frand() * 2.0 - 1.0);
+        return unit(v);
+    };
+    auto jitter = [&](const std::vector<float>& s0, double j) {
+        std::vector<float> v = s0;
+        for (auto& x : v) x += (float)((frand() * 2.0 - 1.0) * j);
+        return unit(v);
+    };
+    // ---- clusterOffline == the naive loop (reclusterNow's, on a plain list), partitions identical
+    {
+        auto naive = [](const std::vector<std::vector<float>>& v, double thr, int cap) {
+            std::vector<int> out(v.size(), -1);
+            std::vector<size_t> idx;
+            for (size_t i = 0; i < v.size(); ++i) if (!v[i].empty()) idx.push_back(i);
+            const int n = (int)idx.size();
+            if (n == 0) return out;
+            std::vector<double> sim((size_t)n * (size_t)n, 0.0);
+            for (int i = 0; i < n; ++i)
+                for (int j = i + 1; j < n; ++j) {
+                    const auto& a = v[idx[(size_t)i]];
+                    const auto& b = v[idx[(size_t)j]];
+                    double s = 0.0;
+                    for (size_t d = 0; d < std::min(a.size(), b.size()); ++d) s += (double)a[d] * (double)b[d];
+                    sim[(size_t)i * n + j] = s;
+                    sim[(size_t)j * n + i] = s;
+                }
+            std::vector<int> size((size_t)n, 1);
+            std::vector<char> act((size_t)n, 1);
+            std::vector<std::vector<int>> mem((size_t)n);
+            for (int i = 0; i < n; ++i) mem[(size_t)i].push_back(i);
+            int nact = n;
+            while (nact > 1) {
+                double bs = -2.0;
+                int bi = -1, bj = -1;
+                for (int i = 0; i < n; ++i) {
+                    if (!act[(size_t)i]) continue;
+                    for (int j = i + 1; j < n; ++j) {
+                        if (!act[(size_t)j]) continue;
+                        const double s = sim[(size_t)i * n + j];
+                        if (s > bs) { bs = s; bi = i; bj = j; }
+                    }
+                }
+                if (bi < 0) break;
+                if (bs < thr && nact <= cap) break;
+                for (int k = 0; k < n; ++k) {
+                    if (!act[(size_t)k] || k == bi || k == bj) continue;
+                    const double x = ((double)size[(size_t)bi] * sim[(size_t)bi * n + k] + (double)size[(size_t)bj] * sim[(size_t)bj * n + k])
+                                   / (double)(size[(size_t)bi] + size[(size_t)bj]);
+                    sim[(size_t)bi * n + k] = x;
+                    sim[(size_t)k * n + bi] = x;
+                }
+                size[(size_t)bi] += size[(size_t)bj];
+                mem[(size_t)bi].insert(mem[(size_t)bi].end(), mem[(size_t)bj].begin(), mem[(size_t)bj].end());
+                mem[(size_t)bj].clear();
+                act[(size_t)bj] = 0;
+                --nact;
+            }
+            std::vector<int> lab((size_t)n, -1);
+            int next = 0;
+            for (int i = 0; i < n; ++i) {
+                if (lab[(size_t)i] >= 0) continue;
+                for (int r = 0; r < n; ++r)
+                    if (act[(size_t)r] && std::find(mem[(size_t)r].begin(), mem[(size_t)r].end(), i) != mem[(size_t)r].end()) {
+                        for (int m : mem[(size_t)r]) lab[(size_t)m] = next;
+                        ++next;
+                        break;
+                    }
+            }
+            for (int i = 0; i < n; ++i) out[idx[(size_t)i]] = lab[(size_t)i];
+            return out;
+        };
+        int same = 0, total = 0;
+        for (int set = 0; set < 200; ++set) {
+            const int n = 1 + (int)(frand() * 60.0);
+            const int dim = 8 + (int)(frand() * 24.0);
+            const int seeds = 1 + (int)(frand() * 6.0);
+            const double jit = 0.05 + frand() * 0.6, thr = -0.3 + frand() * 1.2;
+            const int cap = 1 + (int)(frand() * 8.0);
+            std::vector<std::vector<float>> S;
+            for (int k = 0; k < seeds; ++k) S.push_back(seed(dim));
+            std::vector<std::vector<float>> V;
+            for (int i = 0; i < n; ++i) {
+                if (frand() < 0.08) { V.emplace_back(); continue; }         // a piece with no voiceprint
+                V.push_back(jitter(S[(size_t)(frand() * seeds) % (size_t)seeds], jit));
+            }
+            ++total;
+            if (clusterOffline(V, thr, cap) == naive(V, thr, cap)) ++same;
+            else std::printf("    set %d differs (n %d, thr %.3f, cap %d)\n", set, n, thr, cap);
+        }
+        ok(same == total, "clusterOffline == the naive average-linkage loop on 200 random sets (the same partitions, numbered by first member)");
+        const std::vector<float> one = seed(12);
+        const std::vector<std::vector<float>> ties = { one, one, one, one, one };
+        ok(clusterOffline(ties, 0.5, 8) == naive(ties, 0.5, 8) && clusterOffline(ties, 2.0, 3) == naive(ties, 2.0, 3)
+           && clusterOffline({}, 0.5, 8).empty() && clusterOffline({ std::vector<float>() }, 0.5, 8) == std::vector<int>{ -1 },
+           "clusterOffline: every similarity equal (the naive's first-pair rule), the cap alone, nothing, a piece with no voiceprint");
+    }
+    // ---- the labelling rules (voiceLabels), on synthetic voiceprints
+    {
+        const std::vector<float> X = seed(16), Y = seed(16);
+        std::vector<float> away = seed(16);                               // a voiceprint near neither voice (cosine < 0.5) -- nearer X
+        for (int guard = 0; guard < 1000; ++guard) {
+            double a = 0.0, b = 0.0;
+            for (size_t d = 0; d < 16; ++d) { a += (double)away[d] * X[d]; b += (double)away[d] * Y[d]; }
+            if (a < 0.2 && b < 0.2 && a > b + 0.05) break;               // (closer to X: the nearest is NOT the previous, Y)
+            away = seed(16);
+        }
+        const std::vector<float> none;
+        auto L = [&](const std::vector<std::vector<float>>& e, const std::vector<double>& secs, const std::vector<char>& ch,
+                     int cap = 8, size_t clusterMax = kVoiceClusterMax) {
+            std::vector<uint32_t> lab;
+            voiceLabels(e, secs, ch, 0.50, cap, 1.2, clusterMax, lab);
+            return lab;
+        };
+        using V = std::vector<uint32_t>;
+        ok(L({ jitter(X, .02), jitter(Y, .02), jitter(X, .05) }, { 3, 3, .8 }, { 0, 0, 0 }) == V{ 1, 2, 1 },
+           "a SHORT piece near a voice takes that voice, not the previous speaker's (M2: the one-word answers)");
+        ok(L({ jitter(X, .02), jitter(Y, .02), away }, { 3, 3, .8 }, { 0, 0, 0 }) == V{ 1, 2, 2 },
+           "a short piece near no voice (cosine < 0.50): the previous speaker (the benched rule, kept for it)");
+        ok(L({ jitter(X, .02), Y, Y }, { 3, 3, .8 }, { 0, 0, 1 }) == V{ 1, 2, 1 },
+           "a KNOWN CHANGE whose voiceprint IS its predecessor's: the nearest OTHER voice, never the same speaker");
+        ok(L({ X, X }, { 3, 3 }, { 0, 1 }) == V{ 1, 2 },
+           "a long change clustered with its predecessor (one voice so far): a NEW speaker");
+        ok(L({ jitter(X, .02), jitter(Y, .02), jitter(X, .02), none }, { 3, 3, 3, .3 }, { 0, 0, 0, 1 }) == V{ 1, 2, 1, 2 },
+           "a change with no voiceprint: the most recent OTHER speaker (a dialogue goes back and forth)");
+        ok(L({ jitter(X, .02), none }, { 3, .3 }, { 0, 1 }) == V{ 1, 2 }, "a change with no voiceprint and one voice so far: a new speaker");
+        ok(L({ jitter(Y, .02), jitter(X, .02), jitter(Y, .02) }, { 3, 3, 3 }, { 0, 0, 0 }) == V{ 1, 2, 1 },
+           "speakers numbered by FIRST APPEARANCE");
+        ok(L({ none, none }, { 3, 3 }, { 0, 0 }) == V{ 0, 0 }, "no voiceprint at all: no names (0 speakers)");
+        ok(L({ jitter(X, .02), jitter(Y, .02), jitter(X, .02), jitter(Y, .02), jitter(X, .02) }, { 5, 4, 3, 2, 1.5 }, { 0, 0, 0, 0, 0 },
+             8, 3) == V{ 1, 2, 1, 2, 1 },
+           "more long pieces than the clustering takes: the longest clustered, the others given the nearest voice");
+        ok(L({ none, jitter(X, .02) }, { .3, 3 }, { 0, 0 }) == V{ 1, 1 }, "the pieces before any voice take the next one's");
+        ok(L({ X, X }, { 3, 3 }, { 0, 1 }, 1) == V{ 1, 1 }, "SPKMAX 1: nothing can differ, nothing invented");
+    }
+    // ---- WHOLE voice jobs, through the pipeline's own fileRequests / fileJobLap, on a WAV written in TEMP
+    wchar_t tmp[MAX_PATH] = {};
+    ::GetTempPathW(MAX_PATH, tmp);
+    const std::wstring dir = std::wstring(tmp) + L"suv_u3v_" + std::to_wstring(::GetCurrentProcessId());
+    ::CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring wavW = dir + L"\\voices.wav";
+    {
+        // 95 s: a tone everywhere (a level the snap must see as speech), SILENCE at 81.6-81.9 s -- the pause between the two lines
+        // of the dash cue below
+        std::vector<float> pcm((size_t)95 * kFileRate);
+        for (size_t i = 0; i < pcm.size(); ++i) pcm[i] = 0.3f * (float)std::sin(2.0 * 3.14159265358979 * 300.0 * (double)i / kFileRate);
+        for (size_t i = (size_t)(81.6 * kFileRate); i < (size_t)(81.9 * kFileRate); ++i) pcm[i] = 0.0f;
+        ok(writeBytesFile(wavW, pcm16Wav(pcm)), "the test WAV is written (95 s, 16 kHz)");
+    }
+    const std::string wav = wideToUtf8L(wavW);
+    TrConfig cfg;                                                       // engine.txt's defaults: SPKON 1, 0.50, 8, 1.2 s
+    Servers srv;
+    Shared sh;
+    CollectSink sink;
+    FileJobStats st;
+    auto queue = [&](const trpipe::WireVoice& v) { std::lock_guard<std::mutex> lk(sh.mx); sh.fileReqs.push_back(FileReq(v, std::string())); };
+    auto runAll = [&](std::unique_ptr<FileJob>& job, const TrConfig& c) {
+        int laps = 0;
+        fileRequests(sh, job, srv, sink, c, &st);
+        while (job && laps++ < 200000) { fileJobLap(job, srv, sink, sh.abortJob, false, &st); fileRequests(sh, job, srv, sink, c, &st); }
+        return laps;
+    };
+    auto linesOf = [&](uint64_t id, const char* kind) {
+        std::vector<std::vector<std::string>> out;
+        for (const auto& m : sink.lines) {
+            const auto t = trpipe::split(m);
+            if (t.size() >= 2 && t[0] == kind && trpipe::jobIdOf(t[1]) == id) out.push_back(t);
+        }
+        return out;
+    };
+    // the stand-in: three voices X Y Z; pieces 5 and 6 (a dialogue-dash cue's two lines) get the IDENTICAL voiceprint
+    const std::vector<float> X = seed(16), Y = seed(16), Z = seed(16);
+    const char* who = "XYXZXYYn";                                       // the voice each piece is given ('n': none)
+    std::vector<size_t> heardLen(8, 0);
+    g_voiceEmbedForTest = [&](size_t i, const std::vector<float>& a, std::vector<float>& out) {
+        if (i < heardLen.size()) heardLen[i] = a.size();
+        if (i >= 8 || who[i] == 'n') return false;
+        const std::vector<float>& base = who[i] == 'X' ? X : who[i] == 'Y' ? Y : Z;
+        out = (i == 5 || i == 6) ? base : jitter(base, 0.02);
+        return true;
+    };
+    {
+        trpipe::WireVoice v;
+        v.jobId = 201; v.path = wav;
+        v.spans = "1000-4000,4500-8000,8500-9300,70000-74000,74500-78000,80000-81000,81000-84000,90000-90300";
+        v.changes = "6";
+        queue(v);
+        std::unique_ptr<FileJob> job;
+        runAll(job, cfg);
+        const auto spk = linesOf(201, "FSPK"), done = linesOf(201, "FDONE"), prog = linesOf(201, "FPROG");
+        trpipe::WireSpk s;
+        trpipe::WireFileDone d;
+        const bool got = spk.size() == 1 && trpipe::unpackSpk(spk[0], s) && done.size() == 1 && trpipe::unpackFileDone(done[0], d);
+        ok(got && d.result == "ok" && s.speakers == 3 && s.labels.size() == 8, "a voice job: ONE FSPK (3 speakers, 8 labels), ONE FDONE ok");
+        if (got && s.labels.size() == 8) {
+            std::printf("    labels:");
+            for (uint32_t l : s.labels) std::printf(" %u", l);
+            std::printf("  (pieces: X Y X-short Z X Y | Y-identical(change) too-short)\n");
+        }
+        ok(got && s.labels.size() == 8 && s.labels[0] == 1 && s.labels[1] == 2 && s.labels[2] == 1 && s.labels[3] == 3
+           && s.labels[4] == 1 && s.labels[5] == 2 && s.labels[6] != s.labels[5] && s.labels[6] != 0 && s.labels[7] == s.labels[6],
+           "the labels: by first appearance, the short X piece named X, the dash's second line NOT its first's speaker, a piece too "
+           "short for a voiceprint the previous speaker's");
+        size_t sk = 0;
+        for (size_t m = 0; m < sink.lines.size(); ++m) {
+            const auto t = trpipe::split(sink.lines[m]);
+            if (t[0] == "FSPK" && m + 1 < sink.lines.size() && trpipe::split(sink.lines[m + 1])[0] == "FDONE") ++sk;
+        }
+        ok(sk == 1 && prog.size() >= 2 && prog[0][2] == "voices" && d.count == 8,
+           "FSPK right before FDONE; FPROG \"voices\" lines; FDONE's count = the pieces named");
+        const double heard5 = (double)heardLen[5] / kFileRate;
+        std::printf("    the dash cue's first line was heard for %.3f s (its share was 1.000 s; the pause starts at 81.6 s)\n", heard5);
+        ok(heard5 >= 1.55 && heard5 <= 1.95 && st.voiceSnapped == 1,
+           "the KNOWN change's boundary moved to the pause between the two voices (the quietest hop within 1 s)");
+        ok(st.voiceSeeks >= 1, "a piece 60 s past the decoded audio: SEEK, not 60 s decoded");
+        std::printf("    audio held at most %.1f s; peak working set %llu MB\n", (double)st.voiceMaxBuf / kFileRate,
+                    (unsigned long long)st.voicePeakMb);
+        ok(st.voiceMaxBuf > 0 && st.voiceMaxBuf <= (uint64_t)40 * kFileRate,
+           "the audio held never exceeds one piece + the snap window + a chunk (<= 40 s here, never the file's 95 s)");
+    }
+    {
+        // FCANCEL mid-way: its one FDONE "cancelled", no FSPK
+        trpipe::WireVoice v;
+        v.jobId = 202; v.path = wav; v.spans = "1000-4000,4500-8000,8500-9300,70000-74000,74500-78000";
+        queue(v);
+        std::unique_ptr<FileJob> job;
+        fileRequests(sh, job, srv, sink, cfg, &st);
+        for (int k = 0; job && k < 400 && job->voice->next < 2; ++k) fileJobLap(job, srv, sink, sh.abortJob, false, &st);
+        const bool mid = job && job->voice && job->voice->next >= 2 && job->voice->next < 5;
+        { std::lock_guard<std::mutex> lk(sh.mx); sh.fileCancels.push_back(202); }
+        runAll(job, cfg);
+        trpipe::WireFileDone d;
+        const auto done = linesOf(202, "FDONE");
+        ok(mid && done.size() == 1 && trpipe::unpackFileDone(done[0], d) && d.result == "cancelled" && linesOf(202, "FSPK").empty(),
+           "FCANCEL mid-way: one FDONE cancelled, no FSPK");
+    }
+    {
+        // the FILE jobs' ONE slot, both ways
+        trpipe::WireFile f;
+        f.jobId = 301; f.path = wav; f.langA = "en"; f.langB = "fr";
+        trpipe::WireVoice v;
+        v.jobId = 302; v.path = wav; v.spans = "1000-4000";
+        { std::lock_guard<std::mutex> lk(sh.mx); sh.fileReqs.push_back(FileReq(f)); sh.fileReqs.push_back(FileReq(v, std::string())); }
+        std::unique_ptr<FileJob> job;
+        fileRequests(sh, job, srv, sink, cfg, &st);
+        const bool voiceRuns = job && job->voice && job->req.jobId == 302;
+        // a malformed FILE through the door: it ends the running voice job ("cancelled", no FSPK) and gets its own FDONE error
+        servantHandle(sh, nullptr, trpipe::split("FILE\t303\t" + trpipe::esc(wav) + "\ten\tfr\tauto\tauto\tjunk\t0"));
+        runAll(job, cfg);
+        trpipe::WireFileDone d1, d2, d3;
+        const auto f1 = linesOf(301, "FDONE"), f2 = linesOf(302, "FDONE"), f3 = linesOf(303, "FDONE");
+        ok(voiceRuns && f1.size() == 1 && trpipe::unpackFileDone(f1[0], d1) && d1.result == "cancelled",
+           "a FILE then an FVOICE in one lap: the FILE is superseded (cancelled), the voice pass runs");
+        ok(f2.size() == 1 && trpipe::unpackFileDone(f2[0], d2) && d2.result == "cancelled" && linesOf(302, "FSPK").empty()
+           && f3.size() == 1 && trpipe::unpackFileDone(f3[0], d3) && d3.result == "error",
+           "a FILE (here a malformed one) ends a running voice pass: its FDONE cancelled, no FSPK; the FILE its own one FDONE");
+        // a FILE job made, then an FVOICE: the FILE ends "cancelled"
+        f.jobId = 311;
+        { std::lock_guard<std::mutex> lk(sh.mx); sh.fileReqs.push_back(FileReq(f)); }
+        fileRequests(sh, job, srv, sink, cfg, &st);
+        const bool fileMade = job && !job->voice && job->req.jobId == 311;
+        v.jobId = 312;
+        queue(v);
+        runAll(job, cfg);
+        trpipe::WireFileDone d4, d5;
+        const auto f4 = linesOf(311, "FDONE"), f5 = linesOf(312, "FDONE");
+        ok(fileMade && f4.size() == 1 && trpipe::unpackFileDone(f4[0], d4) && d4.result == "cancelled"
+           && f5.size() == 1 && trpipe::unpackFileDone(f5[0], d5) && d5.result == "ok" && linesOf(312, "FSPK").size() == 1,
+           "an FVOICE ends a running FILE job (cancelled) and runs to its end");
+    }
+    {
+        // the live refusal, and a malformed FVOICE through the door
+        { std::lock_guard<std::mutex> lk(sh.mx); sh.liveWanted = true; }
+        trpipe::WireVoice v;
+        v.jobId = 321; v.path = wav; v.spans = "1000-4000";
+        servantHandle(sh, nullptr, trpipe::split(trpipe::packVoice(v)));
+        std::vector<std::string> wire;
+        drainWire(sh, wire);
+        trpipe::WireFileDone d;
+        bool queued = false;
+        { std::lock_guard<std::mutex> lk(sh.mx); queued = !sh.fileReqs.empty(); sh.liveWanted = false; }
+        ok(wire.size() == 1 && trpipe::unpackFileDone(trpipe::split(wire[0]), d) && d.jobId == 321 && d.result == "error"
+           && d.err == kLiveFileRefusal && !queued, "during the live: an FVOICE refused at the door, ONE FDONE error, nothing queued");
+        sink.lines.clear();
+        servantHandle(sh, nullptr, trpipe::split("FVOICE\t331\t" + trpipe::esc(wav) + "\t\t5-1\t"));
+        std::unique_ptr<FileJob> job;
+        runAll(job, cfg);
+        trpipe::WireFileDone e;
+        const auto f = linesOf(331, "FDONE");
+        ok(f.size() == 1 && trpipe::unpackFileDone(f[0], e) && e.result == "error"
+           && e.err == "The request's list of pieces to name could not be read.", "a malformed FVOICE: ONE FDONE error saying why");
+    }
+    g_voiceEmbedForTest = nullptr;
+    {
+        // the stage OFF: the transcript still comes -- FSPK 0 + why, FDONE ok
+        TrConfig off;
+        off.spkOn = false;
+        trpipe::WireVoice v;
+        v.jobId = 341; v.path = wav; v.spans = "1000-4000,4500-8000";
+        queue(v);
+        std::unique_ptr<FileJob> job;
+        runAll(job, off);
+        trpipe::WireSpk s;
+        trpipe::WireFileDone d;
+        const auto sp = linesOf(341, "FSPK"), dn = linesOf(341, "FDONE");
+        ok(sp.size() == 1 && trpipe::unpackSpk(sp[0], s) && s.speakers == 0 && s.labels.empty()
+           && s.model.find("SPKON 0") != std::string::npos && dn.size() == 1 && trpipe::unpackFileDone(dn[0], d) && d.result == "ok"
+           && d.count == 0, "SPKON 0: FSPK 0 with the sentence why, FDONE ok -- never an error");
+        // no runtime: the same, its own sentence
+        v.jobId = 342;
+        std::string err;
+        std::unique_ptr<FileJob> j2;
+        const bool made = makeVoiceJob(v, cfg, j2, err);
+        if (made) { j2->voice->cfg.on = true; j2->voice->cfg.model = wavW; j2->voice->cfg.binDir.clear(); }
+        for (int k = 0; j2 && k < 1000; ++k) fileJobLap(j2, srv, sink, sh.abortJob, false, &st);
+        const auto sp2 = linesOf(342, "FSPK");
+        ok(made && sp2.size() == 1 && trpipe::unpackSpk(sp2[0], s) && s.speakers == 0 && s.model.find("runtime") != std::string::npos,
+           "no sherpa runtime: FSPK 0 + why (the stage is optional, never a failure)");
+        // a file gone: FDONE error, no FSPK
+        v.jobId = 343; v.path = wideToUtf8L(dir + L"\\gone.wav");
+        queue(v);
+        runAll(job, cfg);
+        const auto dn3 = linesOf(343, "FDONE");
+        ok(dn3.size() == 1 && trpipe::unpackFileDone(dn3[0], d) && d.result == "error" && linesOf(343, "FSPK").empty(),
+           "a file that cannot be opened: ONE FDONE error, no FSPK");
+    }
+    ::DeleteFileW(wavW.c_str());
+    ::RemoveDirectoryW(dir.c_str());
+}
+
+// ===========================================================================
+// THE ENGINE'S WHOLE SELFTEST:  --selftest [offline]
+// SUVTITLE SPLIT: AudioPB's --selftest minus its LIVE sections -- [1] the decimator, [2] the live servers, [2bis]
+// diarization, [3] / [3bis] the live pipeline and its commit engine, [3ter] the `auto` probe, [3quater] the MT
+// drivers on the live pair, [4] / [4bis] / [4ter] / [5] the live finals, [6] Traditional Chinese end to end through
+// the live path -- which SuVtitle 1.1.0 runs again, under their own switch and with their numbers: --selftest-live
+// (real models). Here: what needs no model -- [0] the wire contract (the whole of TrPipe.h, live messages included),
+// [0bis] [0ter] [0quater] the languages, scripts, routing and filters, [0s] the first-start seed (both pairs), [0p]
+// the payload (the diarization runtime included), [0r] a FILE job's servers below normal (1.1.0), [C8] live and file
+// never together (1.1.0), [C8c] LIVE 0's drain (fix round, a stand-in pair), [0h] the live phantom nets (RESUME 11, the
+// same stand-in) -- then [7] [8] [9], the file selftests (each
+// also runs alone: --selftest-filemode / -v2 / -wh).
+// `offline` (new; AudioPB's --selftest had none): [7] [8] [9] stop where they would start a model, exactly
+// as their own `offline` does.
+// ===========================================================================
+int runSelftest(bool offline) {
+    ::SetConsoleOutputCP(CP_UTF8);        // the transcripts are UTF-8 and half of them are Han
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::printf("=== SuVtitle Engine selftest%s%s ===\n", offline ? " (offline)" : "",
+                g_forceCpu ? " (CPU forced)" : "");
+    int failures = 0;
+    wireContractTests(failures);            // [0]
+    tradChineseTests(failures);             // [0bis] (WA)
     simplifiedNetTests(failures);           // [0ter] (WB): the mirror net, offline
     reviewFixTests(failures);               // [0quater] (WB): the review's offline fixes
     seedSelftest(failures);                 // [0s] (SUVTITLE E8 + fix round): the first-start seed, bounded reads
     payloadSelftest(failures);              // [0p] (SUVTITLE fix round RV3-3): the bundle or the dev payload, never a mix
+    prioritySelftest(failures);             // [0r] (SuVtitle 1.1.0): a FILE job's servers run BELOW_NORMAL, CPU and GPU
+    liveExclusivityTests(failures);         // [C8] (SuVtitle 1.1.0): live and file never run together
+    liveDrainTests(failures);               // [C8c] (fix round): LIVE 0 = stop listening, then finish (a stand-in pair)
+    livePhantomTests(failures);             // [0h] (RESUME 11): the live phantom nets (the same stand-in)
+    u3VoiceTests(failures);                 // [0v] (U3): the transcript's voice pass -- the wire, the clustering, the labels, the job (a stand-in voiceprint)
 
-    // (SUVTITLE SPLIT: sections [1] to [6] -- the live path -- were here; see the note above runSelftest.)
+    // (Sections [1] to [6] -- the live path -- are --selftest-live's: see the note above.)
 
     // The servers for [7] [8] [9]: what AudioPB's [2] had brought up for the live sections, minus the live
     // pair -- the file sections only ever load their own (bringFile).
@@ -7947,8 +13305,2073 @@ int runSelftest(bool offline) {
     return 0;
 }
 
-// (SUVTITLE SPLIT: the SPEAKER SELFTEST, --selftest-spk -- the diarization stage on the 24-utterance
-// synthetic meeting, embedding + clustering only -- was here. No diarization in SuVtitle.)
+// ===========================================================================
+// SELFTEST [7] + [8]: the live finals' SCRIPT NETS and the ONSET GATE, on the real servers (WB).
+// AudioPB's file-mode selftest ran them as [7e] / [7f] until 2026-10-23, fed with the first two seconds of a
+// file fixture; AudioPB Translator 1.1.0 (50f79d6) moved them into its --selftest, fed with the first two
+// seconds of bench_en.wav -- the same sentence ("Good morning everyone.") read by readWavMono -- and SuVtitle
+// 1.1.0 runs that, as --selftest-live's [7] / [8], the recording found through SUVTITLE_TEST_MEDIA. On the
+// BALANCED pair, as there: [8]'s "two words of three at -40 dBFS" is a fact about that ASR model, not
+// about whatever [6] happened to leave up (review N2, 23/10).
+// ===========================================================================
+void liveNetsAndGateTests(Servers& srv, const TrConfig& cfg, int& failures) {
+    auto ok = [&](bool cond, const std::string& what) {
+        if (!cond) { std::printf("    ASSERT FAIL: %s\n", what.c_str()); ++failures; }
+    };
+    // SuVtitle: the recording comes from SUVTITLE_TEST_MEDIA (testMediaRoot) -- not there = NOT CHECKED, never a
+    // failure and never a path; there and unreadable = a failure, as in AudioPB.
+    const std::wstring media = testMediaRoot();
+    if (media.empty() || ::GetFileAttributesW((media + L"bench_en.wav").c_str()) == INVALID_FILE_ATTRIBUTES) {
+        std::printf("\n[7] [8] NOT CHECKED (set SUVTITLE_TEST_MEDIA): bench_en.wav\n");
+        return;
+    }
+    WavFile w;
+    std::string werr;
+    const bool haveSpeech = readWavMono(media + L"bench_en.wav", w, werr)
+                         && w.rate == kAsrRate && w.mono.size() >= 2 * (size_t)kAsrRate;
+    if (!haveSpeech) {
+        ok(false, "bench_en.wav (16 kHz) is readable for [7] / [8] (" + werr + ")");
+        return;
+    }
+    const std::vector<float> first(w.mono.begin(), w.mono.begin() + 2 * (size_t)kAsrRate);   // "Good morning everyone."
+    if (!srv.ensureUp("balanced", /*verbose=*/false)) {
+        ok(false, "the live pair is up for [7] / [8] (" + srv.lastError() + ")");
+        return;
+    }
+
+    // 7. THE LIVE FINALS' SCRIPT NETS, deterministic (WB): a real final (processSegment on
+    //    "Good morning everyone.") whose MT reply is stood in for. en<->zh: a Traditional reply
+    //    is shown Simplified; en<->zh-tw: the same reply is kept as is (never simplified), and
+    //    a Simplified one is shown Traditional (the WA net, live).
+    std::printf("\n[7] the LIVE finals' script nets (processSegment, a stand-in MT reply)\n");
+    {
+        const char* kTrad = "\xe4\xbb\x8a\xe5\xa4\xa9\xe6\x88\x91\xe5\x80\x91\xe8\xa6\x81\xe4\xb8\x80\xe8\xb5\xb7\xe6\xaa\xa2"
+                            "\xe6\x9f\xa5\xe7\xac\xac\xe4\xba\x8c\xe5\xa0\xb4\xe7\x9a\x84\xe6\x9c\x80\xe7\xb5\x82\xe6\xb7\xb7"
+                            "\xe9\x9f\xb3\xe3\x80\x82";   // U+4ECA,5929,6211,5011,8981,4E00,8D77,6AA2,67E5,7B2C,4E8C,5834,7684,6700,7D42,6DF7,97F3,3002
+        const char* kSimp = "\xe4\xbb\x8a\xe5\xa4\xa9\xe6\x88\x91\xe4\xbb\xac\xe8\xa6\x81\xe4\xb8\x80\xe8\xb5\xb7\xe6\xa3\x80"
+                            "\xe6\x9f\xa5\xe7\xac\xac\xe4\xba\x8c\xe5\x9c\xba\xe7\x9a\x84\xe6\x9c\x80\xe7\xbb\x88\xe6\xb7\xb7"
+                            "\xe9\x9f\xb3\xe3\x80\x82";   // U+4ECA,5929,6211,4EEC,8981,4E00,8D77,68C0,67E5,7B2C,4E8C,573A,7684,6700,7EC8,6DF7,97F3,3002
+        TrSpeaker spk;                   // not begun: lines are labelled by input, as with SPKON 0
+        struct LCase { const char* b; const char* reply; const char* want; const char* what; };
+        const LCase cases[] = {
+            { "zh",    kTrad, kSimp, "en<->zh: a Traditional translation is shown SIMPLIFIED" },
+            { "zh-tw", kTrad, kTrad, "en<->zh-tw: a Traditional translation is NEVER simplified" },
+            { "zh-tw", kSimp, kTrad, "en<->zh-tw: a Simplified translation is shown Traditional" },
+        };
+        uint64_t sid = 990000;
+        auto routingFor = [&](const char* b) {
+            Routing rt;
+            rt.mode = "auto"; rt.langA = "en"; rt.langB = b;
+            rt.mtStyle = mtStyleFor(srv.mtModel()); rt.asrPrompt = cfg.asrPrompt; rt.mtContext = cfg.mtContext;
+            return rt;
+        };
+        // One real final: the audio decoded for real, its MT reply (and, when asked, its decode)
+        // stood in for.
+        auto final1 = [&](const char* b, const char* reply, const char* zhDecode, trpipe::WireLine& line,
+                          std::string& why) {
+            const Routing rt = routingFor(b);
+            TrContext ctx;
+            Segment s;
+            s.mono16k  = first;
+            s.segId    = ++sid;
+            s.peakDbfs = hopPeakDbfs(first);
+            StageTimes tm;
+            std::string skip, perr;
+            g_mtReplyForTest = reply;
+            g_asrZhTextForTest = zhDecode ? zhDecode : "";
+            const bool said = processSegment(srv, spk, rt, ctx, s, line, tm, skip, perr);
+            g_mtReplyForTest.clear();
+            g_asrZhTextForTest.clear();
+            why = skip + perr;
+            std::printf("    final %-5s %s->%s  %s  |  %s\n", b, line.lang.c_str(), line.dstLang.c_str(),
+                        said ? line.src.c_str() : why.c_str(), line.dst.c_str());
+            return said;
+        };
+        for (const LCase& lc : cases) {          // the DESTINATION net, three ways
+            trpipe::WireLine line;
+            std::string why;
+            const bool said = final1(lc.b, lc.reply, nullptr, line, why);
+            ok(said && line.lang == "en" && line.dstLang == lc.b && line.dst == lc.want, lc.what);
+        }
+        {                                         // the SOURCE net: a final decoded as Traditional Chinese
+            const char* kEn = "Today we are going to check the final mix of the second scene together.";
+            trpipe::WireLine lz, lt;
+            std::string why;
+            const bool okZ  = final1("zh", kEn, kTrad, lz, why);
+            const bool okTw = final1("zh-tw", kEn, kTrad, lt, why);
+            ok(okZ && lz.lang == "zh" && lz.src == kSimp,
+               "en<->zh: a final whisper wrote in Traditional is shown SIMPLIFIED");
+            ok(okTw && lt.lang == "zh-tw" && lt.src == kTrad, "en<->zh-tw: a Traditional final is NEVER simplified");
+        }
+        {                                         // the DRAFTS (processPartial), source and translation
+            TrAudio idleAudio;                    // never started: nothing is ever "waiting"
+            auto draft1 = [&](const char* b, const char* text, const char* lang, const char* reply,
+                              trpipe::WirePartial& p) {
+                const Routing rt = routingFor(b);
+                TrContext ctx;
+                PartialSnap snap;
+                snap.segId = ++sid;
+                AsrResult a;
+                a.text = text; a.language = lang; a.chinese = chineseByScript(a.text, a.language);
+                PartialState pst;
+                uint32_t m = 0;
+                std::string e;
+                g_mtReplyForTest = reply ? reply : "";
+                const bool sent = processPartial(srv, idleAudio, rt, ctx, snap, a, /*wantMt=*/reply != nullptr,
+                                                 pst, p, m, e);
+                g_mtReplyForTest.clear();
+                std::printf("    draft %-5s %s->%s  %s  |  %s\n", b, p.lang.c_str(), p.dstLang.c_str(),
+                            p.src.c_str(), p.dst.c_str());
+                return sent;
+            };
+            trpipe::WirePartial pz, pzd, pt, ptd;
+            const bool a1 = draft1("zh", kTrad, "zh", nullptr, pz);
+            const bool a2 = draft1("zh", "Good morning everyone.", "en", kTrad, pzd);
+            const bool a3 = draft1("zh-tw", kTrad, "zh", nullptr, pt);
+            const bool a4 = draft1("zh-tw", "Good morning everyone.", "en", kTrad, ptd);
+            ok(a1 && pz.lang == "zh" && pz.src == kSimp, "en<->zh: a draft written in Traditional is shown SIMPLIFIED");
+            ok(a2 && pzd.dstLang == "zh" && pzd.dst == kSimp,
+               "en<->zh: a draft translation written in Traditional is shown SIMPLIFIED");
+            ok(a3 && pt.lang == "zh-tw" && pt.src == kTrad && a4 && ptd.dstLang == "zh-tw" && ptd.dst == kTrad,
+               "en<->zh-tw: a Traditional draft and draft translation are NEVER simplified");
+        }
+    }
+
+    // 8. THE ONSET GATE (WB, after the review): it may only drop what the VAD itself would have
+    //    closed on. Real speech whose loudest hop never reaches the OPENING level (-38) -- a tail
+    //    after a commit, a continuation held open by the hysteresis -- is transcribed; noise
+    //    below the CLOSING level (-44) is not even sent; noise between the two is sent and its
+    //    junk filtered (the prompt's echo, the quiet rules).
+    std::printf("\n[8] the onset gate: quiet REAL speech survives, quiet noise does not\n");
+    {
+        const std::vector<float>& speech = first;   // "Good morning everyone."
+        TrSpeaker spk;
+        Routing rt;
+        rt.mode = "auto"; rt.langA = "en"; rt.langB = "zh";
+        rt.mtStyle = mtStyleFor(srv.mtModel()); rt.asrPrompt = cfg.asrPrompt; rt.mtContext = cfg.mtContext;
+        auto scaledTo = [](std::vector<float> v, double peakDb) {
+            const double g = std::pow(10.0, (peakDb - hopPeakDbfs(v)) / 20.0);
+            for (auto& s : v) s = (float)(s * g);
+            return v;
+        };
+        uint64_t sid = 995000;
+        for (const double peak : { -40.0, -37.0 }) {
+            const std::vector<float> a = scaledTo(speech, peak);
+            Segment s;
+            s.mono16k  = a;
+            s.segId    = ++sid;
+            s.peakDbfs = -12.0;                     // the utterance's peak, as a tail carries it
+            TrContext ctx;
+            ctx.lastFinalLang = "en";
+            ctx.rememberSrc("en", "Let us listen to it together one more time and decide.");
+            trpipe::WireLine line;
+            StageTimes tm;
+            std::string skip, perr;
+            g_mtReplyForTest = "\xe5\xa4\xa7\xe5\xae\xb6\xe6\x97\xa9\xe4\xb8\x8a\xe5\xa5\xbd\xe3\x80\x82";   // U+5927,5BB6,65E9,4E0A,597D,3002
+            const bool said = processSegment(srv, spk, rt, ctx, s, line, tm, skip, perr);
+            g_mtReplyForTest.clear();
+            const std::vector<std::string> got = normWords(line.src);
+            int hits = 0;
+            for (const char* wds : { "good", "morning", "everyone" })
+                hits += (int)(std::find(got.begin(), got.end(), wds) != got.end());
+            std::printf("    speech at %.0f dBFS (own peak %.1f): %s\n", peak, hopPeakDbfs(a),
+                        said ? ("LINE: " + line.src).c_str() : (skip + perr).c_str());
+            ok(said && hits >= 2, std::string("real speech peaking at ") + std::to_string((int)peak)
+                                  + " dBFS (below the VAD's opening level) is transcribed, not gated");
+        }
+        // ... and noise: below the closing level never reaches the ASR; between the levels, no LINE.
+        uint32_t rng = 4242u;
+        std::vector<float> noise((size_t)kAsrRate * 2);
+        for (auto& v : noise) { rng = rng * 1664525u + 1013904223u; v = ((float)(rng >> 8) / 16777216.0f * 2.0f - 1.0f); }
+        for (const double peak : { -48.0, -41.0 }) {
+            int lines = 0, gated = 0;
+            for (int rep = 0; rep < 3; ++rep) {
+                Segment s;
+                s.mono16k  = scaledTo(noise, peak);
+                s.segId    = ++sid;
+                s.peakDbfs = -12.0;
+                TrContext ctx;
+                ctx.lastFinalLang = "en";
+                ctx.rememberSrc("en", "Let us listen to it together one more time and decide.");
+                trpipe::WireLine line;
+                StageTimes tm;
+                std::string skip, perr;
+                const bool said = processSegment(srv, spk, rt, ctx, s, line, tm, skip, perr);
+                if (said) { ++lines; std::printf("    noise at %.0f dBFS produced: %s\n", peak, line.src.c_str()); }
+                if (!said && skip.rfind("no onset", 0) == 0) ++gated;
+            }
+            std::printf("    noise peaking at %.0f dBFS: %d line(s), %d of 3 gated before the ASR\n", peak, lines, gated);
+            ok(lines == 0, std::string("noise at ") + std::to_string((int)peak) + " dBFS never becomes a LINE");
+            if (peak < kVadCloseDbfs) ok(gated == 3, "noise below the VAD's closing level never reaches the ASR");
+        }
+    }
+}
+
+// ===========================================================================
+// [C8b] LIVE 0 WHILE AN UTTERANCE IS PARTLY ON SCREEN OWES IT ONE ENDING (SuVtitle 1.1.0) -- the SHIPPING pipeline thread
+// on the REAL live pair ([3] brought it up), fed continuous speech in real time: bench_en with its gaps squeezed below
+// the VAD's hangover (compressGaps, as [4]), over and over, until a sentence is COMMITTED while its utterance is still
+// open (a LINE closes=0) -- then LIVE 0 at once. Proved, on the wire the servant would send:
+//   * every LINE names its STRIP -- spkSlot is the strip's LANE ID (TrPipe.h LANES: the key alone for this mix strip);
+//   * the stop FINISHES the last utterance that spoke (fix round RVA-1, the drain): EXACTLY ONE ending and nothing after
+//     it -- its closing LINE (the capture stopped, so its tail became a final) or an END (a tail too short to be a
+//     sentence, or one the filters dropped);
+//   * the capture is released when the door returns (fix round RVA-7); STATE live 1 -> 0 once the queued finals are
+//     finished, and the live whisper children gone after it.
+// The audio reaches the VAD the way the engine it runs in delivers it: L0's stub hub reports its input "unsupported" and
+// feeds nothing, so THIS thread then plays the hub's mixer (feed16k, real-time pace, between the pipeline's start and
+// the stop -- never alongside a mixer); the real hub plays the same audio from a wav: input itself.
+// NOT CHECKED without SUVTITLE_TEST_MEDIA, or when no sentence was committed mid-utterance within two minutes.
+// ===========================================================================
+void liveStopEndTest(Servers& srv, const TrConfig& cfg, int& failures) {
+    std::printf("\n[C8b] LIVE 0 while an utterance is partly on screen: one ending, nothing after it (the real live pair)\n");
+    auto ok = [&](bool cond, const std::string& what) {
+        if (!cond) { std::printf("    ASSERT FAIL: %s\n", what.c_str()); ++failures; }
+    };
+    const std::wstring media = testMediaRoot();
+    WavFile w;
+    std::string werr;
+    if (media.empty() || ::GetFileAttributesW((media + L"bench_en.wav").c_str()) == INVALID_FILE_ATTRIBUTES) {
+        std::printf("    NOT CHECKED (set SUVTITLE_TEST_MEDIA): bench_en.wav\n");
+        return;
+    }
+    if (!readWavMono(media + L"bench_en.wav", w, werr) || w.rate != (uint32_t)kAsrRate) {
+        ok(false, "bench_en.wav (16 kHz) is readable for [C8b] (" + werr + ")");
+        return;
+    }
+    const std::vector<float> speech = compressGaps(w.mono, w.rate, /*keepMs=*/30.0);
+    wchar_t tmp[MAX_PATH] = {};
+    ::GetTempPathW(MAX_PATH, tmp);
+    const std::wstring dir = std::wstring(tmp) + L"SuVtitle_selftest_c8b", wav = dir + L"\\speech.wav";
+    ::CreateDirectoryW(dir.c_str(), nullptr);
+    if (!writeBytesFile(wav, pcm16Wav(speech))) { ok(false, "the [C8b] audio is written (%TEMP%)"); return; }
+    const std::string key = "wav:" + wideToUtf8L(wav) + "@loop";
+
+    Shared sh;
+    sh.testSources = true;
+    sh.preset = "balanced";                       // the pair [3] brought up: no reload
+    sh.state.preset = "balanced";
+    TrAudio audio;
+    audio.setPartialSec(cfg.partialSec > 0.0 ? cfg.partialSec : kPartialSecDefault);
+    HostLiveEvents events(sh);
+    HubOptions ho;
+    ho.testSources = true;
+    TrCaptureHub hub(&events, ho);
+    TrConfig pc = cfg;
+    pc.preset = "balanced";
+    pc.commit = true;                             // forced on, as [3bis] forces it: this section exists to test it
+    pc.partialMt = true;
+    // What STATE must announce once the live is on: the pair that RUNS -- here [3]'s, still up (no reload), the case
+    // the first model run caught (25/10: the start found it up, skipped the only announcement, and STATE went on naming
+    // a FILE job's idle models). Read now, before the pipeline thread owns srv.
+    const bool        pairUp  = srv.up();
+    const std::string pairAsr = srv.asrModel(), pairMt = srv.mtModel();
+    std::thread pipe(pipelineMain, std::ref(sh), std::ref(audio), std::ref(hub), std::ref(srv), pc, false);
+
+    std::vector<std::string> wire;
+    auto stateNow = [&] { std::lock_guard<std::mutex> lk(sh.mx); return sh.state; };
+    trpipe::WireLive lv;
+    lv.on = true;
+    lv.inputs.push_back({ key, "Bench", 0, 0.0 });
+    servantHandle(sh, nullptr, trpipe::split(trpipe::packLive(lv)), &hub);
+
+    // The live path is on and its pair is up (listening) and ANNOUNCED, and the hub has said how it took the input.
+    std::string inputState;
+    auto announced = [&](const trpipe::WireState& s) {
+        return !pairUp || (s.asrModel == pairAsr && s.mtModel == pairMt);
+    };
+    const ULONGLONG t0 = ::GetTickCount64();
+    for (;;) {
+        drainWire(sh, wire);
+        for (const auto& m : wire) {
+            trpipe::WireInput in;
+            if (trpipe::unpackInput(trpipe::split(m), in) && in.key == key) inputState = in.state;
+        }
+        const trpipe::WireState s = stateNow();
+        if (s.live && s.status == "listening" && announced(s) && !inputState.empty()) break;
+        if (::GetTickCount64() - t0 > 180000) break;
+        ::Sleep(20);
+    }
+    const trpipe::WireState s0 = stateNow();
+    std::printf("    live %d, status %s, input %s, pair %s / %s (up before the start: %s)\n", s0.live ? 1 : 0,
+                s0.status.c_str(), inputState.empty() ? "(no word from the hub)" : inputState.c_str(),
+                s0.asrModel.c_str(), s0.mtModel.c_str(), pairUp ? (pairAsr + " / " + pairMt).c_str() : "no");
+    ok(s0.live && s0.status == "listening", "LIVE 1: STATE live 1, the live pair up (listening)");
+    if (pairUp)
+        ok(announced(s0), "... and ANNOUNCED with the pair already up: STATE names the pair that runs, not a FILE job's");
+    else
+        std::printf("    NOT CHECKED: the announcement with the pair ALREADY up (it was not: the start loaded it)\n");
+    const bool selfFeed = inputState == "unsupported";   // L0's stub: this thread plays the mixer
+    std::printf("    the audio: %s\n", selfFeed ? "fed by this thread (the engine carries the stub hub)"
+                                                : "played by the capture hub from the wav: input");
+
+    // Real time, until a sentence of an OPEN utterance is committed (LINE closes=0), two minutes at most.
+    uint64_t openSeg = 0;
+    const ULONGLONG f0 = ::GetTickCount64();
+    {
+        LARGE_INTEGER qf{}, qs{}, qn{};
+        ::QueryPerformanceFrequency(&qf);
+        ::QueryPerformanceCounter(&qs);
+        size_t fed = 0, at = 0;
+        if (selfFeed) {
+            std::string keys[kMaxLiveInputs];
+            keys[0] = key;
+            audio.bindInputs(keys);
+        }
+        while (!openSeg && ::GetTickCount64() - f0 < 120000) {
+            if (selfFeed) {
+                ::QueryPerformanceCounter(&qn);
+                const size_t due = (size_t)((double)(qn.QuadPart - qs.QuadPart) / (double)qf.QuadPart * kAsrRate);
+                while (fed + (size_t)kFeedMaxFrames <= due) {
+                    float block[kFeedMaxFrames];
+                    for (int i = 0; i < kFeedMaxFrames; ++i) { block[i] = speech[at]; at = (at + 1) % speech.size(); }
+                    const float* per[kMaxLiveInputs] = { block, nullptr, nullptr, nullptr };
+                    audio.feed16k(block, kFeedMaxFrames, per);
+                    fed += (size_t)kFeedMaxFrames;
+                }
+            }
+            drainWire(sh, wire);
+            for (const auto& m : wire) {
+                trpipe::WireLine l;
+                const auto t = trpipe::split(m);
+                if (!t.empty() && t[0] == "LINE" && trpipe::unpackLine(t, l) && !l.closes) openSeg = l.segId;
+            }
+            ::Sleep(5);
+        }
+    }
+    const double fedSec = (double)(::GetTickCount64() - f0) / 1000.0;
+    drainWire(sh, wire);
+    const size_t atStop = wire.size();
+    servantHandle(sh, nullptr, trpipe::split("LIVE\t0"), &hub);    // the stop, at once (the feeding stopped first)
+    const bool released = !hub.running();                          // fix round RVA-7: the devices go AT ONCE
+    // The drain (fix round RVA-1): the queued finals are finished before STATE live 0 -- seconds each on the CPU.
+    bool off = false;
+    const ULONGLONG stop0 = ::GetTickCount64();
+    for (ULONGLONG s = ::GetTickCount64(); ::GetTickCount64() - s < 180000; ::Sleep(10)) {
+        drainWire(sh, wire);
+        if (!stateNow().live) { off = true; break; }
+    }
+    int drained = 0;
+    for (size_t i = atStop; i < wire.size(); ++i) {
+        const auto t = trpipe::split(wire[i]);
+        if (!t.empty() && t[0] == "LINE") ++drained;
+    }
+    std::printf("    LIVE 0 -> the capture released at once: %s; STATE live 0 after %.1f s, %d LINE(s) finished after the stop\n",
+                released ? "yes" : "NO", (double)(::GetTickCount64() - stop0) / 1000.0, drained);
+    ok(released, "LIVE 0: the hub is stopped when the door returns (the devices released at once)");
+    ::Sleep(200);
+    drainWire(sh, wire);
+    ok(off, "LIVE 0: STATE live 0");
+    ok(off && !srv.up(), "... and the live whisper children are gone");
+
+    // The wire, read back exactly as the app reads it.
+    struct Ev { char kind; uint64_t seg; bool closes; std::string slot; };
+    std::vector<Ev> ev;
+    for (const auto& m : wire) {
+        const auto t = trpipe::split(m);
+        if (t.empty()) continue;
+        trpipe::WireLine l; trpipe::WirePartial p; trpipe::WireEnd e;
+        if (t[0] == "LINE" && trpipe::unpackLine(t, l))          ev.push_back({ 'L', l.segId, l.closes, l.spkSlot });
+        else if (t[0] == "PART" && trpipe::unpackPartial(t, p))  ev.push_back({ 'P', p.segId, false, std::string() });
+        else if (t[0] == "END" && trpipe::unpackEnd(t, e))       ev.push_back({ 'E', e.segId, true, std::string() });
+    }
+    int lines = 0, badSlot = 0;
+    for (const Ev& e : ev) if (e.kind == 'L') { ++lines; if (e.slot != key) ++badSlot; }
+    std::printf("    %.1f s of speech, %d LINE(s); a sentence of open utterance #%llu committed: %s\n", fedSec, lines,
+                (unsigned long long)openSeg, openSeg ? "yes" : "no");
+    ok(lines > 0 && badSlot == 0, "every LINE names its strip: spkSlot = the strip's lane (its key: a mix strip)");
+    if (!openSeg) {
+        std::printf("    NOT CHECKED%s: no sentence was committed mid-utterance within 2 minutes -- the END a stop owes an "
+                    "open utterance is not proved by this run\n", g_forceCpu ? " (CPU)" : "");
+    } else {
+        // The last utterance that SPOKE, and its endings.
+        uint64_t last = 0;
+        for (const Ev& e : ev) if (e.kind == 'L' && e.seg > last) last = e.seg;
+        int endings = 0, after = 0, ends = 0;
+        bool closed = false;
+        for (const Ev& e : ev) {
+            if (e.seg != last) continue;
+            if (closed) ++after;
+            if (e.kind == 'E' || (e.kind == 'L' && e.closes)) { ++endings; closed = true; if (e.kind == 'E') ++ends; }
+        }
+        std::printf("    the last utterance that spoke (#%llu): %d ending(s) (%s), %d message(s) after it\n",
+                    (unsigned long long)last, endings, ends ? "an END" : "its closing LINE", after);
+        ok(endings == 1 && after == 0, "the stop leaves it EXACTLY ONE ending, and nothing after it");
+        if (!ends) std::printf("    (its ending is its closing LINE -- the tail the stop cut was a sentence: the END path is NOT "
+                               "CHECKED by this run; [C8c] proves it offline)\n");
+        // ... and every utterance that spoke has exactly one ending (the stop's or its own)
+        std::vector<uint64_t> segs;
+        for (const Ev& e : ev) if (e.kind == 'L' && std::find(segs.begin(), segs.end(), e.seg) == segs.end()) segs.push_back(e.seg);
+        int bad = 0;
+        for (uint64_t sg : segs) {
+            int n = 0;
+            for (const Ev& e : ev) if (e.seg == sg && (e.kind == 'E' || (e.kind == 'L' && e.closes))) ++n;
+            if (n != 1) ++bad;
+        }
+        ok(bad == 0, "every utterance that spoke has exactly one ending (" + std::to_string(segs.size()) + " utterance(s))");
+    }
+
+    sh.quit.store(true, std::memory_order_release);
+    sh.abortJob.store(kAbortAll, std::memory_order_release);
+    pipe.join();
+    hub.stop();
+    ::DeleteFileW(wav.c_str());
+    ::RemoveDirectoryW(dir.c_str());
+}
+
+// ===========================================================================
+// THE LIVE PATH'S SELFTEST:  --selftest-live   (SuVtitle 1.1.0)
+// AudioPB Translator 1.1.0's --selftest (50f79d6), its numbering kept: [0] [0bis] [0ter] [0quater] the offline
+// sections (the SAME functions --selftest runs), [1] the decimator, [2] the payload, [2bis] the diarization stage,
+// [3] the live pair up (balanced), [3ter] the `auto` probe, [3quater] the MT drivers, [3bis] the live line, [4] the
+// WHOLE pipeline over the two bench recordings fed through TrAudio::selftestFeed (no capture, as in 1.1.0) -- the VAD,
+// the drafts, the commits, the finals, in the shipping scheduler's order -- [4bis] [4ter] [5] [6] Traditional Chinese
+// end to end, [7] [8] the script nets and the onset gate; then [C8b], a stop mid-utterance through the pipeline
+// thread. The recordings come from SUVTITLE_TEST_MEDIA (bench_en.wav, bench_zh.wav): NOT CHECKED without them.
+// ===========================================================================
+int runSelftestLive() {
+    ::SetConsoleOutputCP(CP_UTF8);        // the transcripts are UTF-8 and half of them are Han
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::printf("=== SuVtitle Engine live selftest%s ===\n", g_forceCpu ? " (CPU forced)" : "");
+    int failures = 0;
+    wireContractTests(failures);            // [0]
+    tradChineseTests(failures);             // [0bis] (WA)
+    simplifiedNetTests(failures);           // [0ter] (WB): the mirror net, offline
+    reviewFixTests(failures);               // [0quater] (WB): the review's offline fixes
+    livePhantomTests(failures);             // [0h] (SuVtitle 1.1.0, RESUME 11): the live phantom nets, offline
+
+    // ---- 1. the decimator, at the rates a capture device commonly runs at ------
+    std::printf("\n[1] Decimator: %d/%d/%d/%d Hz -> 16000 Hz\n", 44100, 48000, 88200, 96000);
+    const uint32_t rates[] = { 44100, 48000, 88200, 96000 };
+    for (uint32_t r : rates) {
+        Decimator d;
+        d.init(r);
+        std::vector<float> in((size_t)r), out;             // 1 s of 1 kHz at 0.5 amplitude
+        for (uint32_t i = 0; i < r; ++i)
+            in[i] = 0.5f * (float)std::sin(2.0 * 3.14159265358979323846 * 1000.0 * i / r);
+        d.process(in.data(), (int)in.size(), out);
+        const double amp = goertzel(out, 1000.0, 16000.0);
+        const double err = std::fabs(amp - 0.5) / 0.5 * 100.0;
+        const bool ok = out.size() > (size_t)(16000 * 0.95) && err < 3.0;
+        std::printf("    %6u Hz -> %6zu frames, 1 kHz amplitude %.4f (%.2f%% off) %s\n",
+                    r, out.size(), amp, err, ok ? "OK" : "FAIL");
+        if (!ok) ++failures;
+    }
+    {   // Anti-alias: 9 kHz is ABOVE the 8 kHz output Nyquist. A naive "take every 3rd
+        // sample" decimator would fold it down to 7 kHz at FULL level. Ours must not.
+        //
+        // /!\ MEASURE THE STEADY STATE. A tone that starts abruptly at t=0 is a broadband
+        // event, and the lowpass legitimately passes the low half of it: the first ~40
+        // output samples are a real blip that has nothing to do with the stopband. The
+        // first version of this check took the peak over the WHOLE buffer, read that
+        // blip as -9.8 dB of "leakage", and sent me sharpening a filter that was already
+        // right. Trim the ends, then look at 7 kHz -- the exact frequency an alias would
+        // land on -- and at the residual peak.
+        Decimator d;
+        d.init(48000);
+        std::vector<float> in(48000), out;
+        for (int i = 0; i < 48000; ++i)
+            in[(size_t)i] = 0.5f * (float)std::sin(2.0 * 3.14159265358979323846 * 9000.0 * i / 48000.0);
+        d.process(in.data(), (int)in.size(), out);
+        const size_t trim = out.size() / 10;
+        std::vector<float> body(out.begin() + (long)trim, out.end() - (long)trim);
+        double peakAll = 0.0, peak = 0.0;
+        for (float v : out)  peakAll = std::max(peakAll, (double)std::fabs(v));
+        for (float v : body) peak    = std::max(peak,    (double)std::fabs(v));
+        const double alias = goertzel(body, 7000.0, 16000.0);
+        auto db = [](double a) { return a > 1e-12 ? 20.0 * std::log10(a / 0.5) : -240.0; };
+        const bool ok = db(peak) < -40.0 && db(alias) < -60.0;
+        std::printf("    9 kHz @48k: fold-to-7kHz %.1f dB, steady peak %.1f dB "
+                    "(start transient %.1f dB) %s\n",
+                    db(alias), db(peak), db(peakAll), ok ? "OK" : "FAIL");
+        if (!ok) ++failures;
+    }
+
+    // ---- 2. the child servers ------------------------------------------------
+    TrConfig cfg;
+    cfg.load();
+    const std::string preset = "balanced";          // the spec's selftest preset
+    TrPaths paths = resolvePaths(cfg);
+    std::printf("\n[2] Payload\n");
+    std::printf("    whisper : %s\n", paths.whisperExe.empty() ? "(NOT FOUND)" : wideToUtf8L(paths.whisperExe).c_str());
+    std::printf("    llama   : %s\n", paths.llamaExe.empty()   ? "(NOT FOUND)" : wideToUtf8L(paths.llamaExe).c_str());
+    std::printf("    models  : %s\n", paths.modelsDir.empty()  ? "(NOT FOUND)" : wideToUtf8L(paths.modelsDir).c_str());
+    if (!paths.ok()) { std::printf("    LIVE SELFTEST FAILED (no payload)\n"); return 1; }
+
+    // ---- 2bis. the diarization stage ----------------------------------------
+    // Loaded BEFORE the servers so its verdict is on screen before a 1.6 GB model
+    // load buries it. It is optional by design: a failure here prints a reason and
+    // the rest of the selftest runs with per-input attribution, exactly as the
+    // shipped helper does.
+    std::printf("\n[2bis] Diarization stage\n");
+    std::printf("    sherpa : %s\n", paths.sherpaDir.empty() ? "(NOT FOUND)" : wideToUtf8L(paths.sherpaDir).c_str());
+    std::printf("    model  : %s\n", paths.spkModel.empty()  ? "(NOT FOUND)" : wideToUtf8L(paths.spkModel).c_str());
+    TrSpeaker spk;
+    {
+        std::string why;
+        const bool ok = spk.begin(spkConfigFrom(cfg, paths), why);
+        std::printf("    %-8s %s\n", ok ? "ENABLED" : "DISABLED", why.c_str());
+    }
+
+    Servers srv;
+    srv.setPaths(paths);
+    srv.setMtOverride(cfg.mtModel);
+    const uint64_t tUp = ::GetTickCount64();
+    {
+        const AsrModels m = asrModelsFor(preset);
+        std::printf("\n[3] Starting child servers (preset=%s, asr=%s, mt=%s)\n",
+                    preset.c_str(), asrModelsLabel(m).c_str(),
+                    (cfg.mtModel.empty() ? mtModelFor(preset) : cfg.mtModel).c_str());
+        // Every preset's pair, printed once: this is the table the whole wave turns on, and
+        // reading it here is cheaper than deriving it from the source.
+        for (const char* p : { "quality", "balanced", "light" }) {
+            const AsrModels q = asrModelsFor(p);
+            std::printf("      %-8s draft %-22s final %-22s mt %s\n", p,
+                        q.draft.c_str(), q.final.c_str(), mtModelFor(p).c_str());
+        }
+    }
+    if (!srv.ensureUp(preset, /*verbose=*/true)) {
+        std::printf("    %s\n    LIVE SELFTEST FAILED\n", srv.lastError().c_str());
+        return 1;
+    }
+    std::printf("    ready in %llu ms  (asr draft :%u, asr final :%u, mt :%u, backend=%s)\n",
+                (unsigned long long)(::GetTickCount64() - tUp),
+                (unsigned)srv.draftPort(), (unsigned)srv.finalPort(),
+                (unsigned)srv.mtPort(), srv.gpu() ? "Vulkan" : "CPU");
+    std::printf("    loaded: asr %s   mt %s\n", srv.asrModel().c_str(), srv.mtModel().c_str());
+    if (srv.resolvedPreset() != preset) {
+        std::printf("    ASSERT FAIL: asked for preset %s, running %s\n",
+                    preset.c_str(), srv.resolvedPreset().c_str());
+        ++failures;
+    }
+
+    // ---- 3ter. the `auto` PROBE, exercised on the servers that are already up ----
+    // The selftest deliberately stays on `balanced` (the bench must be comparable run to
+    // run), so the probe is called by hand against THIS final server rather than by
+    // ensureUp("auto") -- the code path is the shipping one, only the model under it is
+    // cheaper. What is asserted is that it produces a decision and a number, not WHICH
+    // decision: a machine that is busy is allowed to answer "balanced".
+    {
+        const ProbeVerdict v = probeAutoPreset(srv.finalPort(), srv.asrGpu(), kProbeTimeoutMs);
+        const AsrModels resolved = asrModelsFor(v.preset);
+        std::printf("\n[3ter] auto probe: %s\n", v.why.c_str());
+        std::printf("       -> preset %s = {draft %s, final %s}, mt %s  (threshold %u ms)\n",
+                    v.preset.c_str(), resolved.draft.c_str(), resolved.final.c_str(),
+                    mtModelFor(v.preset).c_str(), (unsigned)kProbeSlowMs);
+        if (v.preset != "quality" && v.preset != "balanced" && v.preset != "light") {
+            std::printf("    ASSERT FAIL: the probe returned a preset that does not exist\n");
+            ++failures;
+        }
+        if (srv.asrGpu() && v.ms == 0) {
+            std::printf("    ASSERT FAIL: a GPU probe must TIME something\n");
+            ++failures;
+        }
+    }
+
+    // ---- 3quater. both MT prompt drivers, against whatever model is loaded -------
+    // The point is the PLUMBING, and the print is the evidence: `hy` aimed at a Qwen proves
+    // the driver builds a request that model answers, it says nothing about HY-MT's quality
+    // (the 17/09 A/B did, and rejected it for this domain). Watch for an answer that
+    // repeats the instruction back: that is what a mis-assembled prompt looks like.
+    {
+        const char* kProbeText = "Can you bring up the level on track four and mute the reverb?";
+        for (const char* style : { "qwen", "hy" }) {
+            std::string out, err;
+            uint32_t ms = 0;
+            const bool ok = mtTranslate(srv.mtPort(), kProbeText, "en", "zh",
+                                        std::vector<MtPair>{}, style, out, ms,
+                                        kMtTimeoutMs, err);
+            std::printf("\n[3quater] MT style=%-4s (%s)  %u ms\n", style,
+                        srv.mtModel().c_str(), ms);
+            std::printf("          en: %s\n", kProbeText);
+            std::printf("          zh: %s\n", ok ? out.c_str() : ("FAILED: " + err).c_str());
+            if (!ok || out.empty()) {
+                std::printf("    ASSERT FAIL: the %s driver produced no translation\n", style);
+                ++failures;
+            } else if (cjkRatio(out) < 0.20) {
+                std::printf("    ASSERT FAIL: the %s driver's output is not Chinese\n", style);
+                ++failures;
+            }
+        }
+        // And the context path, which nothing else in this file exercises: two prior pairs
+        // in, an answer out. A driver that mis-assembles the history breaks HERE rather
+        // than in a live session where it would read as "the translation got vague".
+        std::vector<MtPair> ctxPairs = {
+            MtPair{ "The dialogue is too quiet.", "\xe5\xaf\xb9\xe7\x99\xbd\xe5\xa4\xaa\xe5\xb0\x8f"
+                                                 "\xe4\xba\x86\xe3\x80\x82", "en", "zh" },
+            MtPair{ "Bring it up three dB.", "\xe6\x8f\x90\xe9\xab\x98\xe4\xb8\x89\xe5\x88\x86"
+                                             "\xe8\xb4\x9d\xe3\x80\x82", "en", "zh" },
+        };
+        std::string out, err;
+        uint32_t ms = 0;
+        const bool ok = mtTranslate(srv.mtPort(), "Now do the same on the other one.",
+                                    "en", "zh", ctxPairs, "qwen", out, ms, kMtTimeoutMs, err);
+        std::printf("\n[3quater] MT with %d context pair(s)  %u ms\n", (int)ctxPairs.size(), ms);
+        std::printf("          zh: %s\n", ok ? out.c_str() : ("FAILED: " + err).c_str());
+        if (!ok || out.empty()) {
+            std::printf("    ASSERT FAIL: the context path produced no translation\n");
+            ++failures;
+        }
+    }
+
+    // ---- 3. the WHOLE pipeline over two known files --------------------------
+    //
+    // The live line is exercised HERE, in the same pass, and deliberately not in a
+    // section of its own: what has to be proved is not "partials can be produced" but
+    // that they interleave with the finals the way the shipping scheduler interleaves
+    // them. So the feed is drained the way pipelineMain drains it -- every finished
+    // utterance first, and a draft ONLY when nothing was due -- and the two kinds of
+    // event are recorded in one list, in the order the pipeline emitted them.
+    //
+    // PARTIALSEC/PARTIALMT are FORCED on here, exactly as --selftest-spk forces the
+    // diarization stage on: this mode exists to test the feature, so a config that has
+    // it switched off must not silently turn the assertions below into no-ops.
+    const double partialSec = (cfg.partialSec > 0.0) ? cfg.partialSec : kPartialSecDefault;
+    std::printf("\n[3bis] Live line: PARTIALSEC %.2f s (draft ASR audio_ctx=%d), PARTIALMT on\n",
+                partialSec, kDraftAudioCtx);
+    // THE COMMIT ENGINE (W3), forced on for the same reason PARTIALMT is: this mode exists
+    // to test it, and a config with COMMIT 0 must not quietly turn section [4]'s assertions
+    // into things that pass because nothing happened.
+    CommitCfg commitCfg;
+    commitCfg.on        = true;
+    commitCfg.lookahead = cfg.commitLookahead;
+    commitCfg.pause     = cfg.commitPause;
+    commitCfg.maxSec    = cfg.commitMaxSec;
+    std::printf("[3bis] Commit: LOOKAHEAD %.2f s, PAUSE %.2f s, MAXSEC %.2f s%s\n",
+                commitCfg.lookahead, commitCfg.pause, commitCfg.maxSec,
+                cfg.commit ? "" : "   (COMMIT is 0 in the config; FORCED ON here)");
+
+    // (SuVtitle: `leaf` = the recording's name under SUVTITLE_TEST_MEDIA, testMediaRoot.)
+    struct Case { const wchar_t* leaf; const char* label; bool expectChinese; bool squeeze; };
+    const Case cases[] = {
+        { L"bench_en.wav", "bench_en.wav", false, false },
+        { L"bench_zh.wav", "bench_zh.wav", true,  false },
+        // The SAME English audio with its silences shortened below the VAD's hangover: five
+        // sentences in one unbroken utterance, which is the only shape in which the commit
+        // engine can be seen at all (see compressGaps).
+        { L"bench_en.wav", "bench_en.wav [gaps squeezed: continuous speech]",
+          false, true },
+        // ... and the CHINESE bench the same way (WB): a Chinese sentence committed mid-utterance
+        // is cut out of the DRAFT's word timestamps -- exactly where whisper.cpp writes half a
+        // character as U+FFFD. The repair in parseAsrResponse is what keeps it off the screen,
+        // and [4ter] asserts that nothing on the wire carries one.
+        { L"bench_zh.wav", "bench_zh.wav [gaps squeezed: continuous speech]",
+          true, true },
+    };
+
+    int  longSegsSeen = 0;          // segments longer than 2 x PARTIALSEC, across both files
+    bool anyPartial   = false;
+    bool anyEarlyLine = false;      // W3 (a): a sentence finalised while its utterance was
+                                    // still open -- on at least ONE of the two files
+    // The routing the bench runs under: the default pair, both directions open. Built here
+    // rather than taken from the config so the assertions below can state what they expect.
+    Routing routing;
+    routing.mode      = "auto";
+    routing.langA     = "en";
+    routing.langB     = "zh";
+    routing.mtStyle   = cfg.mtStyle.empty() ? mtStyleFor(srv.mtModel()) : cfg.mtStyle;
+    routing.asrPrompt = cfg.asrPrompt;
+    routing.mtContext = cfg.mtContext;
+    std::printf("\n[3quinquies] Routing: %s %s<->%s, MTSTYLE %s, ASRPROMPT %d, MTCONTEXT %d\n",
+                routing.mode.c_str(), routing.langA.c_str(), routing.langB.c_str(),
+                routing.mtStyle.c_str(), routing.asrPrompt ? 1 : 0, routing.mtContext);
+    // WB (WA review): WHICH prompt a final was actually sent, named by the glossary it starts
+    // with ("-" = none). Read off AsrResult::promptSent, i.e. off the request itself.
+    auto promptLabel = [](const std::string& p) -> std::string {
+        if (p.empty()) return "-";
+        for (const char* l : { "zh-tw", "zh", "en" }) {
+            const std::string g = asrGlossaryFor(l);
+            if (!g.empty() && p.compare(0, g.size(), g) == 0) return l;
+        }
+        return "tail";
+    };
+    int  finalsTotal = 0, finalsPrompted = 0;   // [4]: every final must carry its prompt
+    // [4ter] (WB): NO U+FFFD EVER REACHES THE WIRE -- every LINE and PART text is checked.
+    int  wireTexts = 0, wireFffd = 0, zhCommits = 0;
+    auto fffdCheck = [&](const std::string& s, const char* what, uint64_t segId) {
+        ++wireTexts;
+        if (s.find("\xef\xbf\xbd") == std::string::npos) return;
+        ++wireFffd;
+        std::printf("    ASSERT FAIL: the %s of seg #%llu carries U+FFFD: %s\n", what,
+                    (unsigned long long)segId, s.c_str());
+        ++failures;
+    };
+    // ... and (WB) every text labelled zh in this en<->zh session is SHOWN Simplified: a fixed
+    // point of toSimplified. The deterministic proof is [7]; this is the invariant on real decodes.
+    int  zhTexts = 0, simpNetFinals = 0;
+    auto zhCheck = [&](const std::string& s, const std::string& lang, const char* what, uint64_t segId) {
+        if (lang != "zh" || s.empty()) return;
+        ++zhTexts;
+        if (toSimplified(s) == s) return;
+        std::printf("    ASSERT FAIL: the %s of seg #%llu is labelled zh and still holds Traditional: %s\n",
+                    what, (unsigned long long)segId, s.c_str());
+        ++failures;
+    };
+    // SuVtitle: the bench recordings come from SUVTITLE_TEST_MEDIA (testMediaRoot) -- not there = NOT CHECKED, never
+    // a failure and never a path; a file there that does not read is still one. The claims made ACROSS the cases
+    // below ([4bis], the cadence, the commit) are only made when a case ran.
+    const std::wstring media = testMediaRoot();
+    int casesRun = 0;
+    for (const auto& cse : cases) {
+        std::printf("\n[4] %s  (resampler -> VAD -> ASR child -> MT child, + live line)\n",
+                    cse.label);
+        if (media.empty() || ::GetFileAttributesW((media + cse.leaf).c_str()) == INVALID_FILE_ATTRIBUTES) {
+            std::printf("    NOT CHECKED (set SUVTITLE_TEST_MEDIA)\n");
+            continue;
+        }
+        WavFile w;
+        std::string err;
+        if (!readWavMono(media + cse.leaf, w, err)) {
+            std::printf("    cannot read the bench file: %s\n", err.c_str());
+            ++failures;
+            continue;
+        }
+        ++casesRun;
+        if (cse.squeeze) {
+            const size_t was = w.mono.size();
+            // 2 hops + 30 + 2 hops = 150 ms between sentences, half the VAD's hangover.
+            w.mono = compressGaps(w.mono, w.rate, /*keepMs=*/30.0);
+            std::printf("    gaps squeezed to ~150 ms: %.2f s -> %.2f s of continuous speech\n",
+                        (double)was / (double)w.rate, (double)w.mono.size() / (double)w.rate);
+        }
+        std::printf("    %u Hz, %zu frames (%.2f s)\n", w.rate, w.mono.size(),
+                    (double)w.mono.size() / (double)w.rate);
+
+        TrAudio audio;
+        audio.setPartialSec(partialSec);
+        audio.selftestBegin(w.rate, "selftest:file");
+
+        // The event stream, in emission order: what the tray would have received. Since W3
+        // it carries what the SEQUENCE assertions need -- a LINE is no longer one per
+        // utterance, so "which one, and did it close" is now part of every event.
+        struct Ev {
+            enum Kind { kPart, kLine, kEnd } kind = kPart;
+            uint64_t    segId = 0;
+            uint32_t    seq = 0;
+            bool        closes = false;
+            std::string src;            // LINE/PART: the transcript, for the repaint check
+        };
+        std::vector<Ev> events;
+        struct SegFact {
+            uint64_t segId = 0;
+            double   tailSecs = 0.0;    // what the closing Segment carried
+            double   fullSecs = 0.0;    // ... and how long the whole utterance was
+        };
+        std::vector<SegFact> segs;
+        // The WHOLE audio of each utterance, rebuilt from the windows the pipeline saw
+        // (every snapshot, plus the closing tail, written at its own offset). It exists for
+        // ONE assertion -- coverage -- and for nothing else: the shipping helper never
+        // holds a whole segment again, which is the entire point of this wave.
+        struct SegAudio { uint64_t segId = 0; std::vector<float> pcm; double peakDbfs = -120.0; };
+        std::vector<SegAudio> segAudio;
+        auto segAudioFor = [&](uint64_t id) -> SegAudio& {
+            for (auto& s : segAudio) if (s.segId == id) return s;
+            segAudio.push_back(SegAudio{ id, {}, -120.0 });
+            return segAudio.back();
+        };
+        auto recordAudio = [&](uint64_t id, size_t at, const std::vector<float>& pcm,
+                               double peak) {
+            SegAudio& s = segAudioFor(id);
+            if (s.pcm.size() < at + pcm.size()) s.pcm.resize(at + pcm.size(), 0.0f);
+            if (!pcm.empty()) std::memcpy(&s.pcm[at], pcm.data(), pcm.size() * sizeof(float));
+            if (peak > s.peakDbfs) s.peakDbfs = peak;
+        };
+
+        int lines = 0, cuts = 0, unlabelled = 0, parts = 0, emptyParts = 0;
+        int commits = 0, ends = 0;
+        uint32_t partAsrTot = 0, partMtTot = 0, partMtCalls = 0, draftCalls = 0;
+        uint32_t waitMin = 0xffffffffu, waitMax = 0;
+        uint64_t commitWaitTot = 0;
+        uint32_t commitWaitMax = 0;
+        bool sawExpectedLang = false, sawExpectedScript = false;
+        PartialState pst;
+        AgreeState   agr;
+        SeqState     seqst;
+        PartialSnap  snap;              // hoisted for the same reason pipelineMain hoists it
+        uint64_t     doneSegId = 0;
+        // ONE per file, like the live helper's: the conversation's memory is what feeds the
+        // ASR prompt and the MT context, and starting it fresh per file is what stops the
+        // English bench seeding the Chinese one (which would make this test a liar).
+        TrContext    ctx;
+        // dstLang, checked on EVERY message rather than once: it is the field the dedicated
+        // window filters on, so a single line carrying the wrong one is a line that vanishes.
+        // Stated as an INVARIANT rather than by calling routeFor again -- an assertion that
+        // re-runs the code under test only proves the wire copied it, not that it is right.
+        auto dstLangOk = [&](const std::string& lang, const std::string& dstLang,
+                             const char* kind, uint64_t segId) {
+            const std::string& A = routing.langA;
+            const std::string& B = routing.langB;
+            // Derived from the MODE, not from the message and not from routeFor: a line is
+            // a passthrough exactly when a lock points at the language it is already in.
+            const bool pass = (routing.mode == "a2b" && lang == B)
+                           || (routing.mode == "b2a" && lang == A);
+            const char* bad = nullptr;
+            if (pass) {
+                if (dstLang != lang) bad = "a passthrough must repeat its own language";
+            } else if (dstLang != A && dstLang != B) {
+                bad = "the target is outside the pair";
+            } else if (dstLang == lang) {
+                bad = "translated into the language it came from";
+            } else if (lang == A && dstLang != B) {
+                bad = "A was not sent to B";
+            } else if (lang == B && dstLang != A) {
+                bad = "B was not sent to A";
+            }
+            if (!bad) return;
+            std::printf("    ASSERT FAIL: %s seg #%llu lang=%s dstLang=%s pair=%s/%s: %s\n",
+                        kind, (unsigned long long)segId, lang.c_str(), dstLang.c_str(),
+                        A.c_str(), B.c_str(), bad);
+            ++failures;
+        };
+        // ... and the same derivation applied to the wire's own `pass` flag, which the UI
+        // uses to decide whether a line is a translation at all.
+        auto passFlagOk = [&](const std::string& lang, bool wirePass, uint64_t segId) {
+            const bool want = (routing.mode == "a2b" && lang == routing.langB)
+                           || (routing.mode == "b2a" && lang == routing.langA);
+            if (wirePass == want) return;
+            std::printf("    ASSERT FAIL: LINE seg #%llu lang=%s mode=%s says pass=%d\n",
+                        (unsigned long long)segId, lang.c_str(), routing.mode.c_str(),
+                        wirePass ? 1 : 0);
+            ++failures;
+        };
+
+        // ---- the finals: drained to exhaustion, exactly like pipelineMain's loop ----
+        auto takeFinals = [&]() {
+            Segment seg;
+            while (audio.pop(seg, 0)) {
+                ++cuts;
+                audio.dropPartialsUpTo(seg.segId);
+                if (seg.segId > doneSegId) doneSegId = seg.segId;
+                trimCommitted(agr, seg);      // the shipping guard, on the shipping path
+                const double secs = (double)seg.mono16k.size() / (double)kAsrRate;
+                recordAudio(seg.segId, seg.startOffset, seg.mono16k, seg.peakDbfs);
+                const double fullSecs = (double)segAudioFor(seg.segId).pcm.size()
+                                      / (double)kAsrRate;
+                segs.push_back(SegFact{ seg.segId, secs, fullSecs });
+                if (fullSecs > 2.0 * partialSec) ++longSegsSeen;
+
+                trpipe::WireLine line;
+                StageTimes tm;
+                std::string skip, perr;
+                const bool worthIt = seg.mono16k.size() >= (size_t)(kMinSegMs * kAsrRate / 1000);
+                if (!worthIt) skip = "tail shorter than kMinSegMs";
+                if (!worthIt
+                    || !processSegment(srv, spk, routing, ctx, seg, line, tm, skip, perr)) {
+                    std::printf("    seg #%llu tail (%.2f s of %.2f s, peak %.1f dBFS) "
+                                "no line: %s%s\n",
+                                (unsigned long long)seg.segId, secs, fullSecs, seg.peakDbfs,
+                                skip.empty() ? "" : skip.c_str(),
+                                perr.empty() ? "" : perr.c_str());
+                    if (!perr.empty()) ++failures;
+                    // ...and the message that makes the live line fall, exactly as
+                    // pipelineMain decides it: only for an utterance that already said
+                    // something, because a segment that never produced a line is the
+                    // silent drop this helper has always done.
+                    if (seqst.count(seg.segId)) {
+                        ++ends;
+                        events.push_back(Ev{ Ev::kEnd, seg.segId, 0, true, std::string() });
+                        std::printf("    END  seg #%llu\n", (unsigned long long)seg.segId);
+                    }
+                    continue;
+                }
+                line.seq    = seqst.next(line.segId);
+                line.closes = true;
+                // The SHIPPING expression, from the shipping helper (waitMsFrom), so what
+                // is asserted below is the number the tray is actually sent.
+                line.waitMs = waitMsFrom(seg.cutTickMs);
+                if (line.waitMs < waitMin) waitMin = line.waitMs;
+                if (line.waitMs > waitMax) waitMax = line.waitMs;
+                ++lines;
+                events.push_back(Ev{ Ev::kLine, line.segId, line.seq, true, line.src });
+                if (spk.enabled() && line.spkLabel.empty()) ++unlabelled;
+                std::printf("    LINE seg #%llu seq %u closes 1  %.2f s  peak %.1f dBFS"
+                            "  spk=%s/%s (%.3f, %u ms)"
+                            "  %s->%s%s  asr %u + mt %u = %u ms  wait %u ms  prompt=%s\n",
+                            (unsigned long long)line.segId, line.seq, secs, seg.peakDbfs,
+                            line.spkSlot.empty()  ? "(none)" : line.spkSlot.c_str(),
+                            line.spkLabel.empty() ? "-"      : line.spkLabel.c_str(),
+                            tm.spkSim, tm.spkMs,
+                            line.lang.c_str(), line.dstLang.c_str(), line.pass ? " (pass)" : "",
+                            tm.asrMs, tm.mtMs, tm.totalMs, line.waitMs,
+                            promptLabel(tm.asrPrompt).c_str());
+                ++finalsTotal;
+                if (!tm.asrPrompt.empty()) ++finalsPrompted;
+                dstLangOk(line.lang, line.dstLang, "LINE", line.segId);
+                passFlagOk(line.lang, line.pass, line.segId);
+                std::printf("         src: %s\n", line.src.c_str());
+                std::printf("         dst: %s\n", line.dst.c_str());
+                fffdCheck(line.src, "LINE src", line.segId);
+                fffdCheck(line.dst, "LINE dst", line.segId);
+                zhCheck(line.src, line.lang, "LINE src", line.segId);
+                zhCheck(line.dst, line.dstLang, "LINE dst", line.segId);
+                if (tm.srcToSimp || tm.dstToSimp) ++simpNetFinals;
+                if (line.segId == 0) {
+                    std::printf("    ASSERT FAIL: a LINE with no segId -- its live lines "
+                                "could never be matched to it\n");
+                    ++failures;
+                }
+                if (!(line.waitMs > 0 && line.waitMs < 10000)) {
+                    std::printf("    ASSERT FAIL: waitMs %u is not a plausible wait "
+                                "(0 < waitMs < 10000)\n", line.waitMs);
+                    ++failures;
+                }
+                // The two numbers are nested by construction: the wait STARTS at the cut
+                // and ends after the inference, so it must contain it. Here they come out
+                // equal (nothing queues in a selftest, which drains every block); in the
+                // live helper the difference is the queue plus the servant's poll. What
+                // this catches is the wiring mistake -- waitMs stamped off the wrong
+                // clock -- which would otherwise pass every other assertion in this file.
+                if (line.waitMs < line.ms) {
+                    std::printf("    ASSERT FAIL: waitMs %u < ms %u -- the wait cannot be "
+                                "shorter than the inference inside it\n",
+                                line.waitMs, line.ms);
+                    ++failures;
+                }
+                const bool srcIsZh = cjkRatio(line.src) >= 0.20;
+                const bool dstHasCjk = cjkRatio(line.dst) > 0.0;
+                const bool dstHasLatin = hasLatinLetters(line.dst);
+                if (cse.expectChinese) {
+                    if (line.lang == "zh" || line.lang == "yue" || srcIsZh) sawExpectedLang = true;
+                    if (dstHasLatin) sawExpectedScript = true;       // ZH in -> English out
+                } else {
+                    if (line.lang == "en" || (!srcIsZh && !line.lang.empty())) sawExpectedLang = true;
+                    if (dstHasCjk) sawExpectedScript = true;         // EN in -> Chinese out
+                }
+            }
+        };
+
+        // ---- one draft, and ONLY when the queue above came back empty --------------
+        // The SHIPPING order of pipelineMain's draft branch, step for step: transcribe,
+        // try to COMMIT a sentence out of it, and only if none came out, send the draft as
+        // a live line. Any other order here would be testing a pipeline we do not ship.
+        auto takePartial = [&]() {
+            if (!audio.popPartial(snap)) return;
+            if (snap.segId <= doneSegId) return;      // its paragraph is already on screen
+            if (snapStale(agr, snap)) return;         // ... or a window we already committed
+            const double secs = snap.seconds();
+            recordAudio(snap.segId, snap.startOffset, snap.mono16k, snap.peakDbfs);
+
+            AsrResult draft;
+            std::string perr;
+            if (!draftTranscribe(srv, routing, ctx, snap, draft, perr)) {
+                if (!perr.empty()) {
+                    std::printf("    PART seg #%llu FAILED: %s\n",
+                                (unsigned long long)snap.segId, perr.c_str());
+                    ++failures;
+                }
+                return;
+            }
+            ++draftCalls;
+            partAsrTot += draft.ms;
+            const uint32_t a = draft.ms;
+
+            // ---- the COMMIT: a sentence finalised while the speaker is still talking ----
+            CommitOut co;
+            std::string cerr;
+            if (commitStep(srv, spk, audio, routing, ctx, commitCfg, snap, draft,
+                           agr, pst, co, cerr)) {
+                co.line.seq    = seqst.next(co.line.segId);
+                co.line.waitMs = waitMsFrom(co.refTickMs);   // the shipping expression
+                ++commits;
+                ++lines;
+                anyEarlyLine = true;
+                commitWaitTot += co.line.waitMs;
+                if (co.line.waitMs > commitWaitMax) commitWaitMax = co.line.waitMs;
+                events.push_back(Ev{ Ev::kLine, co.line.segId, co.line.seq, false,
+                                     co.line.src });
+                if (spk.enabled() && co.line.spkLabel.empty()) ++unlabelled;
+                // WB (WA review): how much of the final the reader had already seen in the
+                // live line -- the draft's words against the final's, normalised the engine's
+                // way. A prompted draft followed by an UNPROMPTED final disagreed on punctuation
+                // and casing at every commit; the head-trim in the UI works on this very pair.
+                const std::vector<std::string> dTok = normWords(co.draftSrc);
+                const std::vector<std::string> fTok = normWords(co.line.src);
+                const size_t agreeN = commonPrefixLen(dTok, fTok);
+                const double agree = dTok.empty() ? 1.0
+                                   : (double)agreeN / (double)std::max(dTok.size(), fTok.size());
+                std::printf("    LINE seg #%llu seq %u closes 0  sentence %.2f s of a %.2f s "
+                            "window  spk=%s/%s  %s->%s%s  asr %u + mt %u = %u ms  wait %u ms%s"
+                            "  prompt=%s  draft-agree %.0f%%\n",
+                            (unsigned long long)co.line.segId, co.line.seq,
+                            (double)(co.newOffset - snap.startOffset) / (double)kAsrRate, secs,
+                            co.line.spkSlot.empty()  ? "(none)" : co.line.spkSlot.c_str(),
+                            co.line.spkLabel.empty() ? "-"      : co.line.spkLabel.c_str(),
+                            co.line.lang.c_str(), co.line.dstLang.c_str(),
+                            co.line.pass ? " (pass)" : "",
+                            co.tm.asrMs, co.tm.mtMs, co.tm.totalMs, co.line.waitMs,
+                            co.byPause ? "  [pause rule]" : "",
+                            promptLabel(co.tm.asrPrompt).c_str(), agree * 100.0);
+                ++finalsTotal;
+                if (!co.tm.asrPrompt.empty()) ++finalsPrompted;
+                std::printf("       draft: %s\n", co.draftSrc.c_str());
+                std::printf("         src: %s\n", co.line.src.c_str());
+                std::printf("         dst: %s\n", co.line.dst.c_str());
+                fffdCheck(co.line.src, "committed LINE src", co.line.segId);
+                fffdCheck(co.line.dst, "committed LINE dst", co.line.segId);
+                zhCheck(co.line.src, co.line.lang, "committed LINE src", co.line.segId);
+                zhCheck(co.line.dst, co.line.dstLang, "committed LINE dst", co.line.segId);
+                if (co.tm.srcToSimp || co.tm.dstToSimp) ++simpNetFinals;
+                if (cjkRatio(co.line.src) >= 0.20) ++zhCommits;
+                dstLangOk(co.line.lang, co.line.dstLang, "LINE", co.line.segId);
+                passFlagOk(co.line.lang, co.line.pass, co.line.segId);
+                // /!\ NO waitMs > 0 ASSERTION HERE, and it is not an omission. A committed
+                // line's wait is measured from the SENTENCE's end, which a selftest that
+                // feeds a file faster than real time can legitimately place in the future
+                // -- the clamp then reads 0. The live helper's clock is the speaker's.
+                if (co.line.ms == 0) {
+                    std::printf("    ASSERT FAIL: a committed line with no inference time\n");
+                    ++failures;
+                }
+                // ORDER: the LINE, and only then what is left of the live line.
+                if (co.hasTail) {
+                    ++parts;
+                    events.push_back(Ev{ Ev::kPart, co.tail.segId, 0, false, co.tail.src });
+                    std::printf("    PART seg #%llu  (tail after the commit)\n"
+                                "         src: %s\n",
+                                (unsigned long long)co.tail.segId, co.tail.src.c_str());
+                    fffdCheck(co.tail.src, "tail PART src", co.tail.segId);
+                    zhCheck(co.tail.src, co.tail.lang, "tail PART src", co.tail.segId);
+                    if (!co.tail.dst.empty()) {
+                        std::printf("    ASSERT FAIL: a commit's tail PART must carry NO "
+                                    "translation (the next draft makes it)\n");
+                        ++failures;
+                    }
+                }
+                return;
+            }
+            if (!cerr.empty()) {
+                std::printf("    COMMIT seg #%llu FAILED: %s\n",
+                            (unsigned long long)snap.segId, cerr.c_str());
+                ++failures;
+                return;
+            }
+
+            trpipe::WirePartial p;
+            uint32_t m = 0;
+            if (!processPartial(srv, audio, routing, ctx, snap, draft, /*wantMt=*/true, pst,
+                                p, m, perr)) {
+                return;                 // the text has not moved: a frame the user does not get
+            }
+            ++parts;
+            if (m) { partMtTot += m; ++partMtCalls; }
+            events.push_back(Ev{ Ev::kPart, p.segId, 0, false, p.src });
+            if (p.src.empty()) ++emptyParts;
+            char mtNote[32] = "";
+            if (m) std::snprintf(mtNote, sizeof(mtNote), " + mt %u ms", m);
+            std::printf("    PART seg #%llu  %.2f s of audio  asr %u ms%s  %s->%s\n",
+                        (unsigned long long)p.segId, secs, a, mtNote, p.lang.c_str(),
+                        p.dstLang.empty() ? "-" : p.dstLang.c_str());
+            std::printf("         src: %s\n", p.src.c_str());
+            std::printf("         dst: %s\n", p.dst.empty() ? "(no draft yet)" : p.dst.c_str());
+            fffdCheck(p.src, "PART src", p.segId);
+            fffdCheck(p.dst, "PART dst", p.segId);
+            zhCheck(p.src, p.lang, "PART src", p.segId);
+            zhCheck(p.dst, p.dstLang, "PART dst", p.segId);
+            // A draft with no translation yet has nothing to label, and that is legal (it
+            // is the state of every first draft). Anything else must be consistent.
+            if (!p.dst.empty())
+                dstLangOk(p.lang, p.dstLang, "PART", p.segId);
+        };
+
+        const size_t block = 1024;
+        for (size_t at = 0; at < w.mono.size(); at += block) {
+            audio.selftestFeed(w.mono.data() + at,
+                               (int)std::min(block, w.mono.size() - at));
+            takeFinals();      // finished utterances FIRST -- the shipping priority
+            takePartial();     // ... a draft only once nothing is due
+        }
+        audio.selftestEnd();
+        takeFinals();
+
+        if (parts) anyPartial = true;
+        std::printf("    -> %d VAD cut(s), %d line(s) (%d committed mid-utterance, %d END), "
+                    "%d live line(s)  [tap: %llu made / %llu superseded before pickup]\n",
+                    cuts, lines, commits, ends, parts,
+                    (unsigned long long)audio.partialsMade(),
+                    (unsigned long long)audio.partialsSkipped());
+        if (draftCalls) {
+            std::printf("       draft cost: asr %u ms avg over %u, mt %u ms avg over %u\n",
+                        partAsrTot / draftCalls, draftCalls,
+                        partMtCalls ? partMtTot / partMtCalls : 0u, partMtCalls);
+        }
+        if (lines > commits) std::printf("       waitMs (closing lines): min %u / max %u\n",
+                                         waitMin, waitMax);
+        if (commits) std::printf("       waitMs (committed sentences, from the sentence's own "
+                                 "end): mean %u / max %u over %d\n",
+                                 (uint32_t)(commitWaitTot / (uint64_t)commits),
+                                 commitWaitMax, commits);
+
+        if (lines < 1)          { std::printf("    ASSERT FAIL: no line produced\n"); ++failures; }
+        if (!sawExpectedLang)   { std::printf("    ASSERT FAIL: expected source language %s\n",
+                                              cse.expectChinese ? "zh" : "en"); ++failures; }
+        if (!sawExpectedScript) { std::printf("    ASSERT FAIL: translation is not in the expected script (%s)\n",
+                                              cse.expectChinese ? "latin" : "CJK"); ++failures; }
+        // Both bench files are ONE speaker each, so the only thing worth asserting here
+        // is that an armed stage labelled every line it saw. How WELL it separates
+        // voices is --selftest-spk's job, on material built to answer that question.
+        if (unlabelled)         { std::printf("    ASSERT FAIL: %d line(s) with no speaker label "
+                                              "while the stage is armed\n", unlabelled); ++failures; }
+        if (emptyParts)         { std::printf("    ASSERT FAIL: %d live line(s) with an empty "
+                                              "transcript\n", emptyParts); ++failures; }
+
+        // ---- the live line's own three claims, read off the event stream -----------
+        // (a) A SEGMENT LONG ENOUGH TO HAVE ONE, HAS ONE. The cadence promise, stated
+        //     as the user would state it: if you talk for more than two cadences, the
+        //     screen moves before you stop. Measured on the WHOLE utterance, not on the
+        //     tail the VAD finally cut -- since W3 those are two different lengths.
+        for (const auto& s : segs) {
+            if (s.fullSecs <= 2.0 * partialSec) continue;
+            int n = 0;
+            for (const auto& e : events)
+                if (e.kind == Ev::kPart && e.segId == s.segId) ++n;
+            if (n < 1) {
+                std::printf("    ASSERT FAIL: seg #%llu ran %.2f s (> 2 x PARTIALSEC) "
+                            "and produced no live line\n",
+                            (unsigned long long)s.segId, s.fullSecs);
+                ++failures;
+            }
+        }
+        // (b) EVERY PART COMES BEFORE THE LINE THAT CLOSES ITS UTTERANCE. A draft arriving
+        //     after the paragraph is finished would repaint the screen backwards -- the one
+        //     ordering bug progressive display can have. /!\ A closes=0 LINE does NOT end
+        //     anything: the whole point of W3 is that PARTs keep coming after it.
+        for (size_t i = 0; i < events.size(); ++i) {
+            const bool ending = (events[i].kind == Ev::kEnd)
+                             || (events[i].kind == Ev::kLine && events[i].closes);
+            if (!ending) continue;
+            for (size_t j = i + 1; j < events.size(); ++j)
+                if (events[j].segId == events[i].segId) {
+                    std::printf("    ASSERT FAIL: a %s for seg #%llu was emitted AFTER that "
+                                "utterance was closed\n",
+                                events[j].kind == Ev::kPart ? "live line" : "line",
+                                (unsigned long long)events[i].segId);
+                    ++failures;
+                }
+        }
+        // (c) EVERY PART BELONGS TO A REAL UTTERANCE. A segId that never became a cut
+        //     would mean the ids are minted somewhere they should not be.
+        for (const auto& e : events) {
+            if (e.kind != Ev::kPart) continue;
+            bool known = false;
+            for (const auto& s : segs) known |= (s.segId == e.segId);
+            if (!known) {
+                std::printf("    ASSERT FAIL: live line for seg #%llu, which never "
+                            "became an utterance\n", (unsigned long long)e.segId);
+                ++failures;
+            }
+        }
+
+        // =====================================================================
+        // W3: the commit engine's claims. Read off the SAME event stream, because
+        // "what the tray received, in order" is the only thing a UI can be built on.
+        // =====================================================================
+        // (b2) EXACTLY ONE ENDING per utterance that said anything, and nothing after it.
+        for (const auto& s : segs) {
+            int said = 0, endings = 0;
+            for (const auto& e : events) {
+                if (e.segId != s.segId) continue;
+                if (e.kind == Ev::kLine) ++said;
+                if (e.kind == Ev::kEnd || (e.kind == Ev::kLine && e.closes)) ++endings;
+            }
+            if (!said) continue;                  // never produced a line: nothing is owed
+            if (endings != 1) {
+                std::printf("    ASSERT FAIL: seg #%llu produced %d line(s) and %d ending(s)"
+                            " -- exactly one LINE closes=1 or END is owed\n",
+                            (unsigned long long)s.segId, said, endings);
+                ++failures;
+            }
+        }
+        // (c2) SEQ STRICTLY INCREASING per utterance, starting at 1. A UI that reorders on
+        //      seq cannot do it if two lines claim the same number.
+        for (const auto& s : segs) {
+            uint32_t last = 0;
+            for (const auto& e : events) {
+                if (e.kind != Ev::kLine || e.segId != s.segId) continue;
+                if (e.seq != last + 1) {
+                    std::printf("    ASSERT FAIL: seg #%llu line seq %u follows %u "
+                                "(must be strictly +1 from 1)\n",
+                                (unsigned long long)s.segId, e.seq, last);
+                    ++failures;
+                }
+                last = e.seq;
+            }
+        }
+        // (d) NO REPAINT OF COMMITTED TEXT. After a closes=0 line, the NEXT live line of
+        //     that utterance must not begin with the sentence that was just finalised --
+        //     that is the entire promise of the commit offset, seen from the screen.
+        for (size_t i = 0; i < events.size(); ++i) {
+            if (events[i].kind != Ev::kLine || events[i].closes) continue;
+            const std::vector<std::string> sent = normWords(events[i].src);
+            if (sent.size() < 3) continue;        // too short to be evidence either way
+            for (size_t j = i + 1; j < events.size(); ++j) {
+                if (events[j].segId != events[i].segId) continue;
+                if (events[j].kind != Ev::kPart) break;      // the utterance ended first
+                const std::vector<std::string> tail = normWords(events[j].src);
+                if (tail.size() >= 3 && tail[0] == sent[0] && tail[1] == sent[1]
+                    && tail[2] == sent[2]) {
+                    std::printf("    ASSERT FAIL: seg #%llu live line repeats the committed "
+                                "sentence's first words (\"%s %s %s...\")\n",
+                                (unsigned long long)events[i].segId,
+                                sent[0].c_str(), sent[1].c_str(), sent[2].c_str());
+                    ++failures;
+                }
+                break;                                       // only the NEXT one is asserted
+            }
+        }
+        // (e) COVERAGE. The finished lines of an utterance, concatenated in seq order, must
+        //     still say what the WHOLE utterance said -- and must not say any of it twice.
+        //     This is the assertion the whole wave rests on: cutting a segment into
+        //     sentences is only allowed if nothing falls between the cuts.
+        for (const auto& s : segs) {
+            std::string joined;
+            for (const auto& e : events)
+                if (e.kind == Ev::kLine && e.segId == s.segId) {
+                    if (!joined.empty()) joined += ' ';
+                    joined += e.src;
+                }
+            if (joined.empty()) continue;
+            const SegAudio& whole = segAudioFor(s.segId);
+            if (whole.pcm.size() < (size_t)(kMinSegMs * kAsrRate / 1000)) continue;
+            AsrResult oneShot;
+            std::string oerr;
+            AsrOptions oopt;
+            oopt.language = "auto";
+            // NO PROMPT: this is the control, and it must not be steered by the same
+            // context the lines under test were produced with.
+            if (!asrTranscribe(srv.finalPort(), buildWav16k(whole.pcm), oneShot,
+                               kAsrTimeoutMs, oerr)) {
+                std::printf("    coverage seg #%llu: one-shot ASR failed (%s) -- NOT CHECKED\n",
+                            (unsigned long long)s.segId, oerr.c_str());
+                continue;
+            }
+            // SCRIPT-BLIND (WB, after the WA review): the control is deliberately UNPROMPTED, and
+            // unprompted `small` writes some Chinese sentences in Traditional -- while the lines,
+            // prompted at last, are in the pair's script. Coverage asks "did anything fall between
+            // the cuts", not "which script", so both sides go through the system's character map
+            // first (the per-character tokens would otherwise mismatch on U+5C0D/U+5BF9 and call it a loss).
+            const std::vector<std::string> ref = normWords(lcmapTraditional(oneShot.text));
+            const std::vector<std::string> got = normWords(lcmapTraditional(joined));
+            if (ref.empty()) continue;
+            // Multiset containment: how much of what the one-shot heard survived the cuts.
+            std::vector<bool> used(got.size(), false);
+            size_t hit = 0;
+            for (const auto& rw : ref) {
+                for (size_t k = 0; k < got.size(); ++k)
+                    if (!used[k] && got[k] == rw) { used[k] = true; ++hit; break; }
+            }
+            const double cover = (double)hit / (double)ref.size();
+            // ... and no 3-word window twice, which is what a sentence committed and then
+            // transcribed again would look like.
+            bool dup = false;
+            std::string dupAt;
+            for (size_t k = 0; k + 2 < got.size() && !dup; ++k) {
+                for (size_t m2 = k + 1; m2 + 2 < got.size(); ++m2)
+                    if (got[k] == got[m2] && got[k + 1] == got[m2 + 1]
+                        && got[k + 2] == got[m2 + 2]) {
+                        dup = true;
+                        dupAt = got[k] + " " + got[k + 1] + " " + got[k + 2];
+                        break;
+                    }
+            }
+            std::printf("    coverage seg #%llu (%.2f s, %d line(s)): %.0f%% of a one-shot "
+                        "ASR's %d word(s)%s\n",
+                        (unsigned long long)s.segId,
+                        (double)whole.pcm.size() / (double)kAsrRate,
+                        (int)std::count_if(events.begin(), events.end(),
+                                           [&](const Ev& e) {
+                                               return e.kind == Ev::kLine && e.segId == s.segId;
+                                           }),
+                        cover * 100.0, (int)ref.size(),
+                        dup ? "  DUPLICATED WINDOW" : "");
+            if (cover < 0.80) {
+                std::printf("      one-shot: %s\n      lines   : %s\n",
+                            oneShot.text.c_str(), joined.c_str());
+                std::printf("    ASSERT FAIL: the committed lines of seg #%llu cover only "
+                            "%.0f%% of what the whole utterance said\n",
+                            (unsigned long long)s.segId, cover * 100.0);
+                ++failures;
+            }
+            if (dup) {
+                std::printf("      lines: %s\n", joined.c_str());
+                std::printf("    ASSERT FAIL: seg #%llu says \"%s\" twice -- a sentence was "
+                            "committed AND transcribed again\n",
+                            (unsigned long long)s.segId, dupAt.c_str());
+                ++failures;
+            }
+        }
+    }
+    // ---- WB: NO U+FFFD ON THE WIRE, and the Chinese commit it matters for ----------------
+    std::printf("\n[4ter] U+FFFD on the wire: %d of %d LINE/PART text(s); %d Chinese sentence(s) "
+                "committed mid-utterance%s\n", wireFffd, wireTexts, zhCommits,
+                zhCommits ? "" : "  -- a Chinese commit: NOT CHECKED (none happened in this run)");
+    std::printf("[4ter] zh-labelled texts shown Simplified: %d checked; the Simplified net rewrote %d final(s)\n",
+                zhTexts, simpNetFinals);
+    // ---- WB (WA review): THE FINALS ARE PROMPTED --------------------------------------
+    // Read off AsrResult::promptSent, i.e. off what asrTranscribe put in the request -- not
+    // off asrPromptFor, which was always right and was never the problem.
+    std::printf("\n[4bis] Finals carry their prompt: %d of %d final(s) were sent one%s\n",
+                finalsPrompted, finalsTotal, routing.asrPrompt ? "" : "  (ASRPROMPT 0: none expected)");
+    if (casesRun && routing.asrPrompt && (finalsTotal == 0 || finalsPrompted != finalsTotal)) {
+        std::printf("    ASSERT FAIL: a final was decoded WITHOUT its prompt (the W2a bug)\n");
+        ++failures;
+    }
+    // ---- ...and a prompted final on a QUIET TAIL is not allowed to say anything -----------
+    // The risk the fix creates: a final IS now told "what was said just before", and on a
+    // breath after the last committed sentence whisper hands exactly that back. The tails are
+    // built the way the VAD hands one over -- their OWN audio quiet (pink noise), their
+    // segment's peak the LOUD speech before them (-12 dBFS) -- so only the tail's own level
+    // (hopPeakDbfs) can tell what they are. Two levels, three decodes each (the GPU is not
+    // deterministic, and one lucky call proves nothing):
+    //   * -52 dBFS RMS: no hop reaches the VAD's CLOSING level (-44) -> never transcribed (the gate);
+    //   * -46 and -39 dBFS RMS: hops between the closing and the opening level, or above -- what
+    //     the VAD would keep open (WB, after the review: the gate no longer drops those) -> transcribed
+    //     WITH the prompt, and whatever comes back (echo, caption, phonetic garbage) must be filtered.
+    {
+        TrContext qc;
+        qc.lastFinalLang = "en";
+        qc.rememberSrc("en", "Let us listen to it together one more time and decide.");
+        auto makeTail = [](double rmsDb) {
+            std::vector<float> tail((size_t)kAsrRate * 2);
+            uint32_t rng = 4242u;
+            double b0 = 0, b1 = 0, b2 = 0;        // a cheap pink-ish noise (Paul Kellet, 3 poles)
+            for (auto& v : tail) {
+                rng = rng * 1664525u + 1013904223u;
+                const double wn = ((double)(rng >> 8) / 16777216.0) * 2.0 - 1.0;
+                b0 = 0.99765 * b0 + wn * 0.0990460;
+                b1 = 0.96300 * b1 + wn * 0.2965164;
+                b2 = 0.57000 * b2 + wn * 1.0526913;
+                v = (float)((b0 + b1 + b2 + wn * 0.1848) * 0.05);
+            }
+            double sum = 0.0;
+            for (float v : tail) sum += (double)v * v;
+            const double g = std::pow(10.0, rmsDb / 20.0) / std::sqrt(sum / (double)tail.size());
+            for (auto& v : tail) v = (float)(v * g);
+            return tail;
+        };
+        for (const double rmsDb : { -52.0, -46.0, -39.0 }) {
+            const std::vector<float> tail = makeTail(rmsDb);
+            int spoke = 0, gated = 0;
+            for (int rep = 0; rep < 3; ++rep) {
+                Segment s;
+                s.mono16k  = tail;
+                s.segId    = 900000 + (uint64_t)rep;
+                s.peakDbfs = -12.0;                // the utterance's peak, as a tail carries it
+                trpipe::WireLine ql;
+                StageTimes qt;
+                std::string skip, perr;
+                TrContext ctxCopy = qc;
+                const bool said = processSegment(srv, spk, routing, ctxCopy, s, ql, qt, skip, perr);
+                std::printf("[4bis] quiet tail %.0f dBFS RMS #%d (own peak %.1f, prompt=%s): %s%s\n",
+                            rmsDb, rep + 1, hopPeakDbfs(tail), promptLabel(qt.asrPrompt).c_str(),
+                            said ? ("LINE: " + ql.src).c_str() : skip.c_str(), perr.c_str());
+                if (said) ++spoke;
+                if (!said && skip.rfind("no onset", 0) == 0) ++gated;
+                if (!perr.empty()) ++failures;
+            }
+            if (spoke) {
+                std::printf("    ASSERT FAIL: a quiet tail produced %d line(s) -- the prompt's "
+                            "echo (or other junk) reached the screen\n", spoke);
+                ++failures;
+            }
+            if (hopPeakDbfs(tail) < kVadCloseDbfs && gated != 3) {
+                std::printf("    ASSERT FAIL: a tail with no hop at the VAD's closing level was "
+                            "sent to the ASR (%d of 3 gated)\n", gated);
+                ++failures;
+            }
+        }
+    }
+
+    if (casesRun && !longSegsSeen) {
+        std::printf("\n    ASSERT FAIL: neither bench file contains a segment longer than "
+                    "2 x PARTIALSEC (%.2f s) -- the live line's cadence claim was never "
+                    "put to the test\n", 2.0 * partialSec);
+        ++failures;
+    }
+    if (casesRun && !anyPartial) {
+        std::printf("    ASSERT FAIL: not one live line was produced across either file\n");
+        ++failures;
+    }
+    // THE CLAIM OF THIS WHOLE WAVE, in one assertion: a sentence reached the screen while
+    // its utterance was still open -- i.e. BEFORE the VAD close that used to be the only
+    // moment a subtitle could exist. On at least one of the two files: the bench material
+    // is what it is, and a file of short sentences with long gaps legitimately never needs
+    // a mid-utterance commit.
+    if (casesRun && !anyEarlyLine) {
+        std::printf("    ASSERT FAIL: not one sentence was finalised mid-utterance across "
+                    "either file -- the commit engine never fired\n");
+        ++failures;
+    }
+    if (spk.enabled()) {
+        std::string live;
+        for (const auto& l : spk.clusterer().labels()) { if (!live.empty()) live += ' '; live += l; }
+        std::printf("\n[5] Voices heard across both files: %d (%s)\n",
+                    spk.speakerCount(), live.empty() ? "-" : live.c_str());
+    }
+
+    // ---- 6. TRADITIONAL CHINESE, end to end (wave WA) -------------------------------
+    // The same two bench files, the same SHIPPING stage functions in the same order as
+    // pipelineMain (finished utterances first, a draft only when none is due, a commit tried
+    // before a live line), with the one thing that changed: the pair is en <-> zh-tw. What is
+    // proved is the whole chain the feature stands on -- whisper prompted in Traditional
+    // writes Traditional, the router calls it zh-tw, the translator is asked for Taiwan's
+    // Chinese and answers in it -- and the evidence is the TEXT, voted on per line.
+    // Each file gets a fresh conversation memory, exactly like [4]: the Chinese file must not
+    // inherit a prompt from the English one, or this would test the context and not the pair.
+    {
+        Routing tw = routing;              // the same MT style / ASR prompt / context knobs
+        tw.mode  = "auto";
+        tw.langA = "en";
+        tw.langB = "zh-tw";
+        std::printf("\n[6] Traditional Chinese end to end: %s %s<->%s (shipping stages, + live line)\n",
+                    tw.mode.c_str(), tw.langA.c_str(), tw.langB.c_str());
+        struct TwCase { const wchar_t* leaf; const char* label; bool chinese; };
+        const TwCase twCases[] = {
+            { L"bench_zh.wav", "bench_zh.wav", true  },
+            { L"bench_en.wav", "bench_en.wav", false },
+        };
+        for (const auto& tc : twCases) {
+            std::printf("\n[6] %s\n", tc.label);
+            if (media.empty() || ::GetFileAttributesW((media + tc.leaf).c_str()) == INVALID_FILE_ATTRIBUTES) {
+                std::printf("    NOT CHECKED (set SUVTITLE_TEST_MEDIA)\n");
+                continue;
+            }
+            WavFile w;
+            std::string err;
+            if (!readWavMono(media + tc.leaf, w, err)) {
+                std::printf("    cannot read the bench file: %s\n", err.c_str());
+                ++failures;
+                continue;
+            }
+            TrAudio audio;
+            audio.setPartialSec(partialSec);
+            audio.selftestBegin(w.rate, "selftest:wa");
+            PartialState pst;
+            AgreeState   agr;
+            SeqState     seqst;
+            PartialSnap  snap;
+            uint64_t     doneSegId = 0;
+            TrContext    ctx;
+            int lines = 0, parts = 0;
+            // The two mechanisms, counted APART so neither can hide behind the other:
+            //   byModel = lines whose Traditional the MODEL wrote by itself (whisper under the
+            //             zh-tw prompt for the Chinese file, Qwen for the English one);
+            //   byNet   = lines the safety net (toTraditional) had to rewrite.
+            int byModel = 0, byNet = 0;
+            const char* wantLang = tc.chinese ? "zh-tw" : "en";
+            const char* wantDst  = tc.chinese ? "en"    : "zh-tw";
+
+            // Every finished line, whichever path made it, printed with the prompt its final
+            // was ACTUALLY SENT (StageTimes::asrPrompt, off the request) -- because the prompt
+            // is the cause of the script, and a failure that does not say which prompt produced
+            // it is a failure nobody can read.
+            //
+            // THE CLAIM, per line, is "nothing Simplified is shown": no Simplified-only character
+            // by the vote table, and nothing left for the system converter to change. NOT "more
+            // Traditional than Simplified": "U+5927,5BB6,65E9,4E0A,597D" is the same in both scripts, votes 0/0,
+            // and is perfectly good Traditional -- a majority test would fail it for nothing.
+            // WB (WA review): what the final was ACTUALLY SENT, not what expectedLang would
+            // have chosen -- the two differed for every final until the W2a bug was fixed.
+            // `firstTwSeen`: once a zh-tw line has been finalised, every LATER final of the
+            // Chinese file must have been sent the Traditional prompt (auto mode follows the
+            // last final's language) -- asserted on the request, which is the claim [0bis]
+            // used to make about the prompt BUILDER only.
+            bool firstTwSeen = false;
+            auto checkLine = [&](const trpipe::WireLine& l, const StageTimes& tm, const char* how) {
+                ++lines;
+                int st = 0, ss = 0, dt = 0, ds = 0;
+                hanScriptVotes(l.src, st, ss);
+                hanScriptVotes(l.dst, dt, ds);
+                const bool net = tc.chinese ? tm.srcToTrad : tm.dstToTrad;
+                const std::string sent = promptLabel(tm.asrPrompt);
+                std::printf("    LINE seg #%llu seq %u %s  %s->%s%s  prompt=%s  src T%d/S%d  dst T%d/S%d%s\n",
+                            (unsigned long long)l.segId, l.seq, how, l.lang.c_str(),
+                            l.dstLang.c_str(), l.pass ? " (pass)" : "", sent.c_str(),
+                            st, ss, dt, ds, net ? "  [safety net rewrote it]" : "");
+                std::printf("      prompt: %s\n", tm.asrPrompt.empty() ? "(none)" : tm.asrPrompt.c_str());
+                std::printf("         src: %s\n", l.src.c_str());
+                std::printf("         dst: %s\n", l.dst.c_str());
+                if (tc.chinese && firstTwSeen && tw.asrPrompt && sent != "zh-tw") {
+                    std::printf("    ASSERT FAIL: seg #%llu seq %u: a final after a zh-tw line was "
+                                "sent the %s prompt, not the Traditional one\n",
+                                (unsigned long long)l.segId, l.seq, sent.c_str());
+                    ++failures;
+                }
+                if (l.lang == "zh-tw") firstTwSeen = true;
+                auto fail = [&](const char* what) {
+                    std::printf("    ASSERT FAIL: seg #%llu seq %u: %s\n",
+                                (unsigned long long)l.segId, l.seq, what);
+                    ++failures;
+                };
+                if (l.lang != wantLang)    fail(tc.chinese ? "a Han line was not routed as zh-tw"
+                                                           : "an English line was not routed as en");
+                if (l.dstLang != wantDst)  fail("translated into the wrong half of the pair");
+                if (l.pass)                fail("a translated line marked as a passthrough");
+                const std::string& han = tc.chinese ? l.src : l.dst;   // the zh-tw text
+                const int hs = tc.chinese ? ss : ds, ht = tc.chinese ? st : dt;
+                if (hs != 0)               fail("a Simplified-only character is SHOWN on a zh-tw line");
+                // THE ORACLE (WB, after the WA review). This used to be `toTraditional(han) != han`
+                // -- the code under test run on its own output, which an idempotent function passes
+                // whatever it left behind. The system's CHARACTER map is the independent judge: a
+                // shown zh-tw line must be a fixed point of it, i.e. hold no character it would
+                // still convert. (It maps the ambiguous U+540E/U+91CC to themselves, so they pass.)
+                if (lcmapTraditional(han) != han)
+                    fail("the system's character map still finds Simplified in a zh-tw line");
+                // The two mechanisms, attributed HONESTLY: a Chinese line is the PROMPT's work
+                // only if the Traditional prompt was actually sent with it (WA counted unprompted
+                // finals as the prompt's doing); an English file's Traditional is Qwen's own.
+                if (net) ++byNet;
+                else if (ht > 0 && (!tc.chinese || sent == "zh-tw")) ++byModel;
+                if (tc.chinese) {
+                    if (cjkRatio(l.src) < 0.20)  fail("a zh-tw line with no Chinese in it");
+                    if (!hasLatinLetters(l.dst)) fail("zh-tw -> en produced no English");
+                } else {
+                    if (cjkRatio(l.dst) < 0.20)  fail("en -> zh-tw produced no Chinese");
+                }
+            };
+            auto takeFinals = [&]() {
+                Segment seg;
+                while (audio.pop(seg, 0)) {
+                    audio.dropPartialsUpTo(seg.segId);
+                    if (seg.segId > doneSegId) doneSegId = seg.segId;
+                    trimCommitted(agr, seg);
+                    if (seg.mono16k.size() < (size_t)(kMinSegMs * kAsrRate / 1000)) continue;
+                    trpipe::WireLine line;
+                    StageTimes tm;
+                    std::string skip, perr;
+                    if (!processSegment(srv, spk, tw, ctx, seg, line, tm, skip, perr)) {
+                        std::printf("    seg #%llu no line: %s%s\n", (unsigned long long)seg.segId,
+                                    skip.c_str(), perr.c_str());
+                        if (!perr.empty()) ++failures;
+                        continue;
+                    }
+                    line.seq    = seqst.next(line.segId);
+                    line.closes = true;
+                    checkLine(line, tm, "closes 1");
+                }
+            };
+            auto takePartial = [&]() {
+                if (!audio.popPartial(snap)) return;
+                if (snap.segId <= doneSegId || snapStale(agr, snap)) return;
+                AsrResult draft;
+                std::string perr;
+                if (!draftTranscribe(srv, tw, ctx, snap, draft, perr)) {
+                    if (!perr.empty()) {
+                        std::printf("    PART seg #%llu FAILED: %s\n",
+                                    (unsigned long long)snap.segId, perr.c_str());
+                        ++failures;
+                    }
+                    return;
+                }
+                CommitOut co;
+                std::string cerr;
+                if (commitStep(srv, spk, audio, tw, ctx, commitCfg, snap, draft, agr, pst, co, cerr)) {
+                    co.line.seq = seqst.next(co.line.segId);
+                    checkLine(co.line, co.tm, "closes 0");
+                    if (co.hasTail && co.tail.lang == "zh-tw") {
+                        int t = 0, s = 0;
+                        hanScriptVotes(co.tail.src, t, s);
+                        if (s != 0) {
+                            std::printf("    ASSERT FAIL: a commit's tail PART shows Simplified\n");
+                            ++failures;
+                        }
+                    }
+                    return;
+                }
+                if (!cerr.empty()) {
+                    std::printf("    COMMIT seg #%llu FAILED: %s\n",
+                                (unsigned long long)snap.segId, cerr.c_str());
+                    ++failures;
+                    return;
+                }
+                trpipe::WirePartial p;
+                uint32_t m = 0;
+                if (!processPartial(srv, audio, tw, ctx, snap, draft, /*wantMt=*/true, pst, p, m,
+                                    perr))
+                    return;
+                ++parts;
+                // A draft carries the same routing as a final, so the same two labels must
+                // hold -- the live line is the first thing the reader sees of a sentence.
+                if (p.lang != wantLang) {
+                    std::printf("    ASSERT FAIL: PART seg #%llu lang=%s (want %s)\n",
+                                (unsigned long long)p.segId, p.lang.c_str(), wantLang);
+                    ++failures;
+                }
+                if (!p.dst.empty() && p.dstLang != wantDst) {
+                    std::printf("    ASSERT FAIL: PART seg #%llu dstLang=%s (want %s)\n",
+                                (unsigned long long)p.segId, p.dstLang.c_str(), wantDst);
+                    ++failures;
+                }
+                // ...and the same script rule as a final: the live line is shown too, and the
+                // UI's head-trim compares it with the final that replaces it.
+                const std::string& han = tc.chinese ? p.src : p.dst;
+                int t = 0, s = 0;
+                hanScriptVotes(han, t, s);
+                if (s != 0) {
+                    std::printf("    ASSERT FAIL: PART seg #%llu shows Simplified on a zh-tw line: %s\n",
+                                (unsigned long long)p.segId, han.c_str());
+                    ++failures;
+                }
+            };
+
+            const size_t block = 1024;
+            for (size_t at = 0; at < w.mono.size(); at += block) {
+                audio.selftestFeed(w.mono.data() + at, (int)std::min(block, w.mono.size() - at));
+                takeFinals();
+                takePartial();
+            }
+            audio.selftestEnd();
+            takeFinals();
+            std::printf("    -> %d line(s): %d written Traditional by %s itself, %d rewritten by "
+                        "the safety net, %d other (script-neutral%s); %d live line(s)\n",
+                        lines, byModel,
+                        tc.chinese ? "whisper under the zh-tw prompt it was SENT" : "Qwen",
+                        byNet, lines - byModel - byNet,
+                        tc.chinese ? ", or Traditional without that prompt" : "", parts);
+            if (lines < 1) { std::printf("    ASSERT FAIL: no line produced\n"); ++failures; }
+            // The net must not be the whole story: at least one line has to come out
+            // Traditional from the MODEL, or the prompt half of this wave (the Traditional
+            // ASR glossary, the Taiwan MT prompt) is not reaching the model at all and the net
+            // is quietly doing everything -- with the converter's mainland word choices.
+            if (byModel < 1) {
+                std::printf("    ASSERT FAIL: no line came out Traditional from %s itself\n",
+                            tc.chinese ? "whisper under the zh-tw prompt" : "Qwen");
+                ++failures;
+            }
+        }
+    }
+
+    // ---- 7. + 8. the live finals' script nets, the onset gate (WB) ---------------------------
+    liveNetsAndGateTests(srv, cfg, failures);
+    // ---- C8b. a stop mid-utterance owes it one END (SuVtitle 1.1.0): the pipeline thread on this live pair ------
+    liveStopEndTest(srv, cfg, failures);
+
+    srv.killAll();
+    if (failures) {
+        std::printf("\nLIVE SELFTEST FAILED (%d assertion(s))\n", failures);
+        return 1;
+    }
+    std::printf("\nLIVE SELFTEST PASSED\n");
+    return 0;
+}
+
+// ===========================================================================
+// SPEAKER SELFTEST  (--selftest-spk)
+//
+// The diarization stage alone: no capture, no VAD, no ASR, no MT, no child servers.
+// Twenty-four utterances from the synthetic meeting the DESIGN was benched on, fed in
+// the SAME turn order the bench used, through the SAME embedding + clustering code the
+// live pipeline runs. That is what makes this a regression test of the shipped stage
+// rather than a re-run of the bench.
+//
+// The material: four voices, chosen to be hard in the ways a real meeting is hard --
+// A and B are BOTH en-US (the case an "it's a different language" heuristic cannot
+// help with), C is a French voice speaking accented English, D is Mandarin.
+// ===========================================================================
+int runSelftestSpk() {
+    ::SetConsoleOutputCP(CP_UTF8);
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::printf("=== SuVtitle Engine speaker selftest ===\n");
+
+    // A plausible meeting: interleaved turns with interjections landing immediately
+    // after another speaker -- the worst case for the attach-to-previous policy. This
+    // is the DIRECTOR'S BENCH ORDER, copied verbatim so the two runs are comparable.
+    static const char* kOrder[] = {
+        "A_1","B_1","A_2","B_2","D_1","C_1","B_3","A_3","D_2","C_2","A_4","B_4",
+        "D_3","C_3","B_5","D_4","A_5","C_4","B_6","D_5","C_5","A_6","D_6","C_6"
+    };
+    constexpr int kN = (int)(sizeof(kOrder) / sizeof(kOrder[0]));
+
+    TrConfig cfg;
+    cfg.load();
+    const TrPaths paths = resolvePaths(cfg);
+    std::printf("\n[1] Stage\n");
+    std::printf("    sherpa : %s\n", paths.sherpaDir.empty() ? "(NOT FOUND)" : wideToUtf8L(paths.sherpaDir).c_str());
+    std::printf("    model  : %s\n", paths.spkModel.empty()  ? "(NOT FOUND)" : wideToUtf8L(paths.spkModel).c_str());
+
+    SpkConfig sc = spkConfigFrom(cfg, paths);
+    sc.on = true;                       // this mode exists to test the stage; SPKON does not gate it
+    TrSpeaker spk;
+    std::string why;
+    if (!spk.begin(sc, why)) {
+        std::printf("    DISABLED: %s\n    SPK SELFTEST FAILED (stage would not load)\n", why.c_str());
+        return 1;
+    }
+    std::printf("    %s\n", why.c_str());
+    std::printf("    thresh %.2f  cap %d  short<%.2fs  recluster/%d\n",
+                sc.threshold, sc.maxSpeakers, sc.minSec, sc.recluster);
+
+    // SuVtitle: the meeting comes from SUVTITLE_TEST_MEDIA\meeting\ (testMediaRoot) -- not there = [2] to [4] NOT CHECKED,
+    // never a failure and never a path; [5] and [6] need no recording and run anyway.
+    const std::wstring media = testMediaRoot();
+    const bool haveMeeting = !media.empty()
+        && ::GetFileAttributesW((media + L"meeting\\spkA_1.wav").c_str()) != INVALID_FILE_ATTRIBUTES;
+    int failures = 0;
+    if (!haveMeeting) {
+        std::printf("\n[2] [3] [4] NOT CHECKED (set SUVTITLE_TEST_MEDIA): the 24-utterance meeting\n");
+    } else {
+        std::printf("\n[2] %d utterances, bench order\n", kN);
+        std::printf("    %-12s %-4s %-5s %6s %7s\n", "file", "spk", "label", "sim", "dur/ms");
+
+        std::vector<char>     truth;         // the speaker letter in the filename
+        std::vector<std::string> got;        // the label the stage assigned
+        std::vector<uint32_t> times;
+
+        for (int i = 0; i < kN; ++i) {
+            const std::string leaf = std::string("spk") + kOrder[i] + ".wav";
+            const std::wstring path = media + L"meeting\\" + utf8ToWideL(leaf);
+            WavFile w;
+            std::string err;
+            if (!readWavMono(path, w, err)) {
+                std::printf("    %-12s cannot read: %s\n", leaf.c_str(), err.c_str());
+                ++failures;
+                continue;
+            }
+            // The bench wavs are already 16 kHz mono; anything else goes through the SAME
+            // decimator the live front end uses rather than through a second code path.
+            std::vector<float> mono = w.mono;
+            if (w.rate != (uint32_t)kAsrRate) {
+                Decimator d;
+                d.init(w.rate);
+                std::vector<float> out;
+                d.process(w.mono.data(), (int)w.mono.size(), out);
+                mono.swap(out);
+            }
+            const double secs = (double)mono.size() / (double)kAsrRate;
+
+            double sim = 0.0;
+            uint32_t ms = 0;
+            const std::string label = spk.classify(mono, sim, ms);
+
+            truth.push_back(kOrder[i][0]);
+            got.push_back(label);
+            times.push_back(ms);
+            std::printf("    %-12s %-4c %-5s %6.3f %5.2fs/%ums\n",
+                        leaf.c_str(), kOrder[i][0], label.empty() ? "-" : label.c_str(),
+                        sim, secs, (unsigned)ms);
+        }
+
+        if ((int)got.size() != kN) {
+            std::printf("\n    SPK SELFTEST FAILED (%d of %d utterances read)\n", (int)got.size(), kN);
+            return 1;
+        }
+
+        // ---- purity: per cluster, how many members belong to its majority speaker ----
+        // /!\ Index the histogram with a BOUNDS CHECK, not with a mask. The first draft of
+        // this used "& 25" as a cheap clamp; 25 is 0b11001, so 'C' (2) and 'D' (3) folded
+        // onto 'A' and 'B' and the purity check could no longer see a cluster that mixed
+        // A with C. The assertion was reporting 100 % on evidence it had thrown away.
+        auto bucketOf = [](char letter) -> int {
+            const int t = letter - 'A';
+            return (t >= 0 && t < 26) ? t : 25;
+        };
+        auto purityOf = [&](const std::vector<std::string>& assign, int& clusters) {
+            std::vector<std::string> uniq;
+            for (const auto& g : assign)
+                if (std::find(uniq.begin(), uniq.end(), g) == uniq.end()) uniq.push_back(g);
+            clusters = (int)uniq.size();
+            int correct = 0;
+            for (const auto& u : uniq) {
+                int cnt[26] = {};
+                for (size_t i = 0; i < assign.size() && i < truth.size(); ++i)
+                    if (assign[i] == u) ++cnt[bucketOf(truth[i])];
+                int best = 0;
+                for (int c = 0; c < 26; ++c) best = std::max(best, cnt[c]);
+                correct += best;
+            }
+            return (double)correct / (double)assign.size();
+        };
+
+        int clusters = 0;
+        const double purity = purityOf(got, clusters);
+        std::vector<uint32_t> sorted = times;
+        std::sort(sorted.begin(), sorted.end());
+        const uint32_t median = sorted[sorted.size() / 2];
+
+        std::printf("\n[3] Result\n");
+        std::printf("    clusters      : %d (live labels:", clusters);
+        for (const auto& l : spk.clusterer().labels()) std::printf(" %s", l.c_str());
+        std::printf(")\n");
+        std::printf("    purity        : %.2f\n", purity);
+        std::printf("    embedding ms  : min %u / median %u / max %u\n",
+                    sorted.front(), median, sorted.back());
+
+        if (clusters != 4)   { std::printf("    ASSERT FAIL: expected exactly 4 clusters\n"); ++failures; }
+        if (purity < 1.0)    { std::printf("    ASSERT FAIL: expected 100%% purity\n"); ++failures; }
+        if (median >= 100)   { std::printf("    ASSERT FAIL: median embedding time must stay under 100 ms\n"); ++failures; }
+
+        // ---- the re-cluster pass, and the ONE thing it must never do -----------------
+        // With 24 utterances the periodic pass (every 32) does not fire on its own, so it
+        // is forced here. What is asserted is not that it improves anything -- it is that
+        // it leaves the LABELS ALONE: every cluster must still mean the same person after
+        // the pass, or a screen full of colours has just been repainted.
+        std::printf("\n[4] Re-cluster pass (forced) -- the labels must not move\n");
+        // label -> the speaker letter it currently MEANS, as a printable line.
+        auto meaning = [&](const std::vector<std::string>& assign) {
+            std::vector<std::string> uniq;
+            for (const auto& g : assign)
+                if (std::find(uniq.begin(), uniq.end(), g) == uniq.end()) uniq.push_back(g);
+            std::sort(uniq.begin(), uniq.end());
+            std::string s;
+            for (const auto& u : uniq) {
+                int cnt[26] = {};
+                for (size_t i = 0; i < assign.size() && i < truth.size(); ++i)
+                    if (assign[i] == u) ++cnt[bucketOf(truth[i])];
+                int bi = 0;
+                for (int c = 0; c < 26; ++c) if (cnt[c] > cnt[bi]) bi = c;
+                s += u + "=" + (char)('A' + bi) + " ";
+            }
+            return s;
+        };
+        const std::string beforeMap = meaning(got);
+
+        const double tRe   = qpcMs();
+        const bool   ran   = spk.clusterer().forceRecluster();
+        const double reMs  = qpcMs() - tRe;
+        const std::vector<std::string> after = spk.clusterer().ringLabels();
+        int afterClusters = 0;
+        const double afterPurity = purityOf(after, afterClusters);
+        const std::string afterMap = meaning(after);
+
+        std::printf("    ran=%s in %.1f ms  ->  %d cluster(s), purity %.2f\n",
+                    ran ? "yes" : "no", reMs, afterClusters, afterPurity);
+        std::printf("    before: %s\n", beforeMap.c_str());
+        std::printf("    after : %s\n", afterMap.c_str());
+
+        if (!ran)                 { std::printf("    ASSERT FAIL: the pass did not run\n"); ++failures; }
+        if (afterClusters != 4)   { std::printf("    ASSERT FAIL: the pass changed the speaker count\n"); ++failures; }
+        if (afterPurity < 1.0)    { std::printf("    ASSERT FAIL: the pass lowered purity\n"); ++failures; }
+        if (afterMap != beforeMap) {
+            std::printf("    ASSERT FAIL: a label changed meaning across the pass "
+                        "(the colours on screen would have moved)\n");
+            ++failures;
+        }
+    }
+
+    // ---- the two NAMED remap rules, on material built to trigger them -------------
+    // The 24 real utterances only ever exercise the IDENTITY remap (nothing merges,
+    // nothing splits), so the two branches that decide which colour a person keeps
+    // have no coverage from them at all. These do, deterministically, on synthetic
+    // vectors: what is being tested is the LABEL BOOKKEEPING, which knows nothing
+    // about voices.
+    std::printf("\n[5] Remap rules\n");
+    {
+        uint32_t rng = 777u;
+        auto frand = [&]() { rng = rng * 1664525u + 1013904223u; return (double)(rng >> 8) / 16777216.0; };
+        auto unit  = [&](std::vector<float> v) {
+            double n2 = 0.0; for (float x : v) n2 += (double)x * x;
+            const double n = std::sqrt(n2) > 0 ? std::sqrt(n2) : 1.0;
+            for (auto& x : v) x = (float)(x / n);
+            return v;
+        };
+        std::vector<float> X(192), Y(192);
+        for (int i = 0; i < 192; ++i) { X[(size_t)i] = (float)(frand() * 2.0 - 1.0);
+                                        Y[(size_t)i] = (float)(frand() * 2.0 - 1.0); }
+        X = unit(X); Y = unit(Y);
+        auto jitter = [&](const std::vector<float>& seed) {
+            std::vector<float> v = seed;
+            for (auto& x : v) x += (float)((frand() * 2.0 - 1.0) * 0.05);
+            return unit(v);
+        };
+
+        // /!\ The thresholds below are -1, not "a small number". Two random vectors in
+        //    192 dimensions are very nearly ORTHOGONAL -- their cosine sits around 0,
+        //    sometimes below it -- so "0.10" is not a permissive threshold here, it is
+        //    a strict one. The first draft of this test used 0.10 and neither branch
+        //    fired: the preconditions failed and the rules went untested.
+
+        // (a) MERGE keeps the OLDER label. Two clean clusters, then a pass run at a
+        //     threshold that fuses anything: the survivor must be S1, not S2.
+        OnlineClusterer m;
+        m.configure(0.50, 8, 0);
+        double s = 0.0; bool re = false;
+        for (int i = 0; i < 6; ++i) m.add(jitter(X), s, re);
+        for (int i = 0; i < 6; ++i) m.add(jitter(Y), s, re);
+        const int mBefore = m.speakerCount();
+        m.configure(-1.0, 8, 0);                    // everything is "the same voice" now
+        m.forceRecluster();
+        const std::vector<std::string> mAfter = m.ringLabels();
+        bool allS1 = !mAfter.empty();
+        for (const auto& l : mAfter) allS1 &= (l == "S1");
+        const bool mergeOk = (mBefore == 2) && (m.speakerCount() == 1) && allS1;
+        std::printf("    merge : %d cluster(s) -> %d, label %s  %s\n",
+                    mBefore, m.speakerCount(), mAfter.empty() ? "-" : mAfter.back().c_str(),
+                    mergeOk ? "OK (the older label survived)" : "FAIL");
+        if (!mergeOk) ++failures;
+
+        // (b) SPLIT gives the old label to the BIGGEST piece and the next free label to
+        //     the rest. One online cluster of 8 X + 4 Y, re-clustered at 0.50.
+        OnlineClusterer sp;
+        sp.configure(-1.0, 8, 0);                   // lump everything together first
+        for (int i = 0; i < 8; ++i) sp.add(jitter(X), s, re);
+        for (int i = 0; i < 4; ++i) sp.add(jitter(Y), s, re);
+        const int spBefore = sp.speakerCount();
+        sp.configure(0.50, 8, 0);
+        sp.forceRecluster();
+        const std::vector<std::string> spAfter = sp.ringLabels();
+        bool bigKept = spAfter.size() == 12, smallNew = spAfter.size() == 12;
+        for (size_t i = 0; i < spAfter.size(); ++i)
+            (i < 8 ? bigKept : smallNew) &= (spAfter[i] == (i < 8 ? "S1" : "S2"));
+        const bool splitOk = (spBefore == 1) && (sp.speakerCount() == 2) && bigKept && smallNew;
+        std::printf("    split : %d cluster(s) -> %d, 8x%s + 4x%s  %s\n",
+                    spBefore, sp.speakerCount(),
+                    spAfter.size() == 12 ? spAfter[0].c_str()  : "?",
+                    spAfter.size() == 12 ? spAfter[11].c_str() : "?",
+                    splitOk ? "OK (majority kept S1, remainder got S2)" : "FAIL");
+        if (!splitOk) ++failures;
+    }
+
+    // ---- what the pass costs when the ring is FULL -------------------------------
+    // The pass runs INLINE on the pipeline thread, so its cost is added to one
+    // subtitle's latency every SPKRECLUSTER segments. 24 points says nothing about
+    // 256, and 256 is what a real meeting reaches. Agglomeration is O(n^3) in the
+    // worst case, so this is measured rather than assumed -- on synthetic vectors,
+    // because the pass's cost depends on n and the dimension, not on the voices.
+    {
+        OnlineClusterer big;
+        big.configure(sc.threshold, sc.maxSpeakers, 0);      // 0 = never fire by itself
+        uint32_t rng = 12345u;                               // deterministic: a run is comparable
+        auto frand = [&]() { rng = rng * 1664525u + 1013904223u; return (double)(rng >> 8) / 16777216.0; };
+        std::vector<std::vector<float>> seeds(4, std::vector<float>(192, 0.0f));
+        for (auto& s : seeds) {
+            for (auto& x : s) x = (float)(frand() * 2.0 - 1.0);
+            double n2 = 0.0; for (float x : s) n2 += (double)x * x;
+            const double n = std::sqrt(n2);
+            for (auto& x : s) x = (float)(x / n);
+        }
+        for (int i = 0; i < kSpkRingMax + 40; ++i) {
+            std::vector<float> v = seeds[(size_t)(i % 4)];
+            for (auto& x : v) x += (float)((frand() * 2.0 - 1.0) * 0.05);   // same voice, jittered
+            double n2 = 0.0; for (float x : v) n2 += (double)x * x;
+            const double n = std::sqrt(n2);
+            for (auto& x : v) x = (float)(x / n);
+            double s2 = 0.0; bool re = false;
+            big.add(v, s2, re);
+        }
+        const double t0 = qpcMs();
+        big.forceRecluster();
+        const double cost = qpcMs() - t0;
+        std::printf("\n[6] Re-cluster cost at a FULL ring (%d embeddings, 192 dims): %.1f ms"
+                    "  -> %d cluster(s)\n", kSpkRingMax, cost, big.speakerCount());
+        std::printf("    (paid inline, once every SPKRECLUSTER=%d segments)\n", sc.recluster);
+    }
+
+    // ---- [7] U3 (2026-11-02): THE VOICE PASS' CLUSTERING on the 24 real utterances, all at once (clusterOffline) ----------
+    // The transcript's speakers are clustered OFFLINE (TrSpeaker.h): the re-cluster rule above, run once over a whole file.
+    // The same 24 utterances, each embedded alone (TrSpeaker::embed: no clusterer, no policy): 4 voices, pure, numbered by
+    // first appearance in the bench order (A_1 B_1 A_2 B_2 D_1 C_1 ... -> A B D C).
+    if (!haveMeeting) {
+        std::printf("\n[7] [8] NOT CHECKED (set SUVTITLE_TEST_MEDIA): the meeting\n");
+    } else {
+        std::printf("\n[7] U3: the 24 utterances clustered at once (clusterOffline, %.2f, cap %d)\n", sc.threshold, sc.maxSpeakers);
+        std::vector<std::vector<float>> V;
+        std::vector<char> letter;
+        for (int i = 0; i < kN; ++i) {
+            WavFile w;
+            std::string err;
+            std::vector<float> e;
+            uint32_t ms = 0;
+            if (readWavMono(media + L"meeting\\spk" + utf8ToWideL(kOrder[i]) + L".wav", w, err) && w.rate == (uint32_t)kAsrRate)
+                spk.embed(w.mono, e, ms);
+            V.push_back(e);
+            letter.push_back(kOrder[i][0]);
+        }
+        const std::vector<int> cl = clusterOffline(V, sc.threshold, sc.maxSpeakers);
+        int clusters = 0;
+        bool pure = true, embedded = true;
+        std::map<int, char> owner;
+        for (size_t i = 0; i < cl.size(); ++i) {
+            if (V[i].empty() || cl[i] < 0) { embedded = false; continue; }
+            clusters = std::max(clusters, cl[i] + 1);
+            auto it = owner.find(cl[i]);
+            if (it == owner.end()) owner[cl[i]] = letter[i];
+            else if (it->second != letter[i]) pure = false;
+        }
+        std::string order;
+        for (int c = 0; c < clusters; ++c) order += owner.count(c) ? owner[c] : '?';
+        std::printf("    %d cluster(s), %s, numbered %s\n", clusters, pure ? "pure" : "MIXED", order.c_str());
+        if (!embedded)       { std::printf("    ASSERT FAIL: an utterance got no voiceprint\n"); ++failures; }
+        if (clusters != 4)   { std::printf("    ASSERT FAIL: expected exactly 4 voices\n"); ++failures; }
+        if (!pure)           { std::printf("    ASSERT FAIL: expected 100%% purity\n"); ++failures; }
+        if (order != "ABDC") { std::printf("    ASSERT FAIL: expected the voices numbered by first appearance (ABDC)\n"); ++failures; }
+
+        // ---- [8] U3: a REAL VOICE PASS (FVOICE, the shipping job: MediaReader, its own TrSpeaker, the labels) on
+        //      filemode\meeting.wav, with the 27 pieces the shipping analysis made of it (docs/PROGRESS_U3.md M1), while [1]'s
+        //      stage is still loaded (two extractors in one process). M2 measured the rule: all 27 named right.
+        const std::wstring meetingW = testFilemodeDir() + L"meeting.wav";
+        if (::GetFileAttributesW(meetingW.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            std::printf("\n[8] NOT CHECKED: no filemode\\meeting.wav\n");
+        } else {
+            static const uint64_t kCue[27][2] = {
+                { 120, 1660 }, { 1740, 3680 }, { 4800, 6040 }, { 6420, 9244 }, { 10470, 13882 }, { 14790, 18890 }, { 19730, 23110 },
+                { 23910, 28290 }, { 29610, 30630 }, { 31410, 34590 }, { 35760, 40580 }, { 41640, 46580 }, { 47820, 49660 },
+                { 50700, 54020 }, { 54990, 56360 }, { 57120, 58120 }, { 59460, 62760 }, { 63670, 68140 }, { 69000, 72400 },
+                { 73830, 77580 }, { 78750, 80110 }, { 80190, 82320 }, { 83460, 86520 }, { 87690, 91700 }, { 92580, 96060 },
+                { 96810, 98800 }, { 99960, 103120 } };
+            const char* kWho = "AABBABDCBADCABDCBDACBBDCADC";             // meeting_marks.txt's speaker of each piece
+            const std::map<char, uint32_t> kNum = { { 'A', 1 }, { 'B', 2 }, { 'D', 3 }, { 'C', 4 } };   // first appearance
+            auto voicePass = [&](const std::string& spans, const std::string& changes, uint64_t id, FileJobStats& st,
+                                 trpipe::WireSpk& s) {
+                trpipe::WireVoice v;
+                v.jobId = id; v.path = wideToUtf8L(meetingW); v.spans = spans; v.changes = changes;
+                std::unique_ptr<FileJob> job;
+                std::string err;
+                Servers srv;
+                CollectSink sink;
+                std::atomic<uint64_t> abortNone{ 0 };
+                if (!makeVoiceJob(v, cfg, job, err)) return false;
+                for (int k = 0; job && k < 100000; ++k) fileJobLap(job, srv, sink, abortNone, false, &st);
+                for (const auto& m : sink.lines) if (trpipe::unpackSpk(trpipe::split(m), s)) return s.labels.size() > 0;
+                return false;
+            };
+            std::string spans;
+            for (int i = 0; i < 27; ++i) spans += (i ? "," : "") + std::to_string(kCue[i][0]) + "-" + std::to_string(kCue[i][1]);
+            FileJobStats st;
+            trpipe::WireSpk s;
+            const bool ran = voicePass(spans, "", 8001, st, s);
+            int right = 0;
+            std::string got;
+            for (size_t i = 0; ran && i < s.labels.size() && i < 27; ++i) {
+                got += (char)('0' + (int)std::min<uint32_t>(s.labels[i], 9));
+                if (s.labels[i] == kNum.at(kWho[i])) ++right;
+            }
+            std::printf("\n[8] U3: a real voice pass on meeting.wav, the analysis' 27 pieces\n");
+            std::printf("    labels %s (truth %s = 1122121... by first appearance)\n", got.c_str(), kWho);
+            std::printf("    %d/27 right, %u speaker(s); %u voiceprint(s) in %llu ms, decode %llu ms, clustering %llu ms, wall %llu ms; "
+                        "audio held at most %.1f s; peak working set %llu MB\n", right, st.voiceSpeakers, st.voicePrints,
+                        (unsigned long long)st.voiceEmbedMs, (unsigned long long)st.voiceDecodeMs,
+                        (unsigned long long)st.voiceClusterMs, (unsigned long long)st.wallMs, (double)st.voiceMaxBuf / kAsrRate,
+                        (unsigned long long)st.voicePeakMb);
+            if (!ran)           { std::printf("    ASSERT FAIL: the voice pass gave no labels\n"); ++failures; }
+            if (right != 27)    { std::printf("    ASSERT FAIL: expected all 27 pieces named right (M2)\n"); ++failures; }
+            if (st.voiceSpeakers != 4) { std::printf("    ASSERT FAIL: expected 4 speakers\n"); ++failures; }
+            // a DIALOGUE-DASH cue made of #8 "I agree." (B) and #9 (A) -- "- I agree. - I think we are slightly over on the
+            // marketing side." --, shared by reading time as the app shares it (8 / 59 narrow characters of 29.61-34.59 s:
+            // the boundary at 30.285 s, inside B's "I agree" which ends at 30.97 s): the engine must move it to the pause and
+            // name B then A
+            std::string dash;
+            for (int i = 0; i < 27; ++i) {
+                if (i == 8) { dash += ",29610-30285,30285-34590"; continue; }
+                if (i == 9) continue;
+                dash += (i ? "," : "") + std::to_string(kCue[i][0]) + "-" + std::to_string(kCue[i][1]);
+            }
+            FileJobStats st2;
+            trpipe::WireSpk s2;
+            const bool ran2 = voicePass(dash, "9", 8002, st2, s2);
+            const bool dashOk = ran2 && s2.labels.size() == 27 && s2.labels[8] == 2 && s2.labels[9] == 1;
+            std::printf("    the dash cue's two lines: %u then %u (B = 2, A = 1), boundary moved: %s\n",
+                        ran2 && s2.labels.size() == 27 ? s2.labels[8] : 0, ran2 && s2.labels.size() == 27 ? s2.labels[9] : 0,
+                        st2.voiceSnapped ? "yes" : "no");
+            if (!dashOk) { std::printf("    ASSERT FAIL: expected the dash cue's lines named B then A\n"); ++failures; }
+        }
+    }
+
+    if (failures) {
+        std::printf("\nSPK SELFTEST FAILED (%d assertion(s))\n", failures);
+        return 1;
+    }
+    std::printf("\nSPK SELFTEST PASSED\n");
+    return 0;
+}
 
 // ===========================================================================
 // FILE MODE BY HAND (wave WB):  --selftest-file <media> [--pair a:b] [--mode m] [--quality q]
@@ -7986,11 +15409,14 @@ void printJobStats(const FileJobStats& st) {
                 st.dtw ? "on" : "OFF", st.timedWindows, st.wordWindows, st.dtwDropped ? ", DTW DROPPED after a failure" : "",
                 st.langRedecodes, st.langEmpty, st.langFallback, st.thirdLang, st.tagSegs,
                 st.foreignSegs, st.heldBack, st.dedupWords, st.mergedFrags);
+    std::printf("#   F-RESUME: %u unheard stretch(es) heard again, %u second hearing(s) vouched for, %u early stop(s) left uncut "
+                "(kMaxCutChain)\n", st.reheard, st.unheardKept, st.cutCapped);
     if (!st.track.empty()) std::printf("#   WH: sound track %s\n", st.track.c_str());
 }
 
 int runSelftestFile(const std::string& media, const std::string& pair, const std::string& mode,
-                    const std::string& quality, const std::string& audio) {
+                    const std::string& quality, const std::string& audio, const std::string& have,
+                    const std::string& focus) {
     ::SetConsoleOutputCP(CP_UTF8);
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     TrConfig cfg;
@@ -8003,6 +15429,10 @@ int runSelftestFile(const std::string& media, const std::string& pair, const std
     f.mode    = mode;
     f.quality = quality;
     f.audio   = audio;                            // WH: --audio <ord>:<trackId> ("" = the first sound track)
+    // F-RESUME: a RESUMED job by hand -- --have "s-e,..." (ms, TrPipe.h packRanges: what the tray already holds)
+    // and --focus <ms> (the playhead), exactly the FILE fields the tray sends after a Cancel then Analyse
+    f.have    = have;
+    f.focusMs = focus.empty() ? 0 : std::strtoull(focus.c_str(), nullptr, 10);
     if (!pair.empty()) {
         const size_t c = pair.find(':');
         f.langA = pair.substr(0, c);
@@ -8705,20 +16135,610 @@ int runSelftestWh(bool offline) {
     return failures ? 1 : 0;
 }
 
+// ===========================================================================
+// THE START'S GPU PROBE, ITS SELFTEST:  --selftest-gpuprobe   (SuVtitle 1.1.0, wave GPU -- docs\PROGRESS_GPU.md)
+// No model is ever loaded. [1] the parser on canned outputs. [2] the launcher on a stand-in -- THIS exe as a canned
+// llama-server (--gpuprobe-standin) -- every shape through the real pipe; a child that never ends is killed at its bound,
+// by the probe, and is gone (a process snapshot and tasklist say so). [3] the decision, in this process: not run under
+// the CPU switch; "none" forces the CPU in memory and leaves engine.txt byte-identical; "listed", an exit code, no exe
+// force nothing. [4] the payload's REAL llama-server (SUVTITLE_PAYLOAD; NOT CHECKED without one): as it is --
+// SUVTITLE_TEST_GPU=listed|none says what this PC must answer, unset = any definite answer -- and with
+// VK_LOADER_DRIVERS_DISABLE=* (none, on any PC). [5] runHost END TO END: THIS exe spawned as the app spawns the engine,
+// its pipe served here -- (a) no Vulkan driver: EVERY STATE says gpu 0, the probe's line is in engine.log, engine.txt
+// keeps DEVICE auto; (b) as it is: the GPU path when listed; (c) --cpu and (d) DEVICE cpu: the probe never runs.
+// /!\ NEVER with --cpu or AUDIOPB_TR_FORCE_CPU=1: the CPU switch puts VK_LOADER_DRIVERS_DISABLE=* in THIS process and the
+// real probe would only ever see "(none)" -- it refuses to run then. The real enumerations ([4] as it is, [5] (b)) open
+// the GPU for ~0.2 s each: not while it is busy (the brief's typeperf gate: the caller's).
+// ===========================================================================
+
+// TEST ONLY: THIS exe as a canned `llama-server --list-devices` (--gpuprobe-standin <shape>): text-mode stdout as
+// llama-server's (CRLF), and a log line on stderr first where llama.cpp's back-ends print theirs.
+int gpuProbeStandIn(const std::string& shape) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (shape == "none") {
+        std::fputs("ggml_vulkan: (stand-in) no Vulkan device\n", stderr);
+        std::printf("Available devices:\n  (none)\n");
+        return 0;
+    }
+    if (shape == "list1") {
+        std::fputs("ggml_vulkan: (stand-in) Found 1 Vulkan devices\n", stderr);
+        std::printf("Available devices:\n  Vulkan0: Stand-in GPU (8192 MiB, 8000 MiB free)\n");
+        return 0;
+    }
+    if (shape == "list2") {
+        std::printf("Available devices:\n  Vulkan0: Stand-in GPU A (8192 MiB, 8000 MiB free)\n"
+                    "  Vulkan1: Stand-in GPU B (4096 MiB, 4000 MiB free)\n");
+        return 0;
+    }
+    if (shape == "exit3") { std::printf("Available devices:\n  (none)\n"); return 3; }
+    if (shape == "sleep") { std::printf("Available devices:\n  (none)\n"); ::Sleep(60000); return 0; }
+    if (shape == "flood") {
+        std::printf("Available devices:\n  (none)\n");
+        for (int i = 0; i < 6000; ++i)
+            std::printf("stand-in log line %05d after the list: read to the end, the first %d bytes kept\n", i,
+                        (int)kGpuProbeKeepBytes);
+        return 0;
+    }
+    if (shape == "endless") {
+        // "(none)", then 64 KB blocks without a pause for a minute (the pipe never empties: a reader that only looked at its
+        // bound when there was nothing to read would never look), then it ends -- a broken bound's run stays finite.
+        std::printf("Available devices:\n  (none)\n");
+        static char block[65536];
+        std::memset(block, '.', sizeof(block));
+        const ULONGLONG until = ::GetTickCount64() + 60000;
+        while (::GetTickCount64() < until) std::fwrite(block, 1, sizeof(block), stdout);
+        return 0;
+    }
+    std::fputs("--gpuprobe-standin none | list1 | list2 | exit3 | sleep | flood | endless\n", stderr);
+    return 2;
+}
+
+// [2]: is a process of this id in the system's list (CreateToolhelp32Snapshot -- what tasklist reads)?
+bool gpuTestPidListed(DWORD pid) {
+    HANDLE s = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (s == INVALID_HANDLE_VALUE) return true;          // cannot tell: counted as there (the check fails, never passes blind)
+    PROCESSENTRY32W e{};
+    e.dwSize = sizeof(e);
+    bool found = false;
+    for (BOOL more = ::Process32FirstW(s, &e); more; more = ::Process32NextW(s, &e))
+        if (e.th32ProcessID == pid) { found = true; break; }
+    ::CloseHandle(s);
+    return found;
+}
+
+std::string gpuTestRead(const std::wstring& path) {
+    std::string s;
+    HANDLE h = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return s;
+    char buf[8192];
+    DWORD got = 0;
+    while (::ReadFile(h, buf, (DWORD)sizeof(buf), &got, nullptr) && got) s.append(buf, got);
+    ::CloseHandle(h);
+    return s;
+}
+
+// A variable of THIS process set -- or removed (nullptr) -- until the end of the scope: what a child started meanwhile
+// inherits. (The selftest is single-threaded where it uses it.)
+class GpuTestEnv {
+public:
+    void set(const wchar_t* name, const wchar_t* value) {
+        std::vector<wchar_t> buf(32768);
+        const DWORD n = ::GetEnvironmentVariableW(name, buf.data(), (DWORD)buf.size());
+        const bool had = n > 0 && n < buf.size();
+        saved_.push_back(Saved{ name, had, had ? std::wstring(buf.data(), n) : std::wstring() });
+        ::SetEnvironmentVariableW(name, value);
+    }
+    ~GpuTestEnv() {
+        for (auto it = saved_.rbegin(); it != saved_.rend(); ++it)
+            ::SetEnvironmentVariableW(it->name.c_str(), it->had ? it->value.c_str() : nullptr);
+    }
+private:
+    struct Saved { std::wstring name; bool had; std::wstring value; };
+    std::vector<Saved> saved_;
+};
+
+// [5]'s app: THIS exe in host mode, spawned the way TranslatorManager.cpp spawns the engine (a first-instance message
+// pipe, --pipe / --parent, no window) inside a kill-on-close job, its stdout and stderr into `outFile`; the pipe served
+// here -- the HELLO, every message until 1.5 s after the first STATE that names the models (20 s at most), then QUIT.
+struct GpuTestHost {
+    bool spawned = false, connected = false, hello = false;
+    std::vector<trpipe::WireState> states;       // every STATE, in order
+    std::string out;                             // its stdout and stderr
+    std::string outAtHello;                      // ... as it stood the moment the HELLO arrived (the probe comes AFTER it)
+    DWORD exitCode = STILL_ACTIVE;
+};
+GpuTestHost gpuTestRunHost(const std::wstring& me, const std::wstring& extra, const std::wstring& outFile, uint32_t seq) {
+    GpuTestHost r;
+    const std::string name = trpipe::pipeName(::GetCurrentProcessId(), seq);
+    const std::wstring wname(name.begin(), name.end());
+    HANDLE pipe = ::CreateNamedPipeW(wname.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                                     PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                                     1, 1 << 18, 1 << 18, 0, nullptr);
+    if (pipe == INVALID_HANDLE_VALUE) return r;
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE out = ::CreateFileW(outFile.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (out == INVALID_HANDLE_VALUE) { ::CloseHandle(pipe); return r; }
+    HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        ::SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof(li));
+    }
+    std::vector<wchar_t> inheritEnv;                             // empty: THIS environment, as the caller set it
+    PROCESS_INFORMATION pi{};
+    DWORD err = 0;
+    const std::wstring cmd = L"\"" + me + L"\" --pipe " + wname + L" --parent "
+                           + std::to_wstring((unsigned long)::GetCurrentProcessId()) + (extra.empty() ? std::wstring() : L" " + extra);
+    const bool made = spawnWithOneHandle(cmd, std::wstring(), inheritEnv, out, pi, err);
+    ::CloseHandle(out);
+    if (!made) {
+        if (job) ::CloseHandle(job);
+        ::CloseHandle(pipe);
+        return r;
+    }
+    if (job) ::AssignProcessToJobObject(job, pi.hProcess);
+    ::ResumeThread(pi.hThread);
+    ::CloseHandle(pi.hThread);
+    r.spawned = true;
+    OVERLAPPED ov{};
+    ov.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (::ConnectNamedPipe(pipe, &ov)) {
+        r.connected = true;
+    } else {
+        const DWORD e = ::GetLastError();
+        if (e == ERROR_PIPE_CONNECTED) {
+            r.connected = true;
+        } else if (e == ERROR_IO_PENDING) {
+            HANDLE waits[2] = { ov.hEvent, pi.hProcess };
+            if (::WaitForMultipleObjects(2, waits, FALSE, 20000) != WAIT_OBJECT_0) ::CancelIoEx(pipe, &ov);
+            DWORD n = 0;
+            r.connected = ::GetOverlappedResult(pipe, &ov, &n, TRUE) != FALSE;
+        }
+    }
+    if (ov.hEvent) ::CloseHandle(ov.hEvent);
+    if (r.connected) {
+        std::string m;
+        bool broken = false;
+        r.hello = trpipe::readMessage(pipe, m, 20000, &broken) && m.rfind("HELLO\t", 0) == 0;
+        r.outAtHello = gpuTestRead(outFile);     // the probe takes >= 0.15 s, and it starts after the HELLO: not written yet
+        const ULONGLONG end = ::GetTickCount64() + 20000;
+        ULONGLONG stopAt = 0;
+        while (r.hello) {
+            const ULONGLONG now = ::GetTickCount64();
+            if (now >= end || (stopAt && now >= stopAt)) break;
+            if (trpipe::readMessage(pipe, m, 100, &broken)) {
+                const std::vector<std::string> f = trpipe::split(m);
+                trpipe::WireState s;
+                if (!f.empty() && f[0] == "STATE" && trpipe::unpackState(f, s)) {
+                    r.states.push_back(s);
+                    if (!stopAt && !s.asrModel.empty()) stopAt = ::GetTickCount64() + 1500;
+                }
+            } else if (broken) {
+                break;
+            }
+        }
+        trpipe::writeMessage(pipe, "QUIT", 2000);
+    }
+    if (::WaitForSingleObject(pi.hProcess, 15000) != WAIT_OBJECT_0) {
+        ::TerminateProcess(pi.hProcess, 9);
+        ::WaitForSingleObject(pi.hProcess, 5000);
+    }
+    ::GetExitCodeProcess(pi.hProcess, &r.exitCode);
+    ::CloseHandle(pi.hProcess);
+    if (job) ::CloseHandle(job);
+    ::CloseHandle(pipe);
+    r.out = gpuTestRead(outFile);
+    return r;
+}
+
+int runSelftestGpuProbe() {
+    quietCrashes();
+    ::SetConsoleOutputCP(CP_UTF8);
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::printf("=== SuVtitle Engine selftest: the start's GPU probe (wave GPU) ===\n");
+    // THE TRAP (the brief's condition 5): the CPU switch hides the GPU from the real probe -- refused, never "passed".
+    if (g_forceCpu || !envWide(L"VK_LOADER_DRIVERS_DISABLE").empty() || !envWide(L"GGML_DISABLE_VULKAN").empty()) {
+        std::printf("REFUSED: run it WITHOUT --cpu / AUDIOPB_TR_FORCE_CPU=1, and without VK_LOADER_DRIVERS_DISABLE or "
+                    "GGML_DISABLE_VULKAN in its environment: the real probe would only ever see \"(none)\".\n"
+                    "\nGPUPROBE SELFTEST FAILED (refused)\n");
+        return 2;
+    }
+    int failures = 0, checks = 0;
+    auto ok = [&](bool cond, const std::string& what) {
+        ++checks;
+        if (cond) {
+            std::printf("    ok    %s\n", what.c_str());
+        } else {
+            std::printf("    ASSERT FAIL: %s\n", what.c_str());
+            ++failures;
+        }
+    };
+    auto verdictName = [](GpuProbe::Verdict v) {
+        return std::string(v == GpuProbe::kNone ? "NONE" : v == GpuProbe::kListed ? "LISTED" : "UNKNOWN");
+    };
+    auto has = [](const std::string& s, const char* w) { return s.find(w) != std::string::npos; };
+    // the line of `text` holding `key` (its tail from `key` on), for the record
+    auto lineOf = [](const std::string& text, const char* key) {
+        const size_t at = text.find(key);
+        if (at == std::string::npos) return std::string("(no such line)");
+        size_t e = text.find_first_of("\r\n", at);
+        if (e == std::string::npos) e = text.size();
+        return text.substr(at, std::min<size_t>(e - at, 200));
+    };
+    auto oneLine = [](const std::string& text) {
+        std::string o;
+        for (char c : text) {
+            if (c == '\r') continue;
+            if (c == '\n') { if (!o.empty() && o.back() != ' ') o += " | "; continue; }
+            o += c;
+        }
+        return o.size() > 160 ? o.substr(0, 160) + "..." : o;
+    };
+    wchar_t self[MAX_PATH] = {};
+    const DWORD sn = ::GetModuleFileNameW(nullptr, self, MAX_PATH);
+    const std::wstring me = (sn > 0 && sn < MAX_PATH) ? std::wstring(self, sn) : std::wstring();
+    const ULONGLONG tAll = ::GetTickCount64();
+
+    // ---- [1] ---------------------------------------------------------------------------------------------------------
+    std::printf("\n[1] the parser: NONE only for \"(none)\" alone under \"Available devices:\", exit code 0\n");
+    {
+        const std::string kN = "Available devices:\r\n  (none)\r\n";
+        const std::string kOne = "Available devices:\r\n  Vulkan0: AMD Radeon RX 7700 XT (12272 MiB, 11312 MiB free)\r\n";
+        struct PCase { const char* what; std::string out; bool exited; DWORD code; GpuProbe::Verdict want; size_t devices; };
+        const PCase cases[] = {
+            { "(none), CRLF -- measured with VK_LOADER_DRIVERS_DISABLE=*", kN, true, 0, GpuProbe::kNone, 0 },
+            { "(none), LF", "Available devices:\n  (none)\n", true, 0, GpuProbe::kNone, 0 },
+            { "(none) under a tab", "Available devices:\r\n\t(none)\r\n", true, 0, GpuProbe::kNone, 0 },
+            { "1 device, CRLF -- measured on this PC", kOne, true, 0, GpuProbe::kListed, 1 },
+            { "1 device, LF", "Available devices:\n  Vulkan0: AMD Radeon RX 7700 XT (12272 MiB, 11312 MiB free)\n", true, 0,
+              GpuProbe::kListed, 1 },
+            { "2 devices", "Available devices:\r\n  Vulkan0: A (8192 MiB, 8000 MiB free)\r\n  Vulkan1: B (4096 MiB, 4000 MiB free)\r\n",
+              true, 0, GpuProbe::kListed, 2 },
+            { "empty output", "", true, 0, GpuProbe::kUnknown, 0 },
+            { "garbage", "\x01\x02\xff garbage\r\nmore of it", true, 0, GpuProbe::kUnknown, 0 },
+            { "exit code 1 with (none)", kN, true, 1, GpuProbe::kUnknown, 0 },
+            { "exit code 0xC0000005 (a crash) with (none)", kN, true, 0xC0000005, GpuProbe::kUnknown, 0 },
+            { "(none) but killed at the bound (it did not end by itself)", kN, false, kGpuProbeKilledExit, GpuProbe::kUnknown, 0 },
+            { "header with no device line", "Available devices:\r\n", true, 0, GpuProbe::kUnknown, 0 },
+            { "header with no device line, no newline", "Available devices:", true, 0, GpuProbe::kUnknown, 0 },
+            { "header then an unindented log line", "Available devices:\r\nmain: exiting\r\n", true, 0, GpuProbe::kUnknown, 0 },
+            { "log lines before the header, (none)",
+              "load_backend: loaded RPC backend\r\nggml_vulkan: Found 0 Vulkan devices\r\n" + kN, true, 0, GpuProbe::kNone, 0 },
+            { "log lines before the header, 1 device", "load_backend: loaded Vulkan backend\r\n" + kOne, true, 0,
+              GpuProbe::kListed, 1 },
+            { "a log line after the block", kN + "main: done\r\n", true, 0, GpuProbe::kNone, 0 },
+            { "truncated inside \"(none)\"", "Available devices:\r\n  (no", true, 0, GpuProbe::kUnknown, 0 },
+            { "truncated inside the header", "Available dev", true, 0, GpuProbe::kUnknown, 0 },
+            { "(none) then a device", kN + "  Vulkan0: X (1 MiB, 1 MiB free)\r\n", true, 0, GpuProbe::kUnknown, 0 },
+            { "a device then (none)", kOne + "  (none)\r\n", true, 0, GpuProbe::kUnknown, 0 },
+            { "the header twice", kN + kN, true, 0, GpuProbe::kUnknown, 0 },
+            { "(none) unindented", "Available devices:\r\n(none)\r\n", true, 0, GpuProbe::kUnknown, 0 },
+            { "a line under the header that is no device", "Available devices:\r\n  something odd\r\n", true, 0,
+              GpuProbe::kUnknown, 0 },
+        };
+        for (const PCase& c : cases) {
+            std::vector<std::string> dev;
+            std::string why;
+            const GpuProbe::Verdict v = parseListDevices(c.out, c.exited, c.code, dev, why);
+            ok(v == c.want && dev.size() == c.devices,
+               std::string(c.what) + " -> " + verdictName(v) + (why.empty() ? std::string() : " (" + why + ")"));
+        }
+        std::vector<std::string> dev;
+        std::string why;
+        parseListDevices(kOne, true, 0, dev, why);
+        ok(dev.size() == 1 && dev[0] == "Vulkan0: AMD Radeon RX 7700 XT (12272 MiB, 11312 MiB free)",
+           "the device line kept as printed, its CR gone");
+    }
+
+    // ---- [2] ---------------------------------------------------------------------------------------------------------
+    std::printf("\n[2] the launcher, on a stand-in (this exe as a canned llama-server): the real pipe, the bound, no orphan\n");
+    auto standIn = [&](const wchar_t* shape, DWORD bound) {
+        return runListDevices(me, std::wstring(L"--gpuprobe-standin ") + shape, bound);
+    };
+    {
+        GpuProbe p = standIn(L"none", kGpuProbeBoundMs);
+        ok(p.ran && p.exited && p.exitCode == 0 && p.verdict == GpuProbe::kNone,
+           "none: NONE, through the real pipe (" + std::to_string(p.ms) + " ms)");
+        ok(has(p.out, "ggml_vulkan: (stand-in) no Vulkan device") && has(p.out, "Available devices:\r\n  (none)\r\n"),
+           "... its stderr AND its stdout on the one pipe, CRLF as llama-server's");
+        p = standIn(L"list1", kGpuProbeBoundMs);
+        ok(p.verdict == GpuProbe::kListed && p.devices.size() == 1
+           && p.devices[0] == "Vulkan0: Stand-in GPU (8192 MiB, 8000 MiB free)", "list1: LISTED, the device named");
+        p = standIn(L"list2", kGpuProbeBoundMs);
+        ok(p.verdict == GpuProbe::kListed && p.devices.size() == 2, "list2: LISTED, both devices");
+        p = standIn(L"exit3", kGpuProbeBoundMs);
+        ok(p.ran && p.exited && p.exitCode == 3 && p.verdict == GpuProbe::kUnknown,
+           "exit3: \"(none)\" with exit code 3 -> UNKNOWN (" + p.why + ")");
+        p = standIn(L"flood", kGpuProbeBoundMs);
+        ok(p.exited && !p.timedOut && p.exitCode == 0 && p.verdict == GpuProbe::kNone && p.out.size() == kGpuProbeKeepBytes,
+           "flood (~0.5 MB after the list): read to its end, never blocked, " + std::to_string(p.out.size())
+           + " bytes kept, NONE (" + std::to_string(p.ms) + " ms)");
+        const DWORD bound = 1500;
+        const ULONGLONG t0 = ::GetTickCount64();
+        p = standIn(L"sleep", bound);
+        const ULONGLONG el = ::GetTickCount64() - t0;
+        ok(p.ran && p.timedOut && !p.exited && p.verdict == GpuProbe::kUnknown,
+           "sleep (\"(none)\" printed, then it never ends): killed at its bound -> UNKNOWN (" + p.why + ")");
+        ok(p.exitCode == kGpuProbeKilledExit, "... by the probe's own kill: exit code 0x6B11 (not the job's close, not running)");
+        ok(el >= bound && el < bound + 1500,
+           "... at the bound: " + std::to_string(el) + " ms for a " + std::to_string(bound) + " ms bound");
+        ok(p.pid != 0 && !gpuTestPidListed(p.pid), "... and GONE: no process " + std::to_string(p.pid) + " in a snapshot");
+        wchar_t sys[MAX_PATH] = {};
+        const UINT sl = ::GetSystemDirectoryW(sys, MAX_PATH);
+        const GpuProbe t = runListDevices(std::wstring(sys, sl < MAX_PATH ? sl : 0) + L"\\tasklist.exe",
+                                          L"/FI \"PID eq " + std::to_wstring((unsigned long)p.pid) + L"\" /NH /FO CSV", 30000);
+        ok(t.exited && t.exitCode == 0 && !t.out.empty() && t.out.find("\"" + std::to_string(p.pid) + "\"") == std::string::npos,
+           "... and tasklist /FI \"PID eq " + std::to_string(p.pid) + "\" lists nothing: " + oneLine(t.out));
+        {
+            const ULONGLONG e0 = ::GetTickCount64();
+            const GpuProbe q = standIn(L"endless", bound);
+            const ULONGLONG ee = ::GetTickCount64() - e0;
+            ok(q.ran && q.timedOut && !q.exited && q.verdict == GpuProbe::kUnknown && q.exitCode == kGpuProbeKilledExit
+               && ee >= bound && ee < bound + 1500 && q.out.size() == kGpuProbeKeepBytes,
+               "endless (\"(none)\", then it never stops writing): the bound holds all the same -- killed at " + std::to_string(ee)
+               + " ms, UNKNOWN, " + std::to_string(q.out.size()) + " bytes kept");
+            ok(q.pid != 0 && !gpuTestPidListed(q.pid), "... and gone: no process " + std::to_string(q.pid) + " in a snapshot");
+        }
+        const int before = g_gpuProbeSpawnsForTest;
+        p = runListDevices(me + L".no-such-exe", L"--list-devices", kGpuProbeBoundMs);
+        ok(!p.ran && p.verdict == GpuProbe::kUnknown && g_gpuProbeSpawnsForTest == before,
+           "a missing exe: UNKNOWN (" + p.why + "), nothing started");
+        p = runListDevices(std::wstring(), L"--list-devices", kGpuProbeBoundMs);
+        ok(!p.ran && p.verdict == GpuProbe::kUnknown, "no exe at all (a payload without llama): UNKNOWN (" + p.why + ")");
+    }
+
+    // ---- [3] ---------------------------------------------------------------------------------------------------------
+    std::printf("\n[3] the decision (probeGpuAtStart), in this process: what each answer changes\n");
+    wchar_t tmp[MAX_PATH] = {};
+    ::GetTempPathW(MAX_PATH, tmp);
+    const std::wstring root = std::wstring(tmp) + L"SuVtitle_selftest_gpuprobe";
+    ::CreateDirectoryW(root.c_str(), nullptr);
+    auto vkSet = [] { return envWide(L"VK_LOADER_DRIVERS_DISABLE") == L"*" && envWide(L"GGML_DISABLE_VULKAN") == L"1"; };
+    auto vkClear = [] { return envWide(L"VK_LOADER_DRIVERS_DISABLE").empty() && envWide(L"GGML_DISABLE_VULKAN").empty(); };
+    auto unforce = [] {
+        g_forceCpu = false;
+        ::SetEnvironmentVariableW(L"VK_LOADER_DRIVERS_DISABLE", nullptr);
+        ::SetEnvironmentVariableW(L"GGML_DISABLE_VULKAN", nullptr);
+    };
+    {
+        const int before = g_gpuProbeSpawnsForTest;
+        g_forceCpu = true;                                       // what DEVICE cpu / --cpu leave behind (forceCpuChildren)
+        const GpuProbe p = probeGpuAtStart(me, L"--gpuprobe-standin none");
+        ok(!p.ran && p.why == "not run" && g_gpuProbeSpawnsForTest == before,
+           "under the CPU switch (DEVICE cpu, --cpu): NOT RUN -- no child started, the GPU never opened");
+        unforce();
+    }
+    {
+        // engine.txt in an ISOLATED APPDATA, DEVICE auto, as a user has it
+        const std::wstring dir = root + L"\\decide", appdata = dir + L"\\appdata", own = appdata + L"\\SuVtitle\\engine.txt";
+        ::CreateDirectoryW(dir.c_str(), nullptr);
+        ::CreateDirectoryW(appdata.c_str(), nullptr);
+        GpuTestEnv env;
+        env.set(L"APPDATA", appdata.c_str());
+        ::DeleteFileW(own.c_str());
+        TrConfig seed;
+        seed.save();
+        const std::string before = gpuTestRead(own);
+        const GpuProbe p = probeGpuAtStart(me, L"--gpuprobe-standin none");
+        ok(p.ran && p.verdict == GpuProbe::kNone, "\"(none)\" (the stand-in): NONE");
+        ok(g_forceCpu && vkSet(),
+           "... every child on the CPU: g_forceCpu + GGML_DISABLE_VULKAN=1 + VK_LOADER_DRIVERS_DISABLE=* (forceCpuChildren)");
+        ok(has(before, "\nDEVICE\tauto\n") && gpuTestRead(own) == before,
+           "... IN MEMORY ONLY: engine.txt byte-identical, DEVICE auto (a driver installed later is used at the next start)");
+        unforce();
+        ::DeleteFileW(own.c_str());
+        ::RemoveDirectoryW((appdata + L"\\SuVtitle").c_str());
+        ::RemoveDirectoryW(appdata.c_str());
+        ::RemoveDirectoryW(dir.c_str());
+    }
+    for (const wchar_t* shape : { L"list1", L"exit3" }) {
+        const GpuProbe p = probeGpuAtStart(me, std::wstring(L"--gpuprobe-standin ") + shape);
+        ok(p.ran && p.verdict != GpuProbe::kNone && !g_forceCpu && vkClear(),
+           verdictName(p.verdict) + " (" + wideToUtf8L(shape) + "): nothing forced -- the GPU path, as before");
+        unforce();
+    }
+    {
+        const GpuProbe p = probeGpuAtStart(me + L".no-such-exe");
+        ok(!p.ran && !g_forceCpu && vkClear(), "no exe: nothing forced -- the GPU path, as before (" + p.why + ")");
+        unforce();
+    }
+
+    // ---- [4] ---------------------------------------------------------------------------------------------------------
+    std::printf("\n[4] the payload's REAL llama-server --list-devices\n");
+    const TrPaths paths = resolvePaths(TrConfig{});
+    const std::wstring expect = envWide(L"SUVTITLE_TEST_GPU");
+    const bool real = !paths.llamaExe.empty() && ::GetFileAttributesW(paths.llamaExe.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (!real) {
+        std::printf("    [4] [5] NOT CHECKED (no payload: set SUVTITLE_PAYLOAD)\n");
+    } else {
+        std::printf("    %s\n", wideToUtf8L(paths.llamaExe).c_str());
+        GpuProbe p = runListDevices(paths.llamaExe, L"--list-devices", kGpuProbeBoundMs);
+        std::printf("    as it is: %s -- %s\n", verdictName(p.verdict).c_str(), gpuProbeSentence(p).c_str());
+        if (expect == L"listed")
+            ok(p.verdict == GpuProbe::kListed && !p.devices.empty(),
+               "as it is, this PC (SUVTITLE_TEST_GPU=listed): LISTED -- the GPU path kept");
+        else if (expect == L"none")
+            ok(p.verdict == GpuProbe::kNone, "as it is, this PC (SUVTITLE_TEST_GPU=none): NONE");
+        else
+            ok(p.verdict != GpuProbe::kUnknown, "as it is: a definite answer (SUVTITLE_TEST_GPU unset: either)");
+        ok(p.exited && p.exitCode == 0 && !p.timedOut, "... it ended by itself, exit code 0, within the bound");
+        {
+            GpuTestEnv env;
+            env.set(L"VK_LOADER_DRIVERS_DISABLE", L"*");          // the probe's child inherits it: its loader exposes no driver
+            p = runListDevices(paths.llamaExe, L"--list-devices", kGpuProbeBoundMs);
+        }
+        std::printf("    VK_LOADER_DRIVERS_DISABLE=*: %s -- %s\n", verdictName(p.verdict).c_str(), gpuProbeSentence(p).c_str());
+        ok(p.verdict == GpuProbe::kNone && p.exited && p.exitCode == 0,
+           "with VK_LOADER_DRIVERS_DISABLE=* (no driver): NONE, exit code 0");
+        ok(vkClear(), "... and this process' environment as it was");
+        const std::wstring missing = paths.llamaExe.substr(0, paths.llamaExe.find_last_of(L"\\/") + 1)
+                                   + L"no-such-llama-server.exe";
+        const GpuProbe m = probeGpuAtStart(missing);
+        ok(!m.ran && m.verdict == GpuProbe::kUnknown && !g_forceCpu,
+           "a missing exe in the payload's folder: UNKNOWN, nothing forced (today's path)");
+        unforce();
+    }
+
+    // ---- [5] ---------------------------------------------------------------------------------------------------------
+    struct Prof { std::wstring dir, appdata, local, own, log, out; };
+    std::vector<Prof> profs;
+    if (real) {
+        std::printf("\n[5] runHost END TO END: this exe spawned in host mode as the app spawns the engine, its pipe served here\n");
+        auto prof = [&](const wchar_t* tag) {
+            Prof f;
+            f.dir = root + L"\\" + tag;
+            f.appdata = f.dir + L"\\appdata";
+            f.local = f.dir + L"\\local";
+            f.own = f.appdata + L"\\SuVtitle\\engine.txt";
+            f.log = f.local + L"\\SuVtitle\\engine.log";
+            f.out = f.dir + L"\\stdout.txt";
+            for (const std::wstring& x : { f.own, f.log, f.log + L".1", f.out }) ::DeleteFileW(x.c_str());
+            ::CreateDirectoryW(f.dir.c_str(), nullptr);
+            ::CreateDirectoryW(f.appdata.c_str(), nullptr);
+            ::CreateDirectoryW(f.local.c_str(), nullptr);
+            profs.push_back(f);
+            return f;
+        };
+        // every STATE says `gpu`, and at least one names the models (the pipeline's own announce was among them)
+        auto allGpu = [](const GpuTestHost& h, bool gpu) {
+            bool named = false;
+            for (const trpipe::WireState& s : h.states) {
+                if (s.gpu != gpu) return false;
+                if (!s.asrModel.empty()) named = true;
+            }
+            return named;
+        };
+        auto firstNamed = [](const GpuTestHost& h) -> const trpipe::WireState* {
+            for (const trpipe::WireState& s : h.states) if (!s.asrModel.empty()) return &s;
+            return nullptr;
+        };
+        {   // (a) NO VULKAN DRIVER -- a persisting engine (no --nofabric, no --cpu), an isolated profile
+            const Prof f = prof(L"host_nodriver");
+            GpuTestHost h;
+            {
+                GpuTestEnv env;
+                env.set(L"VK_LOADER_DRIVERS_DISABLE", L"*");
+                env.set(L"APPDATA", f.appdata.c_str());
+                env.set(L"LOCALAPPDATA", f.local.c_str());
+                h = gpuTestRunHost(me, std::wstring(), f.out, 951);
+            }
+            const std::string log = gpuTestRead(f.log), own = gpuTestRead(f.own);
+            std::printf("    (a) %s\n", lineOf(log, "GPU probe:").c_str());
+            ok(h.hello && !h.states.empty(),
+               "(a) no Vulkan driver, NO --cpu: HELLO, then " + std::to_string(h.states.size()) + " STATE(s)");
+            ok(h.hello && !has(h.outAtHello, "GPU probe:"),
+               "(a) the HELLO came FIRST: the probe's line was not written yet when it arrived (the app's 8 s connect leash)");
+            ok(!h.states.empty() && !h.states.front().gpu, "(a) the FIRST STATE already says gpu 0");
+            ok(allGpu(h, false), "(a) EVERY STATE gpu 0, the models named in them (the pipeline started after the probe)");
+            ok(has(h.out, "GPU probe: no GPU device") && has(log, "GPU probe: no GPU device"),
+               "(a) the probe's own line, on stdout and in engine.log");
+            ok(has(log, ", device auto") && !has(log, "(every child on the CPU)"), "(a) the start line still says \"device auto\"");
+            ok(has(own, "\nDEVICE\tauto\n") && !has(own, "DEVICE\tcpu"),
+               "(a) engine.txt after QUIT: DEVICE auto -- the verdict lived in memory only");
+            ok(h.exitCode == 0, "(a) QUIT -> exit 0");
+        }
+        {   // (b) AS IT IS -- a test engine (--nofabric: it writes nothing), the profile isolated all the same (it READS engine.txt)
+            const Prof f = prof(L"host_asis");
+            GpuTestHost h;
+            {
+                GpuTestEnv env;
+                env.set(L"APPDATA", f.appdata.c_str());
+                env.set(L"LOCALAPPDATA", f.local.c_str());
+                h = gpuTestRunHost(me, L"--nofabric", f.out, 952);
+            }
+            const trpipe::WireState* s = firstNamed(h);
+            const bool listed = has(h.out, "GPU probe: listed ");
+            std::printf("    (b) %s\n", lineOf(h.out, "GPU probe:").c_str());
+            if (expect == L"listed")
+                ok(listed && s && s->gpu, "(b) as it is, this PC: listed -> the first STATE naming the models says gpu 1 "
+                                          "(the GPU path, as before)");
+            else if (expect == L"none")
+                ok(!listed && s && !s->gpu, "(b) as it is, this PC: none -> gpu 0");
+            else
+                ok(s && s->gpu == listed, "(b) as it is: the first STATE naming the models agrees with the probe's line");
+            ok(h.hello && h.exitCode == 0, "(b) HELLO ... QUIT -> exit 0");
+        }
+        {   // (c) --cpu: the probe never runs
+            const Prof f = prof(L"host_cpuflag");
+            GpuTestHost h;
+            {
+                GpuTestEnv env;
+                env.set(L"APPDATA", f.appdata.c_str());
+                env.set(L"LOCALAPPDATA", f.local.c_str());
+                h = gpuTestRunHost(me, L"--cpu", f.out, 953);
+            }
+            const std::string log = gpuTestRead(f.log);
+            std::printf("    (c) %s\n", lineOf(log, "GPU probe:").c_str());
+            ok(has(log, "GPU probe: not run") && has(h.out, "GPU probe: not run") && !has(log, "GPU probe: no GPU device")
+               && !has(log, "GPU probe: listed"), "(c) --cpu: the probe NEVER runs (engine.log and stdout)");
+            ok(allGpu(h, false) && h.exitCode == 0, "(c) every STATE gpu 0; QUIT -> exit 0");
+        }
+        {   // (d) DEVICE cpu in engine.txt: the probe never runs
+            const Prof f = prof(L"host_devicecpu");
+            {
+                GpuTestEnv env;
+                env.set(L"APPDATA", f.appdata.c_str());
+                TrConfig c;
+                c.device = "cpu";
+                c.save();
+            }
+            GpuTestHost h;
+            {
+                GpuTestEnv env;
+                env.set(L"APPDATA", f.appdata.c_str());
+                env.set(L"LOCALAPPDATA", f.local.c_str());
+                h = gpuTestRunHost(me, std::wstring(), f.out, 954);
+            }
+            const std::string log = gpuTestRead(f.log), own = gpuTestRead(f.own);
+            std::printf("    (d) %s\n", lineOf(log, "GPU probe:").c_str());
+            ok(has(log, "GPU probe: not run") && has(log, "device cpu (every child on the CPU)"),
+               "(d) DEVICE cpu (engine.txt): the probe NEVER runs (engine.log)");
+            ok(allGpu(h, false) && h.exitCode == 0 && has(own, "\nDEVICE\tcpu\n"),
+               "(d) every STATE gpu 0; engine.txt still DEVICE cpu; QUIT -> exit 0");
+        }
+    }
+    // the isolated profiles go (the files this test knows; a folder that is not empty stays, harmless, in TEMP)
+    for (const Prof& f : profs) {
+        for (const std::wstring& x : { f.own, f.log, f.log + L".1", f.out }) ::DeleteFileW(x.c_str());
+        for (const std::wstring& d : { f.appdata + L"\\SuVtitle", f.appdata, f.local + L"\\SuVtitle", f.local, f.dir })
+            ::RemoveDirectoryW(d.c_str());
+    }
+    ::RemoveDirectoryW(root.c_str());
+
+    std::printf("\n(%d checks, %.1f s)\n", checks, (double)(::GetTickCount64() - tAll) / 1000.0);
+    std::printf(failures ? "\nGPUPROBE SELFTEST FAILED (%d assertion(s))\n" : "\nGPUPROBE SELFTEST PASSED\n", failures);
+    return failures ? 1 : 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string pipePath, presetArg, modeArg, fileArg, pairArg, qualityArg, audioArg;
+    // SuVtitle 1.1.0 (N3, review RV-NH 4): the CURRENT DIRECTORY off this process' DLL search path, first thing. The app
+    // spawns the engine in its own current directory (TranslatorManager.cpp: lpCurrentDirectory null): the film's folder
+    // when Explorer started SuVtitle on it. Every load of the engine names its folder (TrMpvAudio.cpp also does this
+    // before libmpv, for an engine built without this line).
+    ::SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    std::string pipePath, presetArg, modeArg, fileArg, pairArg, qualityArg, audioArg, haveArg, focusArg, clockArg;
     uint32_t parentPid = 0;
     bool selftest = false, stOffline = false, nofabric = false, selftestFm = false, fmOffline = false;
     bool forceCpu = false, selftestV2 = false, v2Offline = false, selftestWf = false;
     bool selftestWh = false, whOffline = false;
+    bool selftestLive = false, selftestSpk = false, help = false;      // SuVtitle 1.1.0
+    bool selftestGpu = false;                                          // the GPU wave: --selftest-gpuprobe
+    std::string standinArg;                                            // ... and its canned llama-server (--gpuprobe-standin)
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : std::string(); };
-        // (SUVTITLE SPLIT: --selftest-spk, the diarization proof, is not ported; an unknown switch is ignored.)
         if      (a == "--selftest-wf")  selftestWf = true;
+        else if (a == "--selftest-live") selftestLive = true;
+        else if (a == "--selftest-spk")  selftestSpk = true;
+        else if (a == "--selftest-gpuprobe") selftestGpu = true;
+        else if (a == "--gpuprobe-standin")  standinArg = next();      // TEST ONLY: --selftest-gpuprobe's canned llama-server
         else if (a == "--selftest") {
             selftest = true;
             if (i + 1 < argc && std::string(argv[i + 1]) == "offline") { stOffline = true; ++i; }
@@ -8739,14 +16759,22 @@ int main(int argc, char** argv) {
         else if (a == "--pair")     pairArg    = next();
         else if (a == "--quality")  qualityArg = next();
         else if (a == "--audio")    audioArg   = next();
+        else if (a == "--have")     haveArg    = next();      // F-RESUME: --selftest-file only
+        else if (a == "--focus")    focusArg   = next();
         else if (a == "--nofabric") nofabric   = true;
         else if (a == "--cpu")      forceCpu   = true;
         else if (a == "--pipe")     pipePath  = next();
         else if (a == "--preset")   presetArg = next();
         else if (a == "--mode")     modeArg   = next();
-        else if (a == "--rate")     (void)next();   // AudioPB's fabric rate: accepted (an AudioPB-shaped spawn line) and ignored
+        else if (a == "--test-clock") clockArg = next();
+        else if (a == "--help" || a == "-h" || a == "/?") help = true;
+        else if (a == "--rate")     (void)next();   // AudioPB's routing rate: accepted (an AudioPB-shaped spawn line) and ignored
         else if (a == "--parent")   parentPid = (uint32_t)std::strtoul(next().c_str(), nullptr, 10);
     }
+
+    // TEST ONLY (the GPU wave): --selftest-gpuprobe runs THIS exe as a canned `llama-server --list-devices` -- every output
+    // shape the probe must read, through the real launcher, no model, no GPU. It prints, and exits: nothing else runs.
+    if (!standinArg.empty()) return gpuProbeStandIn(standinArg);
 
     // The same migration TrConfig::load performs, applied to the COMMAND LINE: an app built
     // before W2 spawned the helper with --mode en2zh (TrPipe.h says why this is read
@@ -8767,13 +16795,16 @@ int main(int argc, char** argv) {
     // --nofabric, --cpu): the app passes none of those, and a `setx AUDIOPB_TR_FORCE_CPU 1` left
     // behind can never turn the shipping engine CPU-only or swap its file models. (A USER who wants the
     // CPU says so in engine.txt: DEVICE cpu.)
+    // SuVtitle 1.1.0: the same test-ness decides the live path's TEST inputs (HubOptions::testSources: "wav:" keys --
+    // the app's test instance passes --cpu, so its engine takes them) and the capture's virtual clock (--test-clock
+    // virtual: a WAV input runs as fast as the CPU allows, in lockstep; never with a device).
     auto envOf = [](const wchar_t* name) {
         wchar_t v[1024] = {};
         const DWORD n = ::GetEnvironmentVariableW(name, v, 1024);
         return (n > 0 && n < 1024) ? wideToUtf8L(v) : std::string();
     };
     const bool testRun = testEnvAllowed(selftest || selftestFm || selftestV2 || selftestWf || selftestWh
-                                        || !fileArg.empty(), nofabric, forceCpu);
+                                        || selftestLive || selftestSpk || selftestGpu || !fileArg.empty(), nofabric, forceCpu);
     if (envOf(L"AUDIOPB_TR_FORCE_CPU") == "1") {
         if (testRun) forceCpu = true;
         else ::OutputDebugStringA("[SuVtitleEngine] AUDIOPB_TR_FORCE_CPU ignored: not a test run "
@@ -8793,31 +16824,51 @@ int main(int argc, char** argv) {
     if (testRun && envOf(L"AUDIOPB_TR_TEST_NO_DTW") == "1") g_fileNoDtwForTest = true;
     // (WF review P3: the first window's whisper call fails once -- the job must go on without DTW)
     if (testRun && envOf(L"AUDIOPB_TR_TEST_ASR_FAIL_ONCE") == "1") g_fileAsrFailOnceForTest = true;
+    const bool virtualClock = (clockArg == "virtual") && testRun;
+    if (clockArg == "virtual" && !testRun)
+        ::OutputDebugStringA("[SuVtitleEngine] --test-clock virtual ignored: not a test run (--nofabric or --cpu)\n");
 
     if (selftestWf)  return runSelftestWf();
     if (selftest)    return runSelftest(stOffline);
+    if (selftestLive) return runSelftestLive();
+    if (selftestSpk) return runSelftestSpk();
     if (selftestFm)  return runSelftestFileMode(fmOffline);
     if (selftestV2)  return runSelftestV2(v2Offline);
     if (selftestWh)  return runSelftestWh(whOffline);
-    if (!fileArg.empty()) return runSelftestFile(fileArg, pairArg, modeArg, qualityArg, audioArg);
-    if (pipePath.empty()) {
+    if (selftestGpu) return runSelftestGpuProbe();   // the GPU wave (it refuses to run under --cpu / AUDIOPB_TR_FORCE_CPU=1)
+    // SuVtitle 1.1.0 (N3): the FILE job hears the file through libmpv -- the player's own decoder, on the player's own
+    // timeline -- and falls back to Media Foundation where libmpv is missing or cannot open the file (TrMedia.h, "THE
+    // DECODER"). The selftests above keep the Media Foundation reader they were written for (tests\cpp\mpvaudio proves
+    // the libmpv one); --selftest-file and the pipe host run the product's choice.
+    pbt::setAnalysisDecoder(pbt::AnalysisDecoder::MpvFirst);
+    if (!fileArg.empty()) return runSelftestFile(fileArg, pairArg, modeArg, qualityArg, audioArg, haveArg, focusArg);
+    if (pipePath.empty() || help) {
         std::printf("SuVtitle Engine " SUVTITLE_ENGINE_VERSION_STR " -- the AI half of SuVtitle (whisper + llama, driven over a pipe)\n"
                     "SuVtitleEngine --pipe <pipe> [--parent pid] [--preset quality|balanced|light|auto]\n"
-                    "               [--mode auto|a2b|b2a] [--nofabric] [--cpu]\n"
-                    "               --selftest [offline] | --selftest-filemode [offline] | --selftest-v2 [offline]\n"
+                    "               [--mode auto|a2b|b2a] [--nofabric] [--cpu] [--test-clock virtual]\n"
+                    "               --selftest [offline] (the wire contract, languages, payload, live/file exclusivity,\n"
+                    "                                     then the file sections) | --selftest-filemode [offline] | --selftest-v2 [offline]\n"
                     "               --selftest-wf (the film-grade cue rules, offline)\n"
                     "               --selftest-wh [offline] (the film's own sound tracks; live jobs: use --cpu)\n"
+                    "               --selftest-live (the LIVE path on the real models: VAD, live line, commit, finals,\n"
+                    "                                Traditional Chinese, the onset gate, a stop mid-utterance; use --cpu)\n"
+                    "               --selftest-spk (diarization: the 24-utterance meeting through CAM++, no ASR)\n"
+                    "               --selftest-gpuprobe (the start's GPU probe: its parser, its launcher, a host's first\n"
+                    "                                    STATE; NEVER with --cpu; the payload's llama-server, no model)\n"
                     "               --selftest-file <media> [--pair a:b] [--mode m] [--quality auto|max|fast]\n"
-                    "                               [--audio <ord>:<trackId>]\n"
+                    "                               [--audio <ord>:<trackId>] [--have <s-e,...ms>] [--focus <ms>]\n"
                     "               [--cpu] (or AUDIOPB_TR_FORCE_CPU=1 with a test switch): every child server on the CPU,\n"
                     "               the GPU untouched. --nofabric: a TEST engine (writes nothing: no engine.txt, no log).\n"
-                    "payload: <exe dir>\\engine\\whisper, \\engine\\llama, \\models; with none of them next to the exe (a build tree)\n"
-                    "         the folder named by SUVTITLE_PAYLOAD (whisper\\, llama\\, models\\); engine.txt WHISPERBIN / LLAMABIN / MODELS win.\n"
+                    "               A test engine (--nofabric or --cpu) also takes LIVE test inputs (wav:<file>), on the\n"
+                    "               virtual capture clock with --test-clock virtual.\n"
+                    "payload: <exe dir>\\engine\\whisper, \\engine\\llama, \\models (+ the optional \\engine\\sherpa, diarization);\n"
+                    "         with none of them next to the exe (a build tree) the folder named by SUVTITLE_PAYLOAD\n"
+                    "         (whisper\\, llama\\, models\\, sherpa\\); engine.txt WHISPERBIN / LLAMABIN / MODELS win.\n"
                     "selftests read their private media from SUVTITLE_TEST_MEDIA (and SUVTITLE_TEST_FILM): NOT CHECKED when unset.\n"
                     "test environment: %s\n",
                     forceCpu ? "CPU forced"
                     : (envOf(L"AUDIOPB_TR_FORCE_CPU") == "1" ? "AUDIOPB_TR_FORCE_CPU ignored (not a test run)" : "none"));
-        return 1;
+        return help ? 0 : 1;
     }
-    return runHost(pipePath, parentPid, presetArg, modeArg, nofabric);
+    return runHost(pipePath, parentPid, presetArg, modeArg, nofabric, testRun, virtualClock);
 }

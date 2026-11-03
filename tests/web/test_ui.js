@@ -47,9 +47,28 @@ const section = (s) => console.log("\n=== " + s + " ===");
     const f1cv = /            <canvas id="fileCanvas" class="file-canvas" hidden><\/canvas>\n/.exec(html);
     const f1js = /  \/\* ---- VIDEO RENDERING \(wave WH, 11\/10\)[\s\S]*?\n  \}\);\n/.exec(html);
     // (the same three pieces of 641f1aa's ui/web/translator.html hash to these: scratchpad/s-web/port/build_index.js)
-    ok("F1's HEVC lines came along BYTE FOR BYTE (the blend-mode CSS, #fileCanvas, the VIDEO RENDERING block = 641f1aa's)",
+    // 25/10 -- ONE deliberate change to the VIDEO RENDERING block, measured live with the user (index.html: THE STANDARD
+    // MODE IS DIRECT IN FULL SCREEN): renderNow() + applyRender() drawing it. The pin now proves "641f1aa's block + exactly
+    // that change, nothing else": undo2510 takes the change back out, mechanically, and the result must hash as before.
+    const undo2510 = (s) => s
+      .replace(/  \/\* THE STANDARD MODE IS DIRECT IN FULL SCREEN[\s\S]*?\*\/\n  function renderNow\(\) \{[^\n]*\}\n/, "")
+      .replace("  function applyRender() {\n    const m = renderNow();\n", "  function applyRender() {\n")
+      .replace('toggle("render-canvas", m === "canvas")', 'toggle("render-canvas", renderMode === "canvas")')
+      .replace('toggle("render-plain", m === "plain")', 'toggle("render-plain", renderMode === "plain")')
+      .replace('el.fileCanvas.hidden = m !== "canvas";', 'el.fileCanvas.hidden = renderMode !== "canvas";')
+      .replace('    if (m === "canvas") {', '    if (renderMode === "canvas") {');
+    // 26/10 (1.1.0, THE NATIVE VIDEO ENGINE, N2) -- a SECOND deliberate change, two lines: mpv draws the picture, so the page
+    // draws in no mode of its own ("native": no canvas, no blend class) and Ctrl+Alt+V says so instead of cycling. undoNative
+    // takes them back out FIRST, mechanically; then undo2510; the result must hash as 641f1aa's block.
+    const undoNative = (s) => s
+      .replace('  function renderNow() { return role === "native" ? "native" : isFull ? "plain" : renderMode; }   // (1.1.0: mpv draws it)\n',
+               '  function renderNow() { return isFull ? "plain" : renderMode; }\n')
+      .replace("    if (role === \"native\") { showFileToast(NATIVE_RENDER_TEXT, false); return; }   // (1.1.0: the modes are the <video>'s)\n", "");
+    ok("F1's HEVC lines came along BYTE FOR BYTE (the blend-mode CSS, #fileCanvas, the VIDEO RENDERING block = 641f1aa's + the 25/10 full-screen change + the 26/10 native change only)",
        !!f1css && !!f1cv && !!f1js && sha(f1css[0]) === "c7ea460daa621bdc" && sha(f1cv[0]) === "bc256d414d844e1c"
-       && sha(f1js[0]) === "88e719c89d277e42", [f1css && sha(f1css[0]), f1cv && sha(f1cv[0]), f1js && sha(f1js[0])]);
+       && /function renderNow\(\)/.test(f1js[0]) && /role === "native" \? "native"/.test(f1js[0])
+       && sha(undo2510(undoNative(f1js[0]))) === "88e719c89d277e42",
+       [f1css && sha(f1css[0]), f1cv && sha(f1cv[0]), f1js && sha(undo2510(undoNative(f1js[0])))]);
     ok("nothing of the Live window is left: no live line / partial / end / session export, no log, no Live|File, no idle fade",
        !/translatorLine|translatorPartial|translatorEnd|"translatorExport"|translatorExported|translatorCtl",\s*clear|modeLive|modeFile|id="log"|tr-live|el\.bar\.classList\.add\("is-idle"\)|KEY_FONT|\bwake\(/.test(html));
     // (the markup and the CSS without their comments, the script through the lexer: an apostrophe in the markup is not
@@ -155,6 +174,7 @@ const section = (s) => console.log("\n=== " + s + " ===");
     const ctl = last(w, "translatorCtl");
     ok("a running yue pair: picking the OTHER half sends yue back -- never \"yu\"",
        !!ctl && ctl.langA === "yue" && ctl.langB === "de", ctl);
+    w.send(fileMsg({ jobId: 2, phase: "analyzing", translate: true }));   // (U1: a file being translated lists SuVtitle's rows)
     w.ids.tCC.click();
     const rowA = w.ids.ccSources.children.find((x) => x.dataset.key === "a:a");
     ok("...and the page NAMES it by its code, not a blank (no table row for yue): \"SuVtitle · YUE\" in the CC panel",
@@ -220,8 +240,9 @@ const section = (s) => console.log("\n=== " + s + " ===");
   section("WC -- Translator window: FILE MODE (player, overlay, list, strip)");
   {
     const w = runTranslatorWindow();
-    ok("boot: exactly one message, `ready` -- view \"file\", SuVtitle's only view (the app replays the session on it)",
-       w.outbox.length === 1 && w.outbox[0].type === "ready" && w.outbox[0].view === "file", w.outbox);
+    // (03/11/2026, THE UPDATE BANNER: + update.check AFTER `ready` -- the app asks the site once per start and answers each)
+    ok("boot: two messages, `ready` -- view \"file\", SuVtitle's only view (the app replays the session on it) -- then update.check",
+       w.outbox.length === 2 && w.outbox[0].type === "ready" && w.outbox[0].view === "file" && w.outbox[1].type === "update.check", w.outbox);
     ok("the page IS the File view: the drop zone, no player yet -- and nothing of the Live window (no log, no Live|File, no mode kept)",
        w.ids.filePane.hidden === false && w.ids.fileEmpty.hidden === false && w.ids.filePlayer.hidden === true
        && !w.ids.log && !w.ids.modeLive && !w.ids.modeFile && !w.ids.resume && w.lsStore["audiopb.tr.mode"] === undefined
@@ -230,23 +251,22 @@ const section = (s) => console.log("\n=== " + s + " ===");
        w.ids.clearBtn.hidden === true && w.ids.exportBtn.disabled === true && w.ids.exportBtn.textContent === "Export ▾");
     ok("the drop zone says what the subtitles will be in (the running pair and direction)",
        w.ids.filePairHint.textContent.indexOf("English ⇄ 简体中文") === 0, w.ids.filePairHint.textContent);
-    const opts = w.ids.fileQuality.children.map((o) => o.getAttribute("value") + "=" + o.textContent);
-    ok("the model: Standard (recommended) and large-v3 (slower) -- nothing promises better (WB measured it)",
-       opts.join("|") === "auto=Standard (recommended)|max=large-v3 (slower)", opts);
-    const tip = "Measured no more accurate than Standard; worse on mixed-language recordings. Needs ggml-large-v3.bin.";
-    ok("...large-v3 says so in its tooltip, and the select names the measurement too",
-       w.ids.fileQuality.children[1].getAttribute("title") === tip
-       && /no more accurate than Standard; worse on mixed-language recordings\. Needs ggml-large-v3\.bin\./.test(w.ids.fileQuality.getAttribute("title"))
-       && !/\bmax\b|better|best|higher quality/i.test(w.ids.fileQuality.children.map((o) => o.textContent).join("|")), w.ids.fileQuality.getAttribute("title"));
-    w.ids.fileQuality.value = "max";
-    w.ids.fileQuality.dispatch("change");
-    ok("...the choice is remembered", w.lsStore["audiopb.tr.fileQuality"] === "max");
+    // U1 (the user, 02/11: "garder seulement le modèle turbo, mais garder le petit menu de sélection"): turbo alone, named as
+    // the default; nothing promises "better" (WB measured large-v3 no more accurate). U2: U1's one-option <select> gave way to
+    // the MODELS menu (the default two + "Import model…") -- its checks and sentinels are test_u2.js's; test_u1.js checks the
+    // migration of a stored "max".
+    const mtxt = w.ids.modelsBtn.textContent;
+    ok("the models: SuVtitle's own two, large-v3-turbo and Qwen3-4B (U1: large-v3 left the menu; U2: the menu imports others) "
+       + "-- nothing promises better (WB measured it)",
+       mtxt === "large-v3-turbo·Qwen3-4B" && !w.ids.fileQuality && !/\bmax\b|better|best|higher quality/i.test(w.ids.modelsBtn.title), mtxt);
+    ok("...and the quality the app is sent is the one there is", w.lsStore["audiopb.tr.fileQuality"] === undefined
+       || w.lsStore["audiopb.tr.fileQuality"] === "auto");
     w.outbox.length = 0;
     w.ids.fileOpenBtn.click();
     w.ids.fileOpenFolderBtn.click();
     ok("Open files… / Open a folder… ask the bridge for its native dialogs, with the quality, nothing else",
-       JSON.stringify(w.outbox) === JSON.stringify([{ type: "translatorFileOpen", quality: "max" },
-         { type: "playerOpen", what: "folder", quality: "max" }]), w.outbox);
+       JSON.stringify(w.outbox) === JSON.stringify([{ type: "translatorFileOpen", quality: "auto" },
+         { type: "playerOpen", what: "folder", quality: "auto" }]), w.outbox);
 
     w.send(fileMsg({ jobId: 3, phase: "loading" }));
     const v = w.ids.fileVideo;
@@ -363,7 +383,7 @@ const section = (s) => console.log("\n=== " + s + " ===");
     w.ids.fileReanalyse.click();
     ok("Show in folder -> Reveal{srt}; Re-analyse -> Analyse{force, quality}",
        JSON.stringify(w.outbox) === JSON.stringify([{ type: "translatorFileReveal", what: "srt" },
-         { type: "translatorFileAnalyse", force: true, quality: "max" }]), w.outbox);
+         { type: "translatorFileAnalyse", force: true, quality: "auto" }]), w.outbox);
 
     // the pair moved since the analysis
     w.send({ type: "translatorState", running: true, status: "listening", mode: "auto", langA: "en", langB: "fr" });
@@ -371,14 +391,16 @@ const section = (s) => console.log("\n=== " + s + " ===");
     w.outbox.length = 0;
     w.ids.fileStaleBtn.click();
     ok("...which may come from the cache (force:false)",
-       JSON.stringify(last(w, "translatorFileAnalyse")) === JSON.stringify({ type: "translatorFileAnalyse", force: false, quality: "max" }));
+       JSON.stringify(last(w, "translatorFileAnalyse")) === JSON.stringify({ type: "translatorFileAnalyse", force: false, quality: "auto" }));
     w.send({ type: "translatorState", running: true, status: "analyzing", mode: "auto", langA: "en", langB: "zh" });
     ok("...and the banner goes when the pair is back", w.ids.fileStale.hidden === true);
 
     // export
     w.ids.exportBtn.click();
     const items = w.ids.exportMenu.children;
-    ok("Export opens a menu of five", w.ids.exportMenu.hidden === false && items.length === 5,
+    // (U3 re-point: SIX -- the bilingual Word file has its own name, "Transcript (.docx)" is the speaker transcript now)
+    ok("Export opens a menu of six", w.ids.exportMenu.hidden === false && items.length === 6
+       && items[4].textContent === "Bilingual subtitles (.docx)" && items[5].textContent === "Transcript (.docx)",
        items.map((b2) => b2.textContent));
     ok("...naming the languages", items[0].textContent === "Subtitles · 简体中文 (.srt)"
        && items[1].textContent === "Subtitles · English, original (.srt)", items.map((b2) => b2.textContent));
@@ -490,10 +512,10 @@ const section = (s) => console.log("\n=== " + s + " ===");
     metaOk(w.ids.fileVideo);
     w.send(cueMsg(2, 0, 0, 1000, "en", "zh", "a", "\u4e00"));
     const err = "large-v3 is not installed: ggml-large-v3.bin was not found in the models folder.";
-    ok("an error (Max without its model): the helper's own sentence, the cues KEPT, \"Analyse again\"",
+    ok("an error (Max without its model): the helper's own sentence, the cues KEPT, Translate offered again (U1: it was \"Analyse again\")",
        say({ jobId: 2, phase: "error", quality: "max", err }) === "Couldn't finish: " + err + " · 1 subtitle kept"
-       && w.ids.fileDot.classList.contains("is-error") && w.ids.fileReanalyse.hidden === false
-       && w.ids.fileReanalyse.textContent === "Analyse again" && w.ids.fileCancel.hidden === true,
+       && w.ids.fileDot.classList.contains("is-error") && w.ids.fileTranslate.hidden === false
+       && w.ids.fileReanalyse.hidden === true && w.ids.fileCancel.hidden === true,
        w.ids.fileStatus.textContent);
     ok("the app's own refusal reads the same way (641f1aa: no Translator card on the desk; here: the engine down)",
        say({ jobId: 3, phase: "error", err: "The SuVtitle engine is not running." })
@@ -627,8 +649,8 @@ const section = (s) => console.log("\n=== " + s + " ===");
        && /\.brand-name \{ font-family: var\(--display\); font-size: 24px; font-weight: 600; font-stretch: normal;/.test(html)
        && noFontFile(html) && shipped.indexOf("index.html") >= 0 && shipped.every((f) => !/\.(woff2?|ttf|otf|eot)$/i.test(f)), shipped);
     const labels = [...html.matchAll(/<span class="lbl">([^<]+)<\/span>/g)].map((m) => m[1]);
-    ok("the bar's controls sit in the app's group plates: Translate (the pair), Window -- the Live window's Source, Show and Text stayed in AudioPB",
-       labels.join("|") === "Translate|Window", labels);
+    ok("the bar's controls sit in the app's group plates: Window -- the pair left for the strip (U1); the Live window's Source, Show and Text stayed in AudioPB",
+       labels.join("|") === "Window", labels);
     ok("...which FOLD into plain rows on a narrow or short window (measured: at the 420 x 320 minimum the plates hid the player)",
        /@media \(max-width: 900px\), \(max-height: 560px\) \{[\s\S]{0,400}#bar \.grp \{ flex-direction: row;[^}]*border: none;[\s\S]{0,120}#bar \.lbl \{ display: none; \}/.test(html)
        && /@media \(max-width: 560px\) \{ #bar \.brand \{ display: none; \} \}/.test(html));
@@ -1163,42 +1185,42 @@ const section = (s) => console.log("\n=== " + s + " ===");
   }
 
   // ---- WE-5 --------------------------------------------------------------------------------------
-  section("WE-5 -- translation On/Off: a plain player too (the switch is the bridge's, D9)");
+  // U1 (02/11/2026): the On/Off SWITCH of WE-5 is gone -- a file is a plain player until Translate is pressed on it (or
+  // Translate all queues it). What WE-5 proved of the "off" state still holds for a file nobody asked to translate; the
+  // press, the batch and their sentinels are test_u1.js's.
+  section("WE-5 -- a file nobody asked to translate: a plain player (U1: the switch became the Translate button, D9)");
   {
     const w = runTranslatorWindow();
-    ok("the empty state carries the switch, On by default",
-       w.ids.emptyTranslate.classList.contains("is-on") && w.ids.emptyTranslate.getAttribute("aria-checked") === "true");
-    w.outbox.length = 0;
-    w.ids.emptyTranslate.click();
-    ok("turning it off tells the bridge (playerSet{translate:false}) and the empty state says what it is now",
-       JSON.stringify(last(w, "playerSet")) === JSON.stringify({ type: "playerSet", translate: false, ms: 0 })
-       && /plain player/.test(w.ids.emptyHint.textContent) && !w.ids.emptyTranslate.classList.contains("is-on"), w.outbox);
+    ok("the empty state carries NO switch any more (U1): the pair and the model only",
+       !w.ids.emptyTranslate && !/id="emptyTranslate"/.test(html) && w.ids.trPair.parentNode === w.ids.emptyPairSlot);
     w.send(fileMsg({ jobId: 2, phase: "off", translate: false }));
     const v = w.ids.fileVideo;
     metaOk(v);
-    ok("a file with translation off: \"Translation off\", nothing to cancel or re-analyse, the strip's switch off",
-       w.ids.fileStatus.textContent === "Translation off" && w.ids.fileReanalyse.hidden === true && w.ids.fileCancel.hidden === true
-       && !w.ids.fileTranslate.classList.contains("is-on"), w.ids.fileStatus.textContent);
+    ok("a file not translated: the strip says how to get its subtitles, Translate offered -- nothing to cancel or re-analyse",
+       w.ids.fileStatus.textContent === "Not translated yet · press Translate to make its subtitles" && w.ids.fileReanalyse.hidden === true
+       && w.ids.fileCancel.hidden === true && w.ids.fileTranslate.hidden === false, w.ids.fileStatus.textContent);
     w.ids.tCC.click();
     const on = w.ids.ccSources.children.filter((b) => b.classList.contains("is-on")).map((b) => b.textContent);
     ok("...and the subtitles are Off (the CC panel says so)", on.join() === "Off", on);
+    w.ids.tCC.click();
     v._seek(42);
     w.outbox.length = 0;
     w.ids.fileTranslate.click();
-    ok("the strip's switch turns it back on AT THE PLAYHEAD (the bridge starts the analysis there)",
-       JSON.stringify(last(w, "playerSet")) === JSON.stringify({ type: "playerSet", translate: true, ms: 42000 }), w.outbox);
+    ok("Translate asks the bridge to analyse THIS file (translatorFileAnalyse{force:false}: from the playhead it has, what is kept resumed)",
+       JSON.stringify(w.outbox) === JSON.stringify([{ type: "translatorFileAnalyse", force: false, quality: "auto" }]), w.outbox);
     const w2 = runTranslatorWindow();
-    w2.send(fileMsg({ jobId: 3, phase: "off", translate: false, doneMs: 120000, ranges: [[0, 120000]] }));
+    w2.send(fileMsg({ jobId: 3, phase: "off", translate: false, doneMs: 120000, ranges: [[0, 120000]], count: 1 }));
     w2.send({ type: "translatorFileCues", jobId: 3, cues: [{ idx: 0, s: 1000, e: 2000, lang: "en", dstLang: "zh", pass: false, src: "a", dst: "一" }] });
-    ok("translation off with a PARTIAL analysis from before: the strip says what is saved, and how much of the file",
-       w2.ids.fileStatus.textContent === "Translation off · 1 subtitle saved (20% of the file)", w2.ids.fileStatus.textContent);
+    ok("a PARTIAL analysis from before: the strip says what there is, how much of the file, and that Translate finishes it",
+       w2.ids.fileStatus.textContent === "1 subtitle · 20% of the file analysed · Translate finishes it", w2.ids.fileStatus.textContent);
     w2.ids.tCC.click();
-    ok("...and the SuVtitle subtitles stay selectable in CC (D9)",
-       w2.ids.ccSources.children.some((b) => /^SuVtitle · both languages/.test(b.textContent)));
+    const on2 = w2.ids.ccSources.children.filter((b) => b.classList.contains("is-on")).map((b) => b.textContent);
+    ok("...and its subtitles are SHOWN without a press (U1) -- SuVtitle's, selectable in CC (D9)",
+       w2.ids.ccSources.children.some((b) => /^SuVtitle · both languages/.test(b.textContent)) && /^SuVtitle/.test(on2.join()), on2);
     const w3 = runTranslatorWindow();
     w3.send(fileMsg({ jobId: 2, phase: "off", translate: false,
                       sidecars: [{ id: 7, name: "film.en.srt", lang: "en" }, { id: 8, name: "film.zh.srt", lang: "zh" }] }));
-    ok("translation off with subtitle files next to the film: the one in the pair's language is asked for, BY ID -- as the DEFAULT "
+    ok("a file not translated with subtitle files next to it: the one in the pair's language is asked for, BY ID -- as the DEFAULT "
        + "rule's choice: auto (CONTRACT ADDENDUM 2: the app ignores it when the user opened his own file with the film)",
        JSON.stringify(last(w3, "playerSubGet")) === JSON.stringify({ type: "playerSubGet", id: 8, auto: true }), w3.outbox);
   }
@@ -1216,15 +1238,16 @@ const section = (s) => console.log("\n=== " + s + " ===");
        w.ids.fileStatus.textContent);
     const qr = w.ids.queueList.children;
     const badge = (i) => qr[i].children[3];
-    ok("five rows, each: grip, number, name + folder, badge, duration or resume point, remove",
-       qr.length === 5 && qr[0].children.length === 6 && qr[1].children[2].children[0].textContent === "E02 The Bridge.mkv"
+    // (U3 re-point: + the transcript's badge after the translation's: seven children)
+    ok("five rows, each: grip, number, name + folder, badge, the transcript's badge, duration or resume point, remove",
+       qr.length === 5 && qr[0].children.length === 7 && qr[1].children[2].children[0].textContent === "E02 The Bridge.mkv"
        && qr[1].children[2].children[1].textContent === "Season 1" && qr[0].classList.contains("is-cur"));
-    ok("badges: ✓ subtitled, ◐ 35 % partly, ⟳ 12 % being made, ⚠ failed, missing (greyed)",
-       badge(0).textContent === "✓" && badge(1).textContent === "◐ 35 %" && badge(2).textContent === "⟳ 12 %"
+    ok("badges: ✓ done (U1: his word), ◐ 35 % partly, ⟳ 12 % being made, ⚠ failed, missing (greyed)",
+       badge(0).textContent === "✓ done" && badge(1).textContent === "◐ 35 %" && badge(2).textContent === "⟳ 12 %"
        && badge(3).textContent === "⚠ failed" && badge(4).textContent === "missing" && qr[4].classList.contains("is-missing")
        && badge(0).classList.contains("st-ready") && badge(1).classList.contains("st-partial"), qr.map((r, i) => badge(i).textContent));
-    ok("a resume point shows as ▶ 12:31, else the duration", qr[1].children[4].textContent === "▶ 12:31"
-       && qr[0].children[4].textContent === "42:10", [qr[1].children[4].textContent, qr[0].children[4].textContent]);
+    ok("a resume point shows as ▶ 12:31, else the duration", qr[1].children[5].textContent === "▶ 12:31"
+       && qr[0].children[5].textContent === "42:10", [qr[1].children[5].textContent, qr[0].children[5].textContent]);
     ok("the tab counts them", w.ids.tabQueue.textContent === "Queue · 5", w.ids.tabQueue.textContent);
     w.outbox.length = 0;
     w.ids.tPlay.click();
@@ -1232,7 +1255,7 @@ const section = (s) => console.log("\n=== " + s + " ===");
        JSON.stringify(last(w, "playerQueue")) === JSON.stringify({ type: "playerQueue", op: "play", id: 11 }), w.outbox);
     w.outbox.length = 0;
     qr[2].dispatch("dblclick");
-    qr[3].children[5].click();
+    qr[3].children[6].click();                                        // (U3 re-point: ✕ is the 7th now)
     ok("double-click plays a row, ✕ removes one -- BY ID, never by position",
        JSON.stringify(w.outbox.filter((m) => m.type === "playerQueue"))
        === JSON.stringify([{ type: "playerQueue", op: "play", id: 13 }, { type: "playerQueue", op: "remove", id: 14 }]), w.outbox);
@@ -1319,8 +1342,8 @@ const section = (s) => console.log("\n=== " + s + " ===");
     v._seek(2);
     w.ids.tCC.click();
     const src = () => w.ids.ccSources.children.map((b) => b.textContent + (b.classList.contains("is-on") ? "*" : ""));
-    ok("the sources: SuVtitle both / English (original) / 简体中文 (translation), the .srt next to the film, Off -- SuVtitle both on",
-       src().join("|") === "SuVtitle · both languages*|SuVtitle · English (original)|SuVtitle · 简体中文 (translation)|film.fr.srt (next to the file)|Off",
+    ok("the sources: SuVtitle both / English (original) / 简体中文 (Simplified Chinese) (translation), the .srt next to the film, Off -- SuVtitle both on",
+       src().join("|") === "SuVtitle · both languages*|SuVtitle · English (original)|SuVtitle · 简体中文 (Simplified Chinese) (translation)|film.fr.srt (next to the file)|Off",
        src());
     w.ids.ccSources.children[2].click();
     ok("choosing one language sets THE display rule (one rule, D12; 641f1aa's Show plate too), kept", w.lsStore["audiopb.tr.show"] === "b"
@@ -1458,7 +1481,8 @@ const section = (s) => console.log("\n=== " + s + " ===");
     n.ids.tMore.click();
     ok("...⋯ offers the speed, A-B, repeat, shuffle, the keys -- and the strip's buttons it has no room for (Re-analyse here); then (WG) the default player and the theme",
        n.ids.morePanel.hidden === false
-       && n.ids.morePanel.children.map((b) => b.textContent.split(/[ ·:]/)[0]).join(",") === "Speed,A-B,Repeat,Shuffle,Keyboard,Re-analyse,Make,Light"
+       // (U3 re-point: + "Models: …" -- a narrow strip keeps both action slots in words, the models move here)
+       && n.ids.morePanel.children.map((b) => b.textContent.split(/[ ·:]/)[0]).join(",") === "Speed,A-B,Repeat,Shuffle,Keyboard,Re-analyse,Models,Make,Light"
        && /body\.is-narrow \.file-strip-btns \{ display: none; \}/.test(html) && /body\.is-narrow \.file-strip-row \{ flex-wrap: nowrap; \}/.test(html),
        n.ids.morePanel.children.map((b) => b.textContent));
     ok("...there the panel is a DRAWER, closed until ☰ (open, it hid the transport and the subtitles: we_e2e N1)",
@@ -1515,7 +1539,8 @@ const section = (s) => console.log("\n=== " + s + " ===");
   section("WE-13 -- a page RELOADED (a new folder, D5; a reopened window) gets everything back on `ready`");
   {
     const w = runTranslatorWindow();
-    ok("the page says `ready` with the tab it is on", JSON.stringify(w.outbox) === JSON.stringify([{ type: "ready", view: "file" }]), w.outbox);
+    ok("the page says `ready` with the tab it is on (then update.check: 03/11, the update banner)",
+       JSON.stringify(w.outbox) === JSON.stringify([{ type: "ready", view: "file" }, { type: "update.check" }]), w.outbox);
     // the bridge's replay, in its order: the window, the state (seen before: fresh false), the cues, the subtitle file, the queue
     w.send({ type: "translatorWindow", shown: true, fullscreen: true });
     w.send(fileMsg({ jobId: 9, seq: 3, itemId: 12, phase: "analyzing", fresh: false, startMs: 61000, doneMs: 90000,
@@ -1577,14 +1602,17 @@ const section = (s) => console.log("\n=== " + s + " ===");
     const w = runTranslatorWindow({ noWebView: true });
     w.dispatchDoc("drop", { dataTransfer: { files: [{ name: "clip.mp4", type: "video/mp4" }, { name: "talk.mp3", type: "audio/mpeg" },
                                                       { name: "notes.txt", type: "text/plain" }] } });
-    ok("a drop in a plain browser goes to the MOCK bridge: a queue of two (not the .txt), the first loaded from an object URL",
+    ok("a drop in a plain browser goes to the MOCK bridge: a queue of two (not the .txt), the first loaded from an object URL -- "
+       + "and NOT translated by itself (U1)",
        w.ids.filePlayer.hidden === false && w.ids.queueList.children.length === 2 && w.ids.fileVideo.src === "blob:mock/clip.mp4"
-       && /^Loading the models/.test(w.ids.fileStatus.textContent), [w.ids.fileStatus.textContent, w.ids.fileVideo.src]);
+       && /^Not translated yet/.test(w.ids.fileStatus.textContent), [w.ids.fileStatus.textContent, w.ids.fileVideo.src]);
     metaOk(w.ids.fileVideo);
+    ok("...a plain player until asked: it plays at once", w.ids.fileVideo.paused === false);
+    w.ids.fileTranslate.click();
     w.pumpTimers(1300);
-    ok("...its 'analysis' lays subtitles AHEAD of the playhead: a green range, cues in the list, a badge -- and it plays when ready",
-       w.ids.seekRanges.children.length === 1 && rows(w).length >= 5 && /⟳/.test(w.ids.queueList.children[0].children[3].textContent)
-       && w.ids.fileVideo.paused === false, [w.ids.seekRanges.children.length, rows(w).length, w.ids.fileVideo.paused]);
+    ok("...Translate: its 'analysis' lays subtitles AHEAD of the playhead -- a green range, cues in the list, a badge",
+       w.ids.seekRanges.children.length === 1 && rows(w).length >= 5 && /⟳/.test(w.ids.queueList.children[0].children[3].textContent),
+       [w.ids.seekRanges.children.length, rows(w).length, w.ids.fileVideo.paused]);
     w.ids.tNext.click();
     ok("...Next plays the mock queue's next item (a sound: the <audio>)", w.ids.fileAudio.src === "blob:mock/talk.mp3", w.ids.fileAudio.src);
   }
@@ -1648,6 +1676,31 @@ const section = (s) => console.log("\n=== " + s + " ===");
 
   // ---- REVIEW RV-4 (23/10): the page's fix round -- its checks and sentinels live in test_rv4.js ----------------------------
   require("./test_rv4.js")({ ok, section, runTranslatorWindow, fileMsg, metaOk, last, countType, html, script, P, MARKUP_SINK, codeOnly });
+
+  // ---- P-CTX (25/10, the user on 1.0.0): the right-click menu + full screen's idle LOGIC -- checks and sentinels in test_pctx.js ----
+  require("./test_pctx.js")({ ok, section, runTranslatorWindow, fileMsg, metaOk, html, script });
+
+  // ---- THE FREEZE WATCH (25/10, his full-screen report, not reproduced): the page reports its own freezes -- test_freeze.js ----
+  require("./test_freeze.js")({ ok, section, runTranslatorWindow, fileMsg, metaOk, script });
+
+  // ---- 1.1.0 THE NATIVE VIDEO ENGINE (26/10, N2): mpv under the page -- the media backend, its clock, its fallbacks -- test_native.js ----
+  require("./test_native.js")({ ok, section, runTranslatorWindow, fileMsg, metaOk, script, html, P });
+
+  // ---- U1 (02/11/2026, the user's own requests): Translate is a button, Translate all, Translate Live, the pair beside
+  //      Translate, one model, "日本語 (Japanese)", the lockup -- checks and sentinels in test_u1.js ----
+  require("./test_u1.js")({ ok, section, runTranslatorWindow, fileMsg, cueMsg, metaOk, ovLines, last, countType, qMsg, qItem, html, script,
+                            MARKUP_SINK, codeOnly, bridgeSrc, playerSrc });
+
+  // ---- U2 (02/11/2026, "Import model…"): the user's own models -- the models button and its menu, no path from the page, the
+  //      node beside the pair, "Model changed since this analysis" -- checks and sentinels in test_u2.js ----
+  require("./test_u2.js")({ ok, section, runTranslatorWindow, fileMsg, cueMsg, metaOk, html, script, MARKUP_SINK, codeOnly, bridgeSrc });
+  // ---- U3 (02/11/2026, the TRANSCRIPTION -- docs/PROGRESS_U3.md): the Transcribe slot, Transcribe all and the second badge, the
+  //      Transcript tab (a click plays, a click on a name renames), the Export menu's two Word files -- checks and sentinels in test_u3.js
+  require("./test_u3.js")({ ok, section, runTranslatorWindow, fileMsg, metaOk, qMsg, qItem, html, script, MARKUP_SINK, codeOnly, bridgeSrc });
+
+  // ---- THE UPDATE BANNER (03/11/2026): the banner, the Updates dialog, the opt-out -- checks and sentinels in
+  //      test_upd.js (also runnable alone: node tests\web\test_upd.js)
+  require("./test_upd.js")({ ok, section, runTranslatorWindow, html, script, bridgeSrc, fileMsg, metaOk });
 
   // ---- 7. MUTATION SENTINELS: each guard removed must be CAUGHT ---------------------------------
   section("WC + WE -- mutation sentinels (index.html with one guard removed each)");

@@ -8,6 +8,47 @@
 // ("# AudioPB player v1"...): the first-run import copies AudioPB's files byte for byte.
 // FIX ROUND 2026-10-23 (review RV4-1, SPLIT_PLAN ADDENDUM 2): Session.userSub + acceptSubGet / userSubFile -- the
 // page's AUTOMATIC subtitle choice never replaces one the viewer made for the item.
+// SUVTITLE LIVE (1.1.0, 2026-10-25 -- docs/LIVE_PLAN.md section 2, the study section 2.8): THE LIVE GATE (setLive, live_,
+// Job::liveHit, the phase "live"): no FILE while the live mode listens, the running jobs cancelled when it starts (their
+// vouched part kept), the current item resumed with `have` when it stops, never `failed` because of it. Proved by
+// tests/cpp/player_smoke.cpp [18].
+// U1 (1.1.0, 02/11/2026 -- the user: "on ne lancera pas automatiquement la traduction au chargement d'une video"; docs/
+// PROGRESS_U1.md): NOTHING IS ANALYSED UNLESS ASKED. The global translation switch (translate_) is gone: a file is analysed
+// when it is WANTED -- the viewer's press of Translate (Session::wanted: THIS file, while it plays) or "Translate all" (batchQ_:
+// every file of the queue not complete yet, one FILE job at a time, in LIST order, the playing one first). Loading a file
+// reads its cache and SHOWS it (complete or partial) and starts nothing; there is no pre-analysis of the next items any more
+// (only the batch analyses files that are not playing). The live gate holds the batch too (resumed after). Badges gain
+// "queued" and "cancelled". player.txt's 1.0.x `OPT translate` is still parsed and IGNORED (never written again).
+// U2 (1.1.0, 02/11/2026 -- "Import model..."; docs/PROGRESS_U2.md): THE USER'S OWN MODELS. setModels() = the models the next
+// analyses run on (an imported model's path + identity per half, {} = the default); a CueSet remembers its models, its FILE
+// names them, its cache key carries their tag ONLY when one is imported (the defaults' keys are the pre-U2 keys); an FDONE error
+// of an imported model (TrPipe.h fileModelErrKind) sends THAT kind back to the default and tells the host (Host::modelFailed).
+// And the user's rule for CANCEL ALL: only what "Translate all" launched (cancelAll).
+// U3 (1.1.0, 02/11/2026 -- the user: "un deuxieme bouton pour la Transcription", "un fichier propre utilisable par des
+// transcripteurs professionnels"; docs/PROGRESS_U3.md): THE TRANSCRIPT. Translate and Transcribe are two WISHES on ONE
+// analysis (whisper runs once whatever is pressed): the analysis runs while either wants it (analysisWanted), each has its own
+// Cancel (cancel / transcriptCancel: cancelling one never stops the other's work), and "Transcribe all" (tbatchQ_) is the
+// twin of "Translate all". A transcript = the analysis' original text (TrTranscript.h pieces) + the VOICE PASS (FVOICE, a job
+// of the engine's one slot -- Job::voice, Session::vwire) run on the COMPLETE analysis; its result is the CueSet's `voices`
+// (<cache>\<key>.voices: the speakers, the user's names, the Word file written). At its completion the Word file is written
+// next to the media (Host::writeTranscript; Q2), by Re-transcribe, and by Transcribe all when missing or older and still
+// ours -- never silently on a rename or an edit ("older" in the post). Speakers are renamed here (renameSpeaker: every
+// speaker sharing the name; the same name twice = one person). Stamps: the file's SOURCE timecode when it carries one
+// (Host::probeTimecode on a worker -> onTimecode; SourceTimecode.h), else file-relative. The page gets translatorTranscript
+// (coalesced) and translatorFile.transcribe / tphase / tpct; the rows a second badge (tstate / tpct).
+// U2b (1.1.0, 02/11/2026 -- docs/PROGRESS_U2b.md): THE BATCH'S ONE RETRY -- a file "Translate all" / "Transcribe all" asked for whose
+// IMPORTED model failed is redone ONCE with the default model (redone_; translatorFile.redo, the rows' `redo`), a single press keeps
+// U2's rule; the host's notice naming the failing model ONCE (Host::modelFailed's `say`); the models the running jobs use
+// (modelsInUse, Host::modelsInUseChanged: a model in use cannot be removed). G2 (the user's answer): a rename -- or a subtitle
+// edit -- rewrites the transcript's Word file IN PLACE by itself while it is SuVtitle's and unchanged (docxSoon / flushDocxDue,
+// Host::rewriteTranscript; coalesced, never lost); "open in another program" said (docxErr) and retried by the next change.
+// FX (1.1.0, 02/11/2026 -- the adversarial review's fix round, docs/PROGRESS_FIX.md): F1 the stamps' timecode is the one this run
+// READ, else the one the Word file was written with (stampTc; its record's DOCXTC) -- an unknown or failed read never makes a
+// Word file "older"; F2 the user's rule, ONE Word file per media AND sound track: another analysis of the same track (another
+// pair or model) never writes it (docxState "other", Host::docxWriter); F4 a refusal of the Word file written before is said with
+// "older" (docxErr), never as a refusing folder; F5 a row says "redone" once the redo STARTED (redoRan_); F6 each row says where
+// its Word file is, or why there is none (`tdoc`), and Transcribe all counts them in ONE notice; F7 the rows say which ones a
+// batch has (`batch`: what Cancel all acts on); F8 a rename names a speaker of the numbering it was typed against (CueSet::vrev).
 // --- the original header follows; read "the tray" as SuVtitle.exe and "the helper" as SuVtitleEngine.exe ---
 //
 // THE PLAYER'S CORE. The user (11/10): watch a film after a SHORT load while the translation stays
@@ -73,6 +114,7 @@
 #include "TrFileStore.h"
 #include "JsonW.h"
 #include "MediaTracks.h"   // WH: the film's own tracks (probe + embedded subtitle extraction, on workers)
+#include "TrTranscript.h"  // U3: the transcript (pieces, speakers, turns; SourceTimecode.h's stamps)
 
 #pragma comment(lib, "shlwapi.lib")
 
@@ -85,7 +127,8 @@ const wchar_t* const kMediaHostSuffix = L".suvtitle-media.example";
 const wchar_t* const kProxyHost       = L"suvtitle-proxy.example";
 constexpr size_t   kQueueMax      = 2000;     // items in the queue
 constexpr size_t   kMapMax        = 16;       // folders mapped per page load (measured: STEP0 M7)
-constexpr size_t   kPreAhead      = 2;        // items pre-analysed ahead of the current one (D14)
+                                              // (U1: kPreAhead went with the pre-analysis -- only "Translate all" analyses
+                                              //  a file that is not playing)
 constexpr size_t   kCueChunk      = 500;      // cues per bulk message
 constexpr uint64_t kCheckpointMs  = 120000;   // a running job's partial result is saved this often
 constexpr uint64_t kQueueSaveMs   = 2000;     // queue edits are written after this much quiet
@@ -105,10 +148,35 @@ constexpr size_t   kAudioPickKeep = 500;      // the user's sound-track choices 
 constexpr uint64_t kAudioSaveMs   = 2000;     // ...written this long after the last change
 constexpr size_t   kSubLruKeep    = 8;        // embedded subtitle extractions kept in memory (D7)
 constexpr size_t   kSubChunk      = 1000;     // cues per playerSubs message (= bridge.cpp kTrSubChunk)
+// U3: the transcript
+constexpr uint64_t kTranscriptGrowMs = 2000;  // a transcript that GROWS (an analysis running) is posted at most this often
+constexpr uint64_t kDocxRenameMs  = 1000;     // U2b (G2): a rename's (or an edit's) Word file rewrite: this long after the LAST one
+constexpr size_t   kTcKeep        = 64;       // source timecodes remembered per tray run (by mediaKey)
+constexpr uint64_t kTcWaitMs      = 3000;     // a batch file's Word file waits at most this long for its timecode
+constexpr size_t   kTurnsPostMax  = 6000;     // turns in one translatorTranscript (a longer one says `cut`)
+constexpr int      kUnmatchedSuggestPct = 10; // more of the speech than this unheard by the voice pass: Re-transcribe suggested
+constexpr uint64_t kDocxWatchSlowMs = 250;    // FX2-B: a watch read of the playing file's Word file this slow stops that watch
 
 inline std::wstring w16(const std::string& s) { return pbtrf::fromUtf8(s); }
 inline std::string  u8(const std::wstring& w) { return pbtrf::toUtf8(w); }
 inline std::wstring lowerW(const std::wstring& s) { return pbtrf::lowerW(s); }
+
+// FX2-B (03/11/2026, docs/PROGRESS_FX2.md): a path's FORM, for Host::onNetwork -- a UNC path ("\\server\share\...", or the long
+// "\\?\UNC\server\share\...", either slash), never the long-path prefix "\\?\C:\..." nor the device namespace "\\.\..."; and the
+// drive letter a path names ("C:\...", "\\?\C:\...", "\\.\C:\..."; 0 = none)
+inline bool slashW(wchar_t c) { return c == L'\\' || c == L'/'; }
+inline bool uncPath(const std::wstring& p) {
+    if (p.size() < 3 || !slashW(p[0]) || !slashW(p[1])) return false;
+    if (p.size() >= 4 && (p[2] == L'?' || p[2] == L'.') && slashW(p[3]))       // a prefix, not a server
+        return p[2] == L'?' && p.size() >= 8 && (p[4] | 0x20) == L'u' && (p[5] | 0x20) == L'n' && (p[6] | 0x20) == L'c' && slashW(p[7]);
+    return true;
+}
+inline wchar_t driveOf(const std::wstring& p) {
+    const size_t at = p.size() >= 4 && slashW(p[0]) && slashW(p[1]) && (p[2] == L'?' || p[2] == L'.') && slashW(p[3]) ? 4 : 0;
+    if (p.size() < at + 2 || p[at + 1] != L':') return 0;
+    const wchar_t c = p[at];
+    return (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') ? c : 0;
+}
 
 // ===========================================================================
 // 1. THE RANGE RULES (pure). The page has twins of focusTarget/leadAt/coveredToEnd/readyAt
@@ -236,8 +304,8 @@ inline void parseResume(const std::string& text, std::map<std::string, ResumeEnt
 
 // The queue file (%APPDATA%\SuVtitle\player.txt). Torn (no END, or a count that disagrees) = an
 // empty queue, never half of one.
+// (U1: a 1.0.x file's `OPT translate` line -- the old global switch -- is read and ignored; it is never written again.)
 struct QueueFile {
-    bool translate = true;
     Repeat repeat = Repeat::Off;
     bool shuffle = false;
     long long cur = -1;
@@ -247,7 +315,6 @@ struct QueueFile {
 };
 inline std::string packQueue(const QueueFile& q) {
     std::string o = "# AudioPB player v1\n";
-    o += std::string("OPT\ttranslate\t") + (q.translate ? "1" : "0") + "\n";
     o += std::string("OPT\trepeat\t") + repeatName(q.repeat) + "\n";
     o += std::string("OPT\tshuffle\t") + (q.shuffle ? "1" : "0") + "\n";
     o += "CUR\t" + std::to_string(q.cur) + "\n";
@@ -277,7 +344,7 @@ inline bool parseQueue(const std::string& text, QueueFile& q) {
         if (end) return false;
         const std::vector<std::string> t = tp::split(line);
         if (t[0] == "OPT" && t.size() >= 3) {
-            if (t[1] == "translate") q.translate = t[2] == "1";
+            if (t[1] == "translate") { /* U1: 1.0.x's global switch -- read, ignored (nothing starts by itself) */ }
             else if (t[1] == "repeat") q.repeat = repeatFrom(t[2]);
             else if (t[1] == "shuffle") q.shuffle = t[2] == "1";
         } else if (t[0] == "CUR" && t.size() >= 2) {
@@ -483,16 +550,43 @@ struct CueSet {
     tp::AudioSel audio;                                        // WH: the SOUND TRACK these cues are of (part of the key)
     bool         trackKnown = true;                            // WH: false = loaded from a record with no AUD line (made
                                                                // before WH; written back the same: never stamped as known)
+    // U2: the MODELS these cues are made with -- an imported model's path ("" = the default) for each half, and the key's
+    // model tag (pbtrf::modelsTag: "" when both are the defaults, the pre-U2 key). Its FILE names the paths.
+    std::string  asrPath, mtPath, models;
+    // U3: THE TRANSCRIPT of this analysis -- the voice pass' result, <cache>\<key>.voices (read once: voicesRead), or made by
+    // FVOICE: the speakers of its pieces, the user's names (NAME), the Word file written for it (DOCX). Kept through edits and
+    // a re-analysis (the new cues are named by overlap: TrTranscript.h speakersOf).
+    bool         voicesRead = false;
+    bool         hasVoices = false;
+    pbtrf::VoiceRec voices;
+    std::wstring tnote;                                        // the Word file could not be written: why (said once)
+    std::wstring docxErr;                                      // U2b (G2): its automatic rewrite failed -- why ("open in another
+                                                               // program"); cleared by the next one that lands, or a Save
+    // FX (F8): the NUMBERING of its speakers -- bumped each time a voice pass' result REPLACES its voices (a pass that could not run
+    // leaves no names: nothing to rename); a rename keeps it. A rename names a speaker of the numbering it was typed against
+    // (translatorTranscript.vrev).
+    uint64_t     vrev = 0;
+    // FX2-B (03/11/2026): its record's Word file is on the NETWORK (Host::onNetwork) -- asked where that path is SET (ensureVoices,
+    // writeDocx, transcriptSaved: docxPathSet), read by the 1 Hz watch, which never stats such a file
+    bool         docxRemote = false;
 };
 
 struct Job {
     uint64_t wire = 0;
     std::shared_ptr<CueSet> set;
-    bool     pre = false;              // a pre-analysis (not the current item's)
+    bool     pre = false;              // not the current item's: a job of "Translate all" (U1; it was the pre-analysis)
     uint32_t nextIdx = 0;              // the helper's next expected FCUE idx (dedupe)
     std::vector<tp::MsRange> lastProg; // the latest FPROG's ranges: vouched for by the NEXT message
     bool     cancelSent = false;
-    std::string phase = "loading";     // loading | analyzing
+    std::string phase = "loading";     // loading | analyzing (U3: voices)
+    bool     liveHit = false;          // SUVTITLE LIVE: it was running when the live gate closed (cancelled by it)
+    // U3: an FVOICE -- the transcript's VOICE PASS on the complete analysis `set` -- not a FILE. Its pieces as sent (FSPK's
+    // labels go with them in order), its FSPK, its progress.
+    bool     voice = false;
+    std::vector<tp::MsRange> vspans;
+    bool     spkGot = false;
+    tp::WireSpk spk;
+    uint64_t vdone = 0, vtotal = 0;
 };
 
 struct Session {
@@ -502,6 +596,7 @@ struct Session {
     std::string mediaKey;
     std::shared_ptr<CueSet> set;
     uint64_t wire = 0;                 // the job working on `set` for this session (0 = none)
+    bool     wanted = false;           // U1: the viewer pressed Translate for THIS file (it ends with the session)
     bool     cancelling = false, userCancelled = false, failed = false;
     std::wstring err;
     bool     autoplay = false, resumed = false;
@@ -527,6 +622,28 @@ struct Session {
     // subtitle, Load subtitles..., or a playerSubGet without `auto`. From then on the page's automatic choice is
     // ignored for this item (acceptSubGet). A new item = a new Session = no mark.
     bool     userSub = false;
+    // 1.1.0 (fix round, L6 -- DECIDED): the sound tracks as MPV lists them (MpvPlayer's audioList, offered by the bridge for
+    // THIS opening), the item's track list where MediaTracks has none (a container it does not read: AVI, TS, MPG, WMV,
+    // FLV...; or a probe that failed). mpvOrd = the track mpv plays (aid=auto's pick, or the one asked); tracksFromMpv =
+    // `tracks` IS mpv's list (adopted), never a MediaTracks one.
+    std::shared_ptr<const pbmedia::Info> mpvTracks;
+    int      mpvOrd = -1;
+    bool     tracksFromMpv = false;
+    bool     mpvFinal = false;                // mpv's choice of track is final (its first restart), or it let the item go
+    // U3: THE TRANSCRIPT's wish for THIS file (the viewer pressed Transcribe; it ends with the session, like `wanted`), the
+    // voice job working on `set` for it (0 = none), its own cancelled / failed marks (Transcribe's Cancel: never Translate's),
+    // and a Re-transcribe waiting for the engine (the voice pass runs again although the transcript has voices)
+    bool     twanted = false;
+    uint64_t vwire = 0;
+    bool     tUserCancelled = false, tFailed = false, tForce = false;
+    std::wstring terr;
+    // U2b: a batch ("Translate all" / "Transcribe all") REDOES this file with the default model -- its imported model failed:
+    // the strip says it (translatorFile.redo, the whole sentence; "" = not redone). Cleared by the viewer's own press.
+    std::wstring redo;
+    // FX2-B (03/11/2026): the media is on the NETWORK (Host::onNetwork, asked at the load) -- its Word file is never watched; and
+    // the Word file (analysis key + path) whose watch read was SLOW (>= kDocxWatchSlowMs): not watched again until the next load
+    bool         mediaRemote = false;
+    std::string  watchSlowKey, watchSlowPath;
 };
 
 // Everything the core cannot do itself. bridge.cpp implements it; player_smoke.cpp fakes it.
@@ -578,6 +695,69 @@ public:
     // time
     virtual uint64_t nowMs() = 0;
     virtual uint64_t epochSec() = 0;
+    // 1.1.0 (fix round, L2): the native video engine (mpv) plays the CURRENT item -- or is about to: its opening is asked
+    // right after the core loads it. Then the SOUND COPY (FPROXY) is never asked: it exists for the page's own <video>
+    // only (an item that falls back asks for it then: Player::mpvDropped). Not pure: a host without the engine (the
+    // smoke's) answers false, as before 1.1.0.
+    virtual bool mpvPlays() { return false; }
+    // U2: an analysis ended because an IMPORTED model failed (missing, wrong kind, would not load: TrPipe.h
+    // fileModelErrKind) -- `kind` "asr" | "mt", `path` the model, `sentence` the engine's words; the core has ALREADY gone
+    // back to the default for that kind (when it still was the choice). The host persists it and updates the menu. Never
+    // calls the core. U2b (02/11/2026): `say` = the host says it in ONE notice -- only when THIS failure made the choice fall
+    // back (a second job failing on a model that is no longer chosen says nothing again: the message ONCE, not once per file),
+    // and the strip does not say it (a file not on screen, or one a batch redoes at once: the strip then shows the redo);
+    // `redone` = the name of the file a batch redoes with the default model ("" = none).
+    virtual void modelFailed(const std::string& kind, const std::string& path, const std::wstring& sentence, bool say,
+                             const std::wstring& redone) {
+        (void)kind; (void)path; (void)sentence; (void)say; (void)redone;
+    }
+    // U2b: the imported models the analyses use NOW changed (a FILE job naming one started, or ended): the host's menu disables the
+    // "x" (remove) of a model in use (its removal is refused meanwhile: modelInUse). Never calls the core back.
+    virtual void modelsInUseChanged() {}
+    // ---- U3: THE TRANSCRIPT (no-op defaults: a host without it -- an older fake -- answers "nothing") -----------------
+    // the voice pass (TranslatorManager::startVoice: exactly one FDONE per FVOICE, FSPK before an FDONE ok)
+    virtual void sendVoice(const tp::WireVoice& v) { (void)v; }
+    // <cache>\<key>.voices (TrFileStore.h; key = the analysis' cache key): read whole / its head only (the badges) / written
+    virtual bool readVoices(const std::string& key, pbtrf::VoiceRec& v) { (void)key; (void)v; return false; }
+    virtual bool peekVoices(const std::string& key, pbtrf::VoiceRec& v) { (void)key; (void)v; return false; }
+    virtual void writeVoices(const std::string& key, const pbtrf::VoiceRec& v) { (void)key; (void)v; }
+    // The transcript's Word file for `set` (the media's folder; TrFileStore.h transcriptCandidates / chooseTranscriptPath: never
+    // over a file that is not ours for this media; `t.prefer`, still ours, is replaced in place; a folder that refuses ->
+    // Documents\SuVtitle Transcripts outside a test instance). Returns its path and identity as written ("" = not written,
+    // `note` says why).
+    virtual std::wstring writeTranscript(const CueSet& set, const pbtrs::TranscriptOut& t, std::wstring& note,
+                                         uint64_t& size, uint64_t& mtime) {
+        (void)set; (void)t; (void)size; (void)mtime;
+        note = L"The Word file cannot be written here.";
+        return std::wstring();
+    }
+    // The file's SOURCE timecode (SourceTimecode.h readFileTimecode), on a WORKER -> Player::onTimecode(req, tc).
+    virtual void probeTimecode(uint64_t req, const std::wstring& path) { (void)req; (void)path; }
+    // U2b (G2, the user's answer 02/11): the Word file written for this transcript REWRITTEN IN PLACE -- `t.prefer`, only while
+    // it is still OURS for this media (the registry); never a new name, never another folder. True = written (its identity
+    // as written). False = not written: `why` says it in one sentence ("open in another program" -- the next change retries),
+    // or is empty when the file is simply not SuVtitle's to touch any more (nothing said).
+    virtual bool rewriteTranscript(const CueSet& set, const pbtrs::TranscriptOut& t, std::wstring& why, uint64_t& size,
+                                   uint64_t& mtime) {
+        (void)set; (void)t; (void)size; (void)mtime;
+        why.clear();
+        return false;
+    }
+    // FX (F2, the user's rule 02/11: ONE Word file per media AND sound track): WHICH analysis' transcript a Word file holds now, as
+    // the registry says -- `path` given: the entry for THAT file; `path` empty: this set's SOUND TRACK's Word file (the newest one
+    // SuVtitle wrote for this media and track that is still there). Its analysis key; "" = none known (a host without the registry).
+    virtual std::string docxWriter(const CueSet& set, const std::wstring& path) { (void)set; (void)path; return std::string(); }
+    // FX2-B (03/11/2026, docs/PROGRESS_FX2.md): is this path on the NETWORK? -- a UNC path (uncPath) or a drive letter whose type is
+    // remote (a mapped letter: GetDriveTypeW, the redirector's own answer, no round trip to the share). The core never stats such
+    // a file once a second (a share that drops blocks a stat up to the SMB timeout, on the UI thread) -- asked where a path is SET
+    // (the load, the record's Word file), never in a tick. The bridge's host keeps this default; a test host says it per path.
+    virtual bool onNetwork(const std::wstring& path) {
+        if (uncPath(path)) return true;
+        const wchar_t d = driveOf(path);
+        if (!d) return false;
+        const wchar_t root[4] = { d, L':', L'\\', 0 };
+        return ::GetDriveTypeW(root) == DRIVE_REMOTE;
+    }
 };
 
 class Player {
@@ -589,7 +769,7 @@ public:
     void setPair(const std::string& a, const std::string& b, const std::string& mode) {
         if (a == langA_ && b == langB_ && mode == mode_) return;
         langA_ = a; langB_ = b; mode_ = mode;
-        cancelPre();                   // a pre-analysis for the old pair is not what the user will want
+        cancelPre();                   // a batch job for the old pair stops: "Translate all" goes on in the new one (U1)
         refreshSummaries();
         schedule();
         flush();
@@ -603,6 +783,58 @@ public:
         schedule();
         flush();
     }
+    // U2 ("Import model..."): the MODELS the next analyses run on -- each an imported model's absolute path and its identity
+    // (pbtrf::modelIdent), or {"", ""} = SuVtitle's default. Like a quality change: the batch's job re-starts on the new choice,
+    // the summaries (badges) follow the new keys; the playing file's set stays on screen, said "made with another model"
+    // (translatorFile.modelsStale) until Translate / Re-analyse asks for the new one.
+    struct ModelPick {
+        std::string path, ident;
+        bool operator==(const ModelPick& o) const { return path == o.path && ident == o.ident; }
+    };
+    void setModels(const ModelPick& asr, const ModelPick& mt) {
+        const ModelPick a = asr.path.empty() ? ModelPick{} : asr, m = mt.path.empty() ? ModelPick{} : mt;
+        if (a == asrPick_ && m == mtPick_) return;
+        asrPick_ = a;
+        mtPick_ = m;
+        modelsTag_ = pbtrf::modelsTag(a.ident, m.ident);
+        cancelPre();
+        refreshSummaries();
+        stateDirty_ = true;
+        queueDirty_ = true;
+        schedule();
+        flush();
+    }
+    const ModelPick& asrModel() const { return asrPick_; }
+    const ModelPick& mtModel() const { return mtPick_; }
+    const std::string& modelsTag() const { return modelsTag_; }
+    // U2b: the imported models an analysis USES now -- every FILE job still in jobs_ (running, or cancelled with its FDONE still
+    // owed: the engine may still have it in hand), never a voice pass (it loads no whisper / GGUF model). A model in use cannot
+    // be removed (the bridge's double guard behind the page's disabled "x").
+    std::vector<std::string> modelsInUse() const {
+        std::vector<std::string> v;
+        auto add = [&](const std::string& p) {
+            if (p.empty()) return;
+            for (const auto& x : v) if (sameModelPath(x, p)) return;
+            v.push_back(p);
+        };
+        for (const Job& j : jobs_) if (!j.voice) { add(j.set->asrPath); add(j.set->mtPath); }
+        return v;
+    }
+    bool modelInUse(const std::string& path) const {
+        for (const auto& p : modelsInUse()) if (sameModelPath(p, path)) return true;
+        return false;
+    }
+    // (Windows compares file names without case: ASCII letters folded, as AppConfig.h samePathCi does for app.txt)
+    static bool sameModelPath(const std::string& a, const std::string& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            char x = a[i], y = b[i];
+            if (x >= 'A' && x <= 'Z') x = static_cast<char>(x + 32);
+            if (y >= 'A' && y <= 'Z') y = static_cast<char>(y + 32);
+            if (x != y) return false;
+        }
+        return true;
+    }
     void setHelperAvailable(bool on) {
         if (on == helper_) return;
         helper_ = on;
@@ -612,6 +844,16 @@ public:
             std::vector<Job> js;
             js.swap(jobs_);
             for (Job& j : js) {
+                if (j.voice) {                               // U3: a voice pass: nothing to save, its transcript says why
+                    if (loaded_ && s_.vwire == j.wire) {
+                        s_.vwire = 0;
+                        s_.tFailed = true;
+                        s_.terr = L"The SuVtitle engine was stopped.";
+                        stateDirty_ = true;
+                        transcriptNow();
+                    }
+                    continue;
+                }
                 endJobSet(j, "error", true);
                 if (loaded_ && s_.wire == j.wire) {
                     s_.wire = 0;
@@ -626,10 +868,30 @@ public:
                 s_.proxyErr = L"the SuVtitle engine was stopped";
                 stateDirty_ = true;
             }
+            noteModelsInUse();                               // U2b: no job left, no model in use
         }
         schedule();
         flush();
     }
+
+    // ---- SUVTITLE LIVE (1.1.0): THE LIVE GATE -----------------------------------------------------------------------
+    // Live translation and a file analysis never run at the same time, and the live one wins (the user, 24/10: "on ne
+    // fait pas tourner les deux ensemble"). The bridge closes the gate while the app WANTS to listen or the engine SAYS it
+    // does (bridge.cpp), and opens it once both are over. Closed: no FILE leaves (ensureCurrentJob, schedule: "Translate
+    // all" too -- U1), every running job is cancelled -- its FDONE keeps its vouched part, the TRUSTED RANGES rule --
+    // and the strip says why (phase "live": a notice, not an error; the film plays with the subtitles already made).
+    // Opened: schedule() starts the current item again, its FILE carrying `have` = what is vouched -- nothing is
+    // analysed twice. A FILE that crossed the LIVE on the wire is refused by the engine with an FDONE "error": an FDONE
+    // received while the gate is closed, or for a job the gate cancelled, never marks anything failed (onDone).
+    void setLive(bool on) {
+        if (on == live_) return;
+        live_ = on;
+        if (on) for (Job& j : jobs_) { j.liveHit = true; cancelJob(j); }
+        stateDirty_ = true;
+        schedule();
+        flush();
+    }
+    bool live() const { return live_; }
 
     // ---- persistence ---------------------------------------------------------------------------------
     // WH: player-audio.txt -- the user's sound-track choices (before load(): the badges' keys depend on them)
@@ -638,7 +900,7 @@ public:
         parseResume(resumeText, resume_);
         QueueFile q;
         if (parseQueue(queueText, q)) {
-            translate_ = q.translate;
+            // (U1: a 1.0.x file's `OPT translate 1` starts nothing -- parseQueue reads it and drops it)
             repeat_ = q.repeat;
             shuffle_ = q.shuffle;
             items_.clear();
@@ -661,9 +923,9 @@ public:
     struct Known { uint64_t size = 0, mtime = 0; bool ok = false; };
     // Files to PLAY: inserted right after the current item, the first one starts now. A file already
     // in the queue is not added twice (dropping the same film again just plays it), nor a path given
-    // twice in one call.
-    void open(const std::vector<std::wstring>& paths, bool forceTranslate, const std::vector<Known>* known = nullptr) {
-        if (forceTranslate && !translate_) { translate_ = true; queueSaveDirty(); }
+    // twice in one call. U1: `analyseFirst` = the file that plays is WANTED at once, as if Translate were pressed on it
+    // (an "open and translate" door; the bridge passes false everywhere: a file opened is played, never analysed by itself).
+    void open(const std::vector<std::wstring>& paths, bool analyseFirst, const std::vector<Known>* known = nullptr) {
         // The FIRST of `paths` plays -- remembered by its ID, never its index: the files inserted right
         // after the current item shift every later index (review of WE, C2: the WRONG item played).
         uint64_t firstId = 0;
@@ -682,7 +944,7 @@ public:
             const size_t at = (cur_ == npos) ? items_.size() : cur_ + 1;
             if (insertItems(at, add) && !firstId) firstId = add.front().id;
         }
-        if (firstId) loadItem(indexOf(firstId), true, -1);
+        if (firstId) loadItem(indexOf(firstId), true, -1, analyseFirst);
         flush();
     }
     // Files to QUEUE: appended. Nothing loaded yet: the first becomes current, ready, not playing.
@@ -724,7 +986,7 @@ public:
             std::vector<Item> left;
             for (const auto& it : items_) {
                 if (it.id == keep) left.push_back(it);
-                else cancelPreFor(it);
+                else { cancelPreFor(it); forgetBatch(it.id); }
             }
             items_ = left;
             cur_ = keep ? 0 : npos;
@@ -739,25 +1001,8 @@ public:
         schedule();
         flush();
     }
-    void setTranslate(bool on, uint64_t ms) {
-        if (on == translate_) return;
-        translate_ = on;
-        queueSaveDirty();
-        if (!on) {
-            for (Job& j : jobs_) cancelJob(j);   // their partial results are saved on their FDONE
-        } else if (loaded_) {
-            s_.userCancelled = false;
-            s_.failed = false;
-            s_.err.clear();
-            if (ms) s_.lastPosMs = ms;
-            // WH: the user switched the sound while translation was off -- the analysis goes to what he HEARS now
-            if (s_.set && heardSel().ord != s_.set->audio.ord) retrack(heardSel());
-            else ensureCurrentJob(s_.lastPosMs);
-        }
-        stateDirty_ = queueDirty_ = true;
-        schedule();
-        flush();
-    }
+    // (U1: setTranslate -- 1.0.x's global On/Off -- is gone: playerSet{translate} is no longer read. A file is analysed when
+    //  Translate is pressed on it (analyse) or by "Translate all" (analyseAll), and stopped by Cancel / Cancel all.)
     void setRepeat(Repeat r) { if (r != repeat_) { repeat_ = r; queueChanged(); schedule(); } flush(); }
     void setShuffle(bool on) {
         if (on != shuffle_) { shuffle_ = on; if (on) reshuffle(); else order_.clear(); queueChanged(); schedule(); }
@@ -794,21 +1039,55 @@ public:
     }
 
     // ---- the strip's buttons ------------------------------------------------------------------------------
+    // TRANSLATE -- the press (U1: translatorFileAnalyse{force:false}) -- and the re-analyses. The playing file becomes
+    // WANTED (Session::wanted: this file only, while it plays); a cancelled or failed one is asked again.
     // force = discard what this file has (complete or partial) and analyse it all again; else resume
     // from the vouched ranges -- or load the cache of the pair running NOW (the "languages changed" case).
     void analyse(bool force) {
         if (!loaded_) return;
+        s_.wanted = true;
+        s_.redo.clear();                                     // (U2b: the viewer's own press -- a batch's redo is not said any more)
+        batchCancelled_.erase(s_.itemId);
+        if (s_.set) failedKeys_.erase(s_.set->key);
+        // U3: Translate pressed while the analysis already runs for the TRANSCRIPT (the same key): it JOINS it -- whisper runs
+        // once whatever is pressed
+        if (!force && transcribeWantedNow() && runningHeard()) { stateDirty_ = true; markItem(s_.itemId); schedule(); flush(); return; }
+        runAnalysis(force);
+    }
+    // U3: the press of Translate (analyse) and of Transcribe (transcribe) share this -- the analysis of the playing file, for
+    // whichever wish asked; its body is U1's analyse unchanged.
+    void runAnalysis(bool force) {
+        flushDocxDue();                                      // (U2b G2: a rename's Word file first -- its record before a new set reads it)
+        // THE PRESS on what is on screen (U1): no job, the set shown IS the heard track's in the pair running now, and it is
+        // not complete -- the job simply starts from what is vouched (ensureCurrentJob), with NO new generation: the
+        // subtitles already shown stay as they are (a cached partial, a cancelled run's part)
+        if (!force && !s_.wire && s_.set && !s_.set->complete && s_.set->key == heardKey()) {
+            s_.userCancelled = s_.failed = s_.cancelling = false;
+            s_.err.clear();
+            stateDirty_ = true;
+            markItem(s_.itemId);
+            ensureCurrentJob(s_.lastPosMs);
+            schedule();
+            flush();
+            return;
+        }
         // the set going away first writes an edit not saved yet (the 2 s rule had not come: review of WG #15)
         if (s_.set && s_.set->editDirty) saveEdits(*s_.set);
         if (s_.wire) { if (Job* j = job(s_.wire)) cancelJob(*j); s_.wire = 0; }
-        if (!translate_) { translate_ = true; queueSaveDirty(); }
         auto set = makeSet(s_.path, s_.name, s_.folder, s_.size, s_.mtime, heardSel());   // WH: the track HEARD now
         const auto keep = s_.set;
+        // U3: a voice pass running on another set (another pair, or a re-analysis: force) stops -- the engine's one slot
+        // goes to the analysis; one running on THIS analysis (a batch's, or the playing file's) goes on (adopted below)
+        if (s_.vwire) {
+            Job* vj = job(s_.vwire);
+            if (vj && (force || vj->set->key != set->key)) { cancelJob(*vj); s_.vwire = 0; }
+        }
         if (!force) {
             // resume what is held -- as a COPY of its vouched part: the job just cancelled may still say
             // a last word into the old set, and none of it must land in the one being shown
             if (keep && keep->key == set->key && !keep->complete) set = vouchedCopy(*keep);
-            else if (Job* pj = jobForKey(set->key)) set = pj->set;                 // a pre-analysis has it
+            else if (Job* pj = jobForKey(set->key)) set = pj->set;                 // a batch job has it
+            else if (Job* vj = voiceJobForKey(set->key)) set = vj->set;            // U3: its voice pass runs (a complete set)
             else loadCacheInto(*set);
         } else {
             set->hasVideo = keep ? keep->hasVideo : false;
@@ -823,11 +1102,194 @@ public:
         s_.err.clear();
         s_.autoplay = false;
         s_.startMs = s_.lastPosMs;
+        ensureVoices(*set);                                  // U3: the transcript of this analysis, if it has one
+        if (Job* vj = voiceJobForKey(set->key)) { vj->pre = false; s_.vwire = vj->wire; }
         if (Job* pj = jobForKey(set->key)) { pj->pre = false; s_.wire = pj->wire; }
         else ensureCurrentJob(s_.lastPosMs);
+        markItem(s_.itemId);
+        transcriptNow();
         postStateNow();
         postCuesNow();
         schedule();
+        flush();
+    }
+    // ---- U3: TRANSCRIBE (translatorTranscribe{force}) ---------------------------------------------------------------------
+    // The playing file's TRANSCRIPT is wished (Session::twanted: this file, while it plays). Its analysis first when it has
+    // none in the pair running now -- Translate's press path (runAnalysis), or JOINED when it already runs -- then the voice
+    // pass on the complete analysis (ensureCurrentVoice); its Word file at the end. force = RE-TRANSCRIBE: the voice pass again
+    // on the analysis kept (names carried over by time), then the Word file again. A transcript complete already: its Word
+    // file is (re)written when missing or older and still ours (Transcribe all's rule), nothing runs.
+    void transcribe(bool force) {
+        if (!loaded_) return;
+        s_.twanted = true;
+        s_.redo.clear();                                     // (U2b: the viewer's own press)
+        tbatchCancelled_.erase(s_.itemId);
+        s_.tUserCancelled = s_.tFailed = false;
+        s_.terr.clear();
+        if (s_.set) { tfailedKeys_.erase(s_.set->key); failedKeys_.erase(s_.set->key); }
+        const bool analysed = s_.set && s_.set->complete && s_.set->key == heardKey();
+        if (analysed) {
+            ensureVoices(*s_.set);
+            if (force || !s_.set->hasVoices) {
+                s_.tForce = force && s_.set->hasVoices;
+                if (s_.vwire) { if (Job* vj = job(s_.vwire)) { if (force) cancelJob(*vj); } if (force) s_.vwire = 0; }
+                ensureCurrentVoice();
+            } else {
+                docxIfNeeded(*s_.set);
+            }
+        } else if (!runningHeard()) {
+            s_.userCancelled = s_.failed = s_.cancelling = false;
+            s_.err.clear();
+            transcriptNow();                                 // (the tab: waiting / analysing, posted by runAnalysis)
+            runAnalysis(false);
+            return;
+        }
+        stateDirty_ = true;
+        transcriptNow();
+        markItem(s_.itemId);
+        schedule();
+        flush();
+    }
+    // TRANSCRIBE ALL (translatorTranscribeAll{quality}): every file of the list (not missing) is QUEUED unless this run already
+    // KNOWS its transcript complete with an up-to-date Word file; one job at a time (FILE or FVOICE), the playing file first,
+    // then the LIST's order; per file, at its turn, all its work: its analysis if incomplete, its voice pass if none, its Word
+    // file if missing or older (still ours) -- a file found complete and up to date leaves with nothing done (schedule).
+    void transcribeAll() {
+        for (const Item& it : items_) {
+            if (it.missing || knownTranscribed(it)) continue;
+            tbatchQ_.insert(it.id);
+            tbatchCancelled_.erase(it.id);
+            redone_.erase(it.id);                            // (U2b: asked again = a new batch: its one retry again)
+            redoRan_.erase(it.id);                           // (FX F5: and what its row says of it)
+            const std::string k = keyOf(it);
+            tfailedKeys_.erase(k);
+            failedKeys_.erase(k);
+        }
+        if (loaded_ && tbatchQ_.count(s_.itemId)) {
+            s_.tUserCancelled = s_.tFailed = false;
+            s_.terr.clear();
+            if (!s_.set || !s_.set->complete) { s_.userCancelled = s_.failed = false; s_.err.clear(); }
+            stateDirty_ = true;
+            transcriptNow();
+        }
+        queueDirty_ = true;
+        schedule();
+        flush();
+    }
+    // TRANSCRIBE's CANCEL (translatorTranscriptCancel{jobId}): the playing file's transcript wish ends -- its voice pass stops;
+    // its ANALYSIS goes on when Translate still wants it, else it is cancelled (its vouched part kept, FDONE). In "Transcribe
+    // all" the file is marked cancelled and the batch goes on. Never touches Translate's wish.
+    void transcriptCancel(uint64_t gen) {
+        if (!loaded_ || gen != s_.gen) return;
+        const bool queued = tbatchQ_.erase(s_.itemId) > 0;
+        if (!s_.twanted && !queued && !s_.vwire) return;
+        s_.twanted = false;
+        s_.tForce = false;
+        if (queued) tbatchCancelled_.insert(s_.itemId);
+        if (s_.vwire) { if (Job* vj = job(s_.vwire)) cancelJob(*vj); s_.vwire = 0; }
+        s_.tUserCancelled = true;
+        if (!wantedNow() && s_.wire) {                       // nobody wants the analysis any more
+            if (Job* j = job(s_.wire)) cancelJob(*j);
+            s_.cancelling = true;
+            s_.userCancelled = true;
+        }
+        stateDirty_ = true;
+        transcriptNow();
+        markItem(s_.itemId);
+        schedule();
+        flush();
+    }
+    // RENAME A SPEAKER (translatorSpeakerName{jobId, id, label, vrev}): the speaker's name for EVERY turn -- and for every speaker
+    // that shares its name now (two speakers given one name are one person: renaming that person renames both; "" sends each
+    // back to its own "Speaker <n>", which undoes a merge). Kept in the voices record (NAME lines); the Word file follows (U2b G2:
+    // docxSoon). False (nothing changed) when refused.
+    // FX (F8, the review 02/11): `gen` and `vrev` name the transcript the name was TYPED for (the page takes both when its field
+    // opens) -- another file, a re-analysis or a re-track (the generation), or a Re-transcribe that ended meanwhile and numbered
+    // the speakers again (vrev, the same generation): refused, said in one sentence; nobody else is renamed.
+    bool renameSpeaker(uint64_t gen, uint64_t vrev, uint32_t id, const std::string& label, std::wstring* why = nullptr) {
+        if (!loaded_ || !s_.set) return false;
+        if (gen != s_.gen || vrev != s_.set->vrev) {
+            if (why) *why = L"The speaker was not renamed: the transcript changed while the name was being typed.";
+            return false;
+        }
+        if (!s_.set->hasVoices || !s_.set->voices.on) return false;
+        pbtrf::VoiceRec& V = s_.set->voices;
+        if (id == 0 || id > V.speakers) return false;
+        std::string clean, err;
+        if (!pbtrs::nameOk(label, clean, err)) { if (why) *why = w16(err); transcriptNow(); flush(); return false; }
+        std::map<uint32_t, std::string> names(V.names.begin(), V.names.end());
+        const std::string was = pbtrs::foldName(pbtrs::speakerName(id, names));
+        for (uint32_t k = 1; k <= V.speakers; ++k) {
+            if (pbtrs::foldName(pbtrs::speakerName(k, names)) != was) continue;
+            if (clean.empty()) names.erase(k);
+            else names[k] = clean;
+        }
+        V.names.assign(names.begin(), names.end());
+        host_.writeVoices(s_.set->key, V);
+        docxSoon(s_.set);                                    // U2b (G2): its Word file follows, kDocxRenameMs after the LAST rename
+        transcriptNow();
+        flush();
+        return true;
+    }
+    // TRANSLATE ALL (U1 -- the user: "un bouton Transcription/Traduction qui le lance sur TOUS les fichiers de la liste";
+    // translatorFileAnalyseAll{quality}): every file of the queue that is not complete yet (and not missing) is QUEUED; they
+    // are analysed one after another -- one FILE job at a time, the playing file first, then in the LIST's order (schedule).
+    // Its failed and cancelled marks are cleared: asked again. A file whose cache record has not been read yet is queued too:
+    // the scheduler takes it out when it turns out complete. The live gate holds it all, as everything (resumed after).
+    void analyseAll() {
+        for (const Item& it : items_) {
+            if (it.missing || knownComplete(it)) continue;
+            batchQ_.insert(it.id);
+            batchCancelled_.erase(it.id);
+            failedKeys_.erase(keyOf(it));
+            redone_.erase(it.id);                            // (U2b: asked again = a new batch: its one retry again)
+            redoRan_.erase(it.id);                           // (FX F5: and what its row says of it)
+        }
+        if (loaded_ && batchQ_.count(s_.itemId)) {
+            s_.userCancelled = s_.failed = false;
+            s_.err.clear();
+            stateDirty_ = true;
+        }
+        queueDirty_ = true;
+        schedule();
+        flush();
+    }
+    // CANCEL ALL (U1, the queue panel; translatorFileCancelAll{}) -- U2, THE USER'S RULE (02/11): it cancels ONLY what the
+    // LIST launched ("Translate all"): the files still queued are marked cancelled, the batch's jobs for files not playing
+    // are cancelled (the vouched part of each is kept, FDONE) -- and the PLAYING file's job only when the batch launched it
+    // (queued, not pressed). A playing file the user PRESSED Translate on is the strip's Cancel's: its job goes on (it only
+    // leaves the batch, unmarked). Nothing starts again by itself.
+    void cancelAll() {
+        const bool curBatch = loaded_ && batchQ_.count(s_.itemId) > 0;
+        const bool curT = loaded_ && tbatchQ_.count(s_.itemId) > 0;      // U3: "Transcribe all" had it too
+        for (uint64_t id : batchQ_) batchCancelled_.insert(id);
+        batchQ_.clear();
+        for (uint64_t id : tbatchQ_) tbatchCancelled_.insert(id);        // U3: both batches, the same rule
+        tbatchQ_.clear();
+        for (Job& j : jobs_) if (j.pre) cancelJob(j);          // the batches' jobs (FILE and FVOICE) for files that are not playing
+        if (curBatch && s_.wanted) {
+            batchCancelled_.erase(s_.itemId);                   // pressed too: the press stands (the strip's Cancel stops it)
+        } else if (curBatch && s_.twanted) {
+            batchCancelled_.erase(s_.itemId);                   // U3: Transcribe pressed on it: that press keeps the analysis
+        } else if ((curBatch || (curT && !s_.wanted && !s_.twanted)) && (s_.wire || (s_.set && !s_.set->complete))) {
+            // launched by a batch (a complete file: nothing to stop)
+            if (s_.wire) {
+                if (Job* j = job(s_.wire)) cancelJob(*j);
+                s_.cancelling = true;
+            }
+            s_.userCancelled = true;
+            stateDirty_ = true;
+        }
+        // U3: the playing file's VOICE PASS, when only "Transcribe all" asked for it (a press of Transcribe keeps it)
+        if (curT && s_.twanted) {
+            tbatchCancelled_.erase(s_.itemId);
+        } else if (curT) {
+            if (s_.vwire) { if (Job* vj = job(s_.vwire)) cancelJob(*vj); s_.vwire = 0; }
+            s_.tUserCancelled = true;
+            stateDirty_ = true;
+            transcriptNow();
+        }
+        queueDirty_ = true;
         flush();
     }
     // ---- WG: THE SUBTITLE EDITOR (the user, 11/10: "editer le fichier sous-titre, en incluant modification du timing
@@ -860,16 +1322,41 @@ public:
         j.kv(L"edited", loaded_ && s_.set ? s_.set->edited : false);
         j.end();
         if (!windowBusy()) host_.postWindow(j.take());
-        if (ok) { stateDirty_ = true; flush(); }      // the strip says "edited"; the card's count follows
+        if (ok) {                                                   // the strip says "edited"; the card's count follows (U3: the
+            stateDirty_ = true;                                     // transcript too -- its Word file then follows it, U2b G2)
+            if (loaded_ && s_.set) docxSoon(s_.set);
+            transcriptNow();
+            flush();
+        }
         return ok;
     }
 
+    // CANCEL (the strip; translatorFileCancel{jobId}): the playing file's analysis stops -- its job (its vouched part is kept:
+    // FDONE), or (U1) the wish the live gate holds (phase "live": it will not start when Live stops). Its press is over; in
+    // "Translate all" it is marked cancelled and the batch goes on with the next file.
     void cancel(uint64_t gen) {
-        if (!loaded_ || gen != s_.gen || !s_.wire) return;
-        if (Job* j = job(s_.wire)) cancelJob(*j);
-        s_.cancelling = true;
+        if (!loaded_ || gen != s_.gen) return;
+        const bool queued = batchQ_.erase(s_.itemId) > 0;
+        if (!s_.wire && !s_.wanted && !queued) return;
+        s_.wanted = false;
+        if (queued) batchCancelled_.insert(s_.itemId);
+        // U3: the TRANSCRIPT still wants the analysis (Transcribe pressed, or "Transcribe all"): it goes on -- cancelling one
+        // wish never stops the other's work; only the translation's press is over
+        if (transcribeWantedNow()) {
+            stateDirty_ = true;
+            markItem(s_.itemId);
+            schedule();
+            flush();
+            return;
+        }
+        if (s_.wire) {
+            if (Job* j = job(s_.wire)) cancelJob(*j);
+            s_.cancelling = true;
+        }
         s_.userCancelled = true;
         stateDirty_ = true;
+        markItem(s_.itemId);
+        schedule();
         flush();
     }
     // Stop and unload the current item (its job is cancelled, its partial result kept). The queue stays.
@@ -885,7 +1372,37 @@ public:
     }
     void playFailed(uint64_t seq) {
         if (!loaded_ || seq != s_.seq) return;
+        if (host_.mpvPlays()) return;                  // 1.1.0 (L2): mpv plays it -- a stale <video> failure (the copy is the <video>'s)
         requestProxy();
+        flush();
+    }
+
+    // 1.1.0 (fix round, L6 -- DECIDED by the director, 26/10): the bridge offers MPV's sound-track list for the CURRENT
+    // opening (seq; at mpv's Tracks / Loaded). It becomes the item's list where MediaTracks has none -- a container it does not
+    // read (AVI, TS / M2TS, MPG / VOB, WMV, FLV, OGG...), or a probe that failed -- so the right-click menu, the CC panel and
+    // setAudio work as for a Matroska file, and the analysis follows the same ord (the engine maps ord exactly as MpvPlayer
+    // does). A MediaTracks list is NEVER overridden (a probe still running: its answer first). The analysis that already
+    // runs on the track aid=auto picked is NOT restarted: with no pick of the viewer's, the track heard IS mpv's choice.
+    // `info` = the list as the bridge built it from mpv (its strings capped there: the FILE's, untrusted; empty = mpv lists
+    // no sound track); mpvOrd = the track mpv plays now (-1 = none / not known yet); final = mpv's choice will not change
+    // by itself any more (its first restart).
+    void offerMpvTracks(uint64_t seq, std::shared_ptr<const pbmedia::Info> info, int mpvOrd, bool final) {
+        if (!loaded_ || !seq || s_.seq != seq || !info) return;
+        s_.mpvOrd = mpvOrd;
+        s_.mpvFinal = s_.mpvFinal || final;
+        if (!info->audio.empty()) s_.mpvTracks = std::move(info);
+        adoptMpvTracks();
+        mpvWaitDone();
+        flush();
+    }
+    // fix round (L2 / L3): mpv will not play this opening after all (it refused the file, the page gave up waiting, the
+    // engine went away): it is the page's <video>'s -- an item with NO URL has its sound copy asked now (none was while mpv
+    // was to play it: never an item left on "Preparing its sound..."), and a job held for mpv's track list starts.
+    void mpvDropped(uint64_t seq) {
+        if (!loaded_ || !seq || s_.seq != seq) return;
+        s_.mpvFinal = true;
+        mpvWaitDone();
+        if (s_.url.empty()) requestProxy();            // (asked once per item: requestProxy's own guard)
         flush();
     }
 
@@ -948,9 +1465,10 @@ public:
     }
     // playerSet{audioOrd: k[, auto: true]} -- the user chose a sound track in the page (persisted for this file), or the
     // page could not play the tray's choice and plays k instead (`autoPick`: the analysis follows what is HEARD, the
-    // choice is not the user's and is not kept). D5: with translation on, a track other than the analysed one starts a
-    // NEW GENERATION on it -- its own cache record, resumed from what it has; with translation off only what is heard
-    // changes (the analysis goes there when translation is turned back on).
+    // choice is not the user's and is not kept). D5: for a file being analysed (U1: WANTED), a track other than the analysed
+    // one starts a NEW GENERATION on it -- its own cache record, resumed from what it has. A file not being analysed (U1):
+    // the subtitles follow the sound only when that track HAS an analysis (it is shown; nothing starts) -- else the ones on
+    // screen stay, and Translate analyses the track heard.
     void setAudio(int ord, bool autoPick) {
         if (!loaded_ || s_.tracksState != "ready" || !s_.tracks || ord < 0 || static_cast<size_t>(ord) >= s_.tracks->audio.size()) return;
         if (proxied() && ord != 0) return;                     // (WHP-2: the proxy carries the first track only)
@@ -965,7 +1483,7 @@ public:
         }
         const bool moved = ord != s_.audioOrd;
         s_.audioOrd = ord;
-        if (translate_ && s_.set && s_.set->audio.ord != t.ord) retrack(heardSel());
+        if (s_.set && s_.set->audio.ord != t.ord && followsSound(heardSel())) retrack(heardSel());
         else if (moved) stateDirty_ = true;
         flush();
     }
@@ -1035,9 +1553,14 @@ public:
     void keepExtSub(uint64_t id, const std::vector<std::wstring>& chunks) {
         if (loaded_ && s_.extSubId == id) s_.extSubChunks = chunks;
     }
-    void notice(const std::wstring& text) {
+    // A sentence for the page's toast: an error by default (red); `info` = news, not a failure (FX2, 03/11/2026: Transcribe all's
+    // one notice) -- `info: true` on the wire, as the bridge's own postTranslatorFileNotice says it (the page also keeps a subtitle
+    // track the viewer waits for on an `info` notice). Held while the page reloads, flag and all.
+    void notice(const std::wstring& text, bool info = false) {
         JsonW j;
-        j.obj().kv(L"type", L"translatorFileNotice").kv(L"text", text).end();
+        j.obj().kv(L"type", L"translatorFileNotice").kv(L"text", text);
+        if (info) j.kv(L"info", true);
+        j.end();
         if (windowBusy()) { if (heldNotices_.size() < 8) heldNotices_.push_back(j.take()); return; }
         host_.postWindow(j.take());
     }
@@ -1071,6 +1594,7 @@ public:
         postCuesNow();
         for (const auto& c : s_.extSubChunks) host_.postWindow(c);
         queueDirty_ = true;
+        transcriptNow();                                     // U3: the Transcript tab's content
         flush();
     }
     void mainReady() { stateDirty_ = true; flush(); }   // the main page only needs the state (the card)
@@ -1082,6 +1606,14 @@ public:
         Job* j = job(p.jobId);
         if (!j) return;
         CueSet& S = *j->set;
+        if (j->voice) {                                      // U3: a voice pass' progress -- the analysis is not touched
+            j->phase = "voices";
+            j->vdone = p.doneMs;
+            if (p.totalMs) j->vtotal = p.totalMs;
+            if (loaded_ && s_.vwire == j->wire) { stateDirty_ = true; transcriptGrow(); }
+            else markKey(S.key);
+            return;
+        }
         j->phase = p.phase == "analyzing" ? "analyzing" : "loading";
         if (p.totalMs) S.totalMs = p.totalMs;
         if (!p.asrModel.empty()) S.asr = w16(p.asrModel);
@@ -1100,7 +1632,7 @@ public:
     }
     void onCue(const tp::WireCue& c) {
         Job* j = job(c.jobId);
-        if (!j) return;
+        if (!j || j->voice) return;                        // (U3: a voice pass sends no FCUE)
         if (c.idx < j->nextIdx) return;                    // a duplicate
         j->nextIdx = c.idx + 1;
         CueSet& S = *j->set;
@@ -1112,30 +1644,115 @@ public:
         S.spans[k.startMs] = k.endMs;
         S.dirty = true;
         markSrt(S);                                        // WG: the per-language files follow, within 30 s
-        if (isCurrent(*j)) postCue(k);
+        if (isCurrent(*j)) { postCue(k); transcriptGrow(); }   // (U3: the Transcript tab's text grows with it)
+    }
+    // U3: FSPK -- the voice pass' names, once, just before its FDONE ok: one label per piece SENT (0 = none heard).
+    void onSpk(const tp::WireSpk& s) {
+        Job* j = job(s.jobId);
+        if (!j || !j->voice) return;
+        if (s.speakers > 0 && s.labels.size() != j->vspans.size()) return;   // not this pass' pieces: no names from it
+        j->spk = s;
+        j->spkGot = true;
+    }
+    // U3: a file's SOURCE timecode (Host::probeTimecode's answer, from a worker): kept per media (kTcKeep), the stamps follow.
+    void onTimecode(uint64_t req, const pbtc::SourceTc& tc) {
+        const auto r = tcReqs_.find(req);
+        if (r == tcReqs_.end()) return;
+        const std::string mk = r->second;
+        tcReqs_.erase(r);
+        TcEntry& e = tcs_[mk];
+        e.known = true;
+        e.tc = tc;
+        trimTcs();
+        if (loaded_ && s_.mediaKey == mk) { stateDirty_ = true; transcriptNow(); }
+        schedule();
+        flush();
     }
     void onDone(const tp::WireFileDone& d, bool synthesized) {
         auto it = std::find_if(jobs_.begin(), jobs_.end(), [&](const Job& x) { return x.wire == d.jobId; });
         if (it == jobs_.end()) return;
         Job j = *it;
         jobs_.erase(it);
+        noteModelsInUse();                                   // U2b: the models it used are free again (the menu's x follows)
+        if (j.voice) { voiceDone(j, d); return; }           // U3: a voice pass ended
         if (!synthesized) j.set->confirmed = merged(j.set->confirmed, j.lastProg);   // the helper's own last word
         const bool current = loaded_ && s_.wire == j.wire;
         endJobSet(j, d.result, synthesized);
+        // SUVTITLE LIVE: an "error" the LIVE MODE caused -- received while the gate is closed, or for a job the gate
+        // cancelled (a FILE that crossed the LIVE on the wire) -- fails nothing: the item waits for the gate to open
+        const bool liveErr = live_ || j.liveHit;
+        const bool failed = d.result == "error" && !liveErr;
+        // U2: an IMPORTED model failed (TrPipe.h fileModelErrKind: missing, of the wrong kind, would not load) -- which kind, which
+        // file (a failure that is not an imported model's changes no choice)
+        std::string fellKind, fellPath;
+        if (failed) {
+            const std::string k = tp::fileModelErrKind(d.err);
+            if (k == "asr" && !j.set->asrPath.empty()) { fellKind = k; fellPath = j.set->asrPath; }
+            else if (k == "mt" && !j.set->mtPath.empty()) { fellKind = k; fellPath = j.set->mtPath; }
+        }
+        // U2b (02/11/2026, the user's rule): a file a BATCH asked for ("Translate all", "Transcribe all", or both: ONE analysis)
+        // whose imported model failed is REDONE ONCE with the default model -- it stays queued, no failed mark, and the default
+        // runs it next (its key then has no "\tm" tag: the normal cache first); a second failure of it is a normal failure
+        // (redone_). A single press (not in a batch) keeps U2's rule: the strip says it, no redo.
+        const std::vector<uint64_t> batchIds = fellKind.empty() ? std::vector<uint64_t>() : batchItemsOf(*j.set);
+        const bool redo = !batchIds.empty() && redoAllowed(fellKind, fellPath, batchIds);
         if (current) {
             s_.wire = 0;
             s_.cancelling = false;
-            if (d.result == "error") {
+            if (failed && !redo) {
                 s_.failed = true;
                 s_.err = d.err.empty() ? std::wstring(L"The analysis failed.") : w16(d.err);
+                s_.redo.clear();                             // (U2b: a redo that failed in its turn is a failure, said as one)
+                if (batchQ_.count(s_.itemId)) failedKeys_.insert(j.set->key);   // (U1: "Translate all" does not retry it)
+                if (tbatchQ_.count(s_.itemId)) tfailedKeys_.insert(j.set->key); // (U3: nor "Transcribe all")
             }
             stateDirty_ = true;
-        } else if (j.pre && d.result == "error") {
+            transcriptNow();                                 // U3: the transcript's text is complete (or stopped)
+        } else if (j.pre && failed && !redo) {
             failedKeys_.insert(j.set->key);
+            if (inTBatch(j.set->key)) tfailedKeys_.insert(j.set->key);
+        }
+        // U1: "Translate all" -- a file done (complete) or failed leaves the batch; a cancelled job's file stays queued (taken
+        // over by the playing file, a new pair: resumed later) unless Cancel / Cancel all said otherwise (U2b: a file the batch
+        // redoes stays queued too)
+        if (d.result == "ok" || (failed && !redo)) batchFinished(j.set->key, failed);
+        // U3: "Transcribe all" -- a file whose ANALYSIS failed leaves it too (its transcript cannot be made); one done stays
+        // queued: its voice pass is next (schedule)
+        if (failed && !redo) tbatchFinished(j.set->key, true);
+        // U2: that kind goes back to the default for what comes next, when it still is the choice (the user may have moved on
+        // since); the strip says so, the host persists it and updates the menu (Host::modelFailed, after this). The file's own
+        // failure stands (asked again: Translate); "Translate all" goes on with the next files, on the default.
+        bool fellBack = false;
+        if (!fellKind.empty()) {
+            ModelPick& pick = fellKind == "asr" ? asrPick_ : mtPick_;
+            if (pick.path == fellPath) {
+                pick = ModelPick{};
+                modelsTag_ = pbtrf::modelsTag(asrPick_.ident, mtPick_.ident);
+                refreshSummaries();
+                queueDirty_ = true;
+                fellBack = true;
+            }
+            if (current && !redo)
+                s_.err += fellKind == "asr" ? L" SuVtitle goes back to its own transcription model (large-v3-turbo)."
+                                            : L" SuVtitle goes back to its own translation model (Qwen3-4B).";
+        }
+        std::wstring redoneName;
+        if (redo) {
+            for (uint64_t id : batchIds) { redone_.insert(id); markItem(id); }   // (the rows say it: playerQueue / playerItem `redo`)
+            redoneName = j.set->name;
+            queueDirty_ = true;
+            if (current) {
+                // the PLAYING file: its analysis again at once, on the default (runAnalysis: a set of the default's key, its cache
+                // first) -- the strip says why, the engine's sentence whole in its tooltip (translatorFile.redo)
+                s_.redo = (d.err.empty() ? std::wstring() : w16(d.err) + L" ") + redoSentence(fellKind);
+                runAnalysis(false);
+            }
         }
         markKey(j.set->key);
         schedule();
         flush();
+        // the host's ONE notice: only when THIS failure made the choice fall back, and the strip does not say it
+        if (!fellKind.empty()) host_.modelFailed(fellKind, fellPath, w16(d.err), fellBack && (!current || redo), redoneName);
     }
     void onProxyDone(const tp::WireProxyDone& d) {
         if (!loaded_ || !s_.proxyReq || d.jobId != s_.proxyReq) return;
@@ -1171,6 +1788,14 @@ public:
             s_.probeWait = false;
             ensureCurrentJob(s_.lastPosMs);
         }
+        // U3: a source timecode that does not come (a sleeping disk, a slow share) holds a batch's Word file kTcWaitMs at most:
+        // it is then written with file-relative stamps (a late answer still updates the tab)
+        for (auto& kv : tcs_)
+            if (!kv.second.known && !kv.second.timedOut && now - kv.second.askedAt >= kTcWaitMs) kv.second.timedOut = true;
+        // U2b (G2): the Word file of a renamed (or edited) transcript, once the burst is over -- ONE write for many renames
+        if (docxDue_ && now >= docxDueAt_) flushDocxDue();
+        // FX2-A: the playing file's Word file, once a second -- deleted, re-created, edited in Word: the tab and the row follow
+        watchDocx();
         schedule();
         flush();
     }
@@ -1178,6 +1803,7 @@ public:
     // queue and the positions are written now.
     void shutdown() {
         flushFiles();
+        flushDocxDue();                                      // U2b (G2): the last rename never lost
         for (Job& j : jobs_) savePartial(*j.set);
         saveQueueNow();
         saveResumeNow();
@@ -1191,6 +1817,7 @@ public:
     // of positions were lost). Nothing is stopped: the session's end may still be cancelled.
     void persist() {
         flushFiles();
+        flushDocxDue();                                      // U2b (G2): the last rename never lost
         for (Job& j : jobs_) savePartial(*j.set);
         saveQueueNow();
         saveResumeNow();
@@ -1200,7 +1827,9 @@ public:
     // ---- read-only views (export, reveal, the bridge's own needs) -------------------------------------------
     bool loaded() const { return loaded_; }
     const Session& session() const { return s_; }
-    bool translate() const { return translate_; }
+    // U1: the playing file is being analysed or asked to be (the press, or "Translate all"); the batch's queued files
+    bool wanted() const { return wantedNow(); }
+    const std::set<uint64_t>& batchQueued() const { return batchQ_; }
     Repeat repeat() const { return repeat_; }
     bool shuffle() const { return shuffle_; }
     const std::vector<Item>& items() const { return items_; }
@@ -1209,20 +1838,100 @@ public:
     const std::string& quality() const { return quality_; }
     std::vector<uint64_t> playOrderIds() const { std::vector<uint64_t> v; for (size_t i : playOrder()) v.push_back(items_[i].id); return v; }
     const std::map<std::string, AudioPick>& audioPicks() const { return picks_; }   // WH (tests)
+    // U3: the transcript's wish for the playing file (the press, or "Transcribe all"); the files "Transcribe all" still has
+    bool transcribeWanted() const { return transcribeWantedNow(); }
+    const std::set<uint64_t>& tbatchQueued() const { return tbatchQ_; }
+    // U3: the playing file's transcript as the Word file would hold it NOW (the tab's Save .docx..., the Export menu's
+    // "Transcript (.docx)"): false when there is no text yet. A partial one (its analysis not complete) says so (partial).
+    // `prefer` = the Word file written for it, while still ours: the dialog offers that same file (it may replace it).
+    bool transcriptForSave(pbtrs::TranscriptOut& out) {
+        if (!loaded_ || !s_.set) return false;
+        out = transcriptOutOf(*s_.set);
+        if (out.turns.empty()) return false;
+        out.partial = !s_.set->complete;
+        out.doneMs = s_.set->complete ? s_.set->totalMs : tp::rangesTotal(merged(s_.set->confirmed));
+        return true;
+    }
+    // ...and the file the user saved through it (SuVtitle registered it as ours for this media): a COMPLETE transcript keeps
+    // it as its Word file (its identity and what it holds), so "older" is said against it from now on.
+    // FX (F1): `tc` = the timecode of the stamps the Save wrote (TranscriptOut.tc): kept with the file, as an automatic write does.
+    void transcriptSaved(const std::wstring& path, uint64_t size, uint64_t mtime, uint64_t sig, const pbtc::SourceTc& tc) {
+        if (!loaded_ || !s_.set || !s_.set->complete || !s_.set->hasVoices || path.empty()) return;
+        pbtrf::VoiceRec& V = s_.set->voices;
+        V.docxPath = u8(path); V.docxSize = size; V.docxMtime = mtime; V.docxSig = sig;
+        V.docxTc = voiceTcOf(tc);                            // (FX F1: what its stamps were made with)
+        docxPathSet(*s_.set);                                // (FX2-B: saved to a share?)
+        s_.set->tnote.clear();
+        s_.set->docxErr.clear();                             // (U2b G2: the Save wrote it -- a failed automatic update is over)
+        tdocWhy_.erase(s_.set->key);                         // (FX F6: its row has nothing to excuse any more)
+        vdocx_[s_.set->key] = V.docxPath;
+        docxSeen_.erase(s_.set->key);                        // (FX2: nor what it read of the file before -- saved over it, maybe)
+        host_.writeVoices(s_.set->key, V);
+        markKey(s_.set->key);
+        transcriptNow();
+        flush();
+    }
 
-    // Coalesced posts: the state and the queue at most once per call site.
+    // Coalesced posts: the state and the queue at most once per call site. (U3: the transcript at once when it CHANGED --
+    // a state, a name, an edit -- and at most every kTranscriptGrowMs while it only GROWS with the analysis.)
     void flush() {
         if (stateDirty_) postStateNow();
         if (queueDirty_) postQueueNow();
         for (uint64_t id : itemDirty_) postItem(id);
         itemDirty_.clear();
+        if (transcriptDirty_ && (transcriptUrgent_ || host_.nowMs() - transcriptPostedAt_ >= kTranscriptGrowMs)) postTranscriptNow();
+        // FX (F6): "Transcribe all" is over (nothing left in it) and some of its files have no up-to-date Word file next to them:
+        // ONE notice counts them -- each row says where its Word file is, or why there is none
+        if (!tdocMiss_.empty() && tbatchQ_.empty()) postTdocNotice();
     }
 
 private:
     Host& host_;
     // what the engine runs / what the user chose
     std::string langA_ = "en", langB_ = "zh", mode_ = "auto", quality_ = "auto";
-    bool translate_ = true, helper_ = false;
+    ModelPick asrPick_, mtPick_;       // U2: the models the next analyses run on ({} = the default)
+    std::string modelsTag_;            // ...their part of every cache key ("" = both defaults: the pre-U2 key)
+    bool helper_ = false;
+    bool live_ = false;                // SUVTITLE LIVE: the live gate (setLive) -- closed while the live mode listens
+    // U1: "Translate all" -- the files it still has to analyse (item ids; LIST order decides, the playing one first), and the
+    // ones whose analysis was cancelled (Cancel, Cancel all: the badge says so until they are asked again)
+    std::set<uint64_t> batchQ_, batchCancelled_;
+    // U3: "Transcribe all" -- its twin (item ids), the voice passes that failed this run (by analysis key), the source
+    // timecodes (by mediaKey: asked on a worker, kTcKeep kept), the transcript post's coalescing, the voices' peeks (badges)
+    std::set<uint64_t> tbatchQ_, tbatchCancelled_;
+    std::set<std::string> tfailedKeys_;
+    struct TcEntry { bool known = false, timedOut = false; pbtc::SourceTc tc; uint64_t askedAt = 0, req = 0; };
+    std::map<std::string, TcEntry> tcs_;
+    std::map<uint64_t, std::string> tcReqs_;
+    bool transcriptDirty_ = false, transcriptUrgent_ = false;
+    uint64_t transcriptPostedAt_ = 0;
+    std::map<std::string, int> vsummaries_;              // analysis key -> 0 none / 1 named / 2 no names (a head peek)
+    // U2b: the files a batch REDID with the default model after their imported model failed (item ids: once per file and batch;
+    // asked again by Translate all / Transcribe all = a new batch), the imported models the running jobs use (their signature),
+    // and G2's Word file rewrite waiting for the end of a burst of renames / edits (the set, and when)
+    std::set<uint64_t> redone_;
+    std::string inUseSig_;
+    std::shared_ptr<CueSet> docxDue_;
+    uint64_t docxDueAt_ = 0;
+    // FX (02/11/2026, docs/PROGRESS_FIX.md): what the rows say of a redo -- it STARTED, or ended (F5; `redone_` stays the grant: the
+    // once-per-press guard); each analysis' Word file as its record names it (F6: the head peek's DOCX, kept up to date by every
+    // write -- vsummaries_' twin); this run's reason when an analysis has no Word file next to it, or could not update it (F6); the
+    // analyses of "Transcribe all" whose Word file is not next to them (F6: its ONE notice, when nothing is left in it -- presses
+    // made while it runs add to the same list and the same notice)
+    std::set<uint64_t> redoRan_;
+    std::map<std::string, std::string> vdocx_;
+    std::map<std::string, std::wstring> tdocWhy_;
+    std::set<std::string> tdocMiss_;
+    // FX2 (03/11/2026, docs/PROGRESS_FX2.md): what the PLAYING file's row read of its analysis' Word file when it was another
+    // analysis' (n7) or gone (A4) -- kept for that row once the file stops playing (a row not playing never reads the disk):
+    // analysis key -> the reading. Forgotten by a reading back to normal (docxIdentity), by a write that lands (writeDocx) and by
+    // a Save (transcriptSaved) -- every change of an analysis' Word file goes through one of them, so no path is kept to compare
+    // (it could never differ).
+    std::map<std::string, std::string> docxSeen_;
+    // FX2-A (03/11/2026): the playing file's Word file as the last tick read it (watchDocx) -- its raw identity, with the analysis
+    // key and the path it was read for
+    struct DocxWatch { std::string key, path; bool there = false; uint64_t size = 0, mtime = 0; };
+    DocxWatch docxWatch_;
     Repeat repeat_ = Repeat::Off;
     bool shuffle_ = false;
     // the queue
@@ -1247,14 +1956,16 @@ private:
     // `ready` brings everything back (windowReady -> replay).
     bool windowBusy() const { return attached_ && !viewReady_; }
     // bookkeeping
-    std::set<std::string> failedKeys_;            // pre-analyses that failed this run (not retried)
+    std::set<std::string> failedKeys_;            // batch analyses that failed this run (not retried until asked again)
     std::map<std::string, pbtrf::Summary> summaries_;
     std::map<std::string, ResumeEntry> resume_;
     bool stateDirty_ = false, queueDirty_ = false, queueSave_ = false, resumeDirty_ = false;
     std::set<uint64_t> itemDirty_;
     uint64_t queueChangedAt_ = 0, resumeSavedAt_ = 0;
     // WH: the film's own tracks
-    struct ProbeEntry { std::string state; std::shared_ptr<const pbmedia::Info> info; uint64_t req = 0, seq = 0; };
+    // autoOrd (1.1.0 fix round, L6): for a list MPV gave, the track mpv chose by itself at its first opening in this run
+    // (aid=auto: the default flag, then the system's language) -- a later opening with no pick plays it again (chooseOrd)
+    struct ProbeEntry { std::string state; std::shared_ptr<const pbmedia::Info> info; uint64_t req = 0, seq = 0; int autoOrd = -1; };
     std::map<std::string, ProbeEntry> probes_;            // mediaKey -> its probe (kProbeKeep, the oldest go)
     uint64_t probeSeq_ = 0;
     std::map<uint64_t, std::string> probeReqs_;           // a probe in flight -> its mediaKey
@@ -1266,6 +1977,729 @@ private:
 
     uint64_t next() { return ++counter_; }
     uint64_t rand64() { rng_ ^= rng_ << 13; rng_ ^= rng_ >> 7; rng_ ^= rng_ << 17; return rng_; }
+
+    // ---- U1: WHAT IS ASKED FOR ----------------------------------------------------------------------------------------
+    // The playing file is analysed only when it is WANTED: Translate pressed on it, or queued by "Translate all".
+    bool wantedNow() const { return loaded_ && (s_.wanted || batchQ_.count(s_.itemId) > 0); }
+    // The cache key of the playing file's analysis of the sound track HEARD, in the pair (and quality) running now.
+    std::string heardKey() const {
+        return pbtrf::cacheKey(s_.path, s_.size, s_.mtime, langA_, langB_, mode_, quality_, heardSel().ord, modelsTag_);
+    }
+    // Complete as far as this run already KNOWS (the playing file's set, or a summary already read): never a disk read --
+    // "Translate all" over 2000 files must not read 2000 records on the UI thread (the scheduler reads them one at a time).
+    bool knownComplete(const Item& it) const {
+        if (loaded_ && s_.itemId == it.id && s_.set) return s_.set->complete;
+        const auto f = summaries_.find(keyOf(it));
+        return f != summaries_.end() && f->second.ok && f->second.complete;
+    }
+    // Does the playing file have an analysis of THIS sound track (complete or partial, the pair running now)? A file that
+    // is not being analysed shows it when its sound moves there; else the subtitles on screen stay (nothing starts).
+    bool hasAnalysis(const tp::AudioSel& sel) {
+        const std::string k = pbtrf::cacheKey(s_.path, s_.size, s_.mtime, langA_, langB_, mode_, quality_, sel.ord, modelsTag_);
+        if (jobForKey(k) || heldSet(k)) return true;
+        pbtrf::Summary s;
+        if (!host_.peekCache(k, s) || !pbtrf::samePath(s.path, s_.path) || s.size != s_.size || s.mtime != s_.mtime) return false;
+        if (pbtrf::staleRecord(s.engine, s.edited)) return false;
+        return s.ok && (s.complete || !s.ranges.empty());
+    }
+    // The subtitles follow a new sound track: always for a file being analysed (D5: the analysis moves there), else only
+    // to a track that has an analysis of its own.
+    bool followsSound(const tp::AudioSel& sel) { return analysisWanted() || hasAnalysis(sel); }
+    void forgetBatch(uint64_t id) {
+        batchQ_.erase(id); batchCancelled_.erase(id);
+        tbatchQ_.erase(id); tbatchCancelled_.erase(id);      // (U3: "Transcribe all" too)
+        redone_.erase(id);                                   // (U2b: and its "redone with the default model")
+        redoRan_.erase(id);                                  // (FX F5: what its row says of it)
+    }
+    // FX (F5): the batch's redo of these items STARTED (its FILE job sent) or ended without one (the default's analysis found
+    // complete at its turn): only now does the row say "Redone with the default model" -- never while the redo only waits, and
+    // never after a Cancel all that came before it ran (a file out of the batches is never marked)
+    void redoStarted(uint64_t id) {
+        if (!redone_.count(id) || !(batchQ_.count(id) || tbatchQ_.count(id))) return;
+        if (redoRan_.insert(id).second) markItem(id);
+    }
+    // ---- U2b: THE BATCH'S ONE RETRY (the user, 02/11) -------------------------------------------------------------------------
+    // The items of the queue a BATCH ("Translate all" / "Transcribe all") still has for this set's FILE -- by its identity, whatever
+    // the key says (the models are what just moved).
+    std::vector<uint64_t> batchItemsOf(const CueSet& S) const {
+        std::vector<uint64_t> v;
+        const std::wstring p = pbtrf::lowerW(S.path);
+        for (const auto& it : items_)
+            if ((batchQ_.count(it.id) || tbatchQ_.count(it.id)) && it.size == S.size && it.mtime == S.mtime
+                && pbtrf::lowerW(it.path) == p)
+                v.push_back(it.id);
+        return v;
+    }
+    // The batch may redo that file with the DEFAULT: that kind is the default for what comes next (it falls back now, or the user
+    // chose the default since -- never another imported model: "redone with the default model"), and the file was not redone in
+    // this batch yet (a second failure is a normal failure).
+    bool redoAllowed(const std::string& kind, const std::string& path, const std::vector<uint64_t>& ids) const {
+        const ModelPick& next = kind == "asr" ? asrPick_ : mtPick_;
+        if (!next.path.empty() && next.path != path) return false;
+        for (uint64_t id : ids) if (redone_.count(id)) return false;
+        return true;
+    }
+    static std::wstring redoSentence(const std::string& kind) {
+        return kind == "asr" ? L"Redone with SuVtitle's own transcription model (large-v3-turbo)."
+                             : L"Redone with SuVtitle's own translation model (Qwen3-4B).";
+    }
+    // The imported models the running jobs use changed: the host's menu follows (the x of a model in use disabled)
+    void noteModelsInUse() {
+        std::vector<std::string> v = modelsInUse();
+        for (auto& p : v) for (auto& c : p) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+        std::sort(v.begin(), v.end());
+        std::string sig;
+        for (const auto& p : v) sig += p + "\n";
+        if (sig == inUseSig_) return;
+        inUseSig_ = sig;
+        host_.modelsInUseChanged();
+    }
+    // A job of `key` ended complete (done) or failed: its file leaves the batch (a failure is remembered: failedKeys_)
+    void batchFinished(const std::string& key, bool failed) {
+        for (const auto& it : items_) {
+            if (keyOf(it) != key) continue;
+            if (batchQ_.erase(it.id)) queueDirty_ = true;
+            if (!failed) batchCancelled_.erase(it.id);
+        }
+    }
+
+    // ---- U3: THE TRANSCRIPT --------------------------------------------------------------------------------------------
+    // The playing file's transcript is WISHED: Transcribe pressed on it, or queued by "Transcribe all".
+    bool transcribeWantedNow() const { return loaded_ && (s_.twanted || tbatchQ_.count(s_.itemId) > 0); }
+    // Its ANALYSIS runs when either wish wants it -- whisper once, whatever is pressed (Translate's and the transcript's).
+    bool analysisWanted() const { return wantedNow() || transcribeWantedNow(); }
+    // The playing file's analysis already runs in the pair running now: a press of the other button JOINS it.
+    bool runningHeard() const {
+        if (!s_.wire) return false;
+        for (const Job& j : jobs_) if (j.wire == s_.wire) return !j.voice && !j.cancelSent && j.set->key == heardKey();
+        return false;
+    }
+    bool inTBatch(const std::string& key) const {
+        for (const auto& it : items_) if (tbatchQ_.count(it.id) && keyOf(it) == key) return true;
+        return false;
+    }
+    void tunqueue(uint64_t id) { if (tbatchQ_.erase(id)) markItem(id); }
+    // A transcript of `key` ended (its voice pass done or failed, or its analysis failed): its file leaves "Transcribe all"
+    void tbatchFinished(const std::string& key, bool failed) {
+        for (const auto& it : items_) {
+            if (keyOf(it) != key) continue;
+            if (tbatchQ_.erase(it.id)) queueDirty_ = true;
+            if (failed) tfailedKeys_.insert(key);
+            else tbatchCancelled_.erase(it.id);
+            markItem(it.id);
+        }
+    }
+    // Complete, with its Word file up to date, as far as this run KNOWS (the playing file: one stat of its Word file; any other
+    // file is queued and the scheduler reads it at its turn -- never 2000 records at the press).
+    bool knownTranscribed(const Item& it) {
+        if (loaded_ && s_.itemId == it.id && s_.set) return s_.set->complete && s_.set->hasVoices && docxState(*s_.set) == "current";
+        return false;
+    }
+    void transcriptNow() { transcriptDirty_ = transcriptUrgent_ = true; }   // it CHANGED: posted at the next flush
+    void transcriptGrow() { transcriptDirty_ = true; }                      // it only GREW: coalesced (kTranscriptGrowMs)
+    // The voices record of this analysis, read once (a stale or malformed record is a miss: the voice pass runs again).
+    void ensureVoices(CueSet& S) {
+        if (S.voicesRead) return;
+        S.voicesRead = true;
+        pbtrf::VoiceRec r;
+        if (!host_.readVoices(S.key, r) || !pbtrf::samePath(r.path, S.path) || r.size != S.size || r.mtime != S.mtime
+            || r.audioOrd != S.audio.ord)
+            return;
+        S.voices = r;
+        S.hasVoices = true;
+        docxPathSet(S);                                      // (FX2-B: its Word file on the network?)
+    }
+    // FX2-B (03/11/2026, docs/PROGRESS_FX2.md): the record's Word file path was just SET (read from its record, written, saved):
+    // on the network? -- asked of the host here, never in a tick (the watch only reads the answer)
+    void docxPathSet(CueSet& S) { S.docxRemote = !S.voices.docxPath.empty() && host_.onNetwork(w16(S.voices.docxPath)); }
+    pbtrf::VoiceRec voicesBase(const CueSet& S) const {
+        pbtrf::VoiceRec v;
+        v.path = u8(S.path); v.size = S.size; v.mtime = S.mtime;
+        v.audioOrd = S.audio.ord; v.audioTrack = S.audio.trackId;
+        return v;
+    }
+    // ---- the source timecode (per media: asked once on a worker, kTcKeep kept) ----
+    const pbtc::SourceTc& tcOf(const std::string& mk) const {
+        static const pbtc::SourceTc kNone;
+        const auto f = tcs_.find(mk);
+        return f != tcs_.end() && f->second.known ? f->second.tc : kNone;
+    }
+    bool tcSettled(const std::string& mk) const {
+        const auto f = tcs_.find(mk);
+        return f != tcs_.end() && (f->second.known || f->second.timedOut);
+    }
+    void askTimecode(const std::string& mk, const std::wstring& path) {
+        const auto f = tcs_.find(mk);
+        if (f != tcs_.end() && (f->second.known || f->second.req)) return;      // known, or asked already
+        TcEntry& e = tcs_[mk];
+        e.req = next();
+        e.askedAt = host_.nowMs();
+        tcReqs_[e.req] = mk;
+        trimTcs();
+        host_.probeTimecode(e.req, path);                    // (last: its answer may come back at once)
+    }
+    void trimTcs() {
+        while (tcs_.size() > kTcKeep) {
+            auto old = tcs_.end();
+            for (auto it = tcs_.begin(); it != tcs_.end(); ++it)
+                if ((!loaded_ || it->first != s_.mediaKey) && (old == tcs_.end() || it->second.askedAt < old->second.askedAt)) old = it;
+            if (old == tcs_.end()) break;
+            if (old->second.req) tcReqs_.erase(old->second.req);
+            tcs_.erase(old);
+        }
+    }
+    // FX (F1, the review 02/11): THE STAMPS' TIMECODE -- the file's SOURCE timecode when this run READ one; else the one its Word
+    // file was written with (the voices record's DOCXTC: this media's, by identity -- ensureVoices checks path, size, write time
+    // and track -- so a probe that has not answered yet, timed out on a sleeping disk or failed on a locked file never turns a
+    // timecoded Word file into file-relative stamps: it is compared, and rewritten, on the basis it was written with); else
+    // file-relative. A timecode read now that differs from the recorded one wins (a parser fix); one read on a Word file written
+    // without one makes it "older" (true: the file lacks it).
+    pbtc::SourceTc stampTc(const CueSet& S) const {
+        const pbtc::SourceTc& live = tcOf(S.mediaKey);
+        if (live.found) return live;
+        if (S.voices.docxTc.found) return sourceTcOf(S.voices.docxTc);
+        return pbtc::SourceTc{};
+    }
+    static pbtrf::VoiceTc voiceTcOf(const pbtc::SourceTc& c) {
+        pbtrf::VoiceTc v;
+        v.found = c.found; v.origin = c.origin; v.hasRate = c.hasRate; v.startFrames = c.startFrames; v.fpsNum = c.fpsNum;
+        v.fpsDen = c.fpsDen; v.base = c.base; v.drop = c.drop; v.startSamples = c.startSamples; v.sampleRate = c.sampleRate;
+        return v;
+    }
+    static pbtc::SourceTc sourceTcOf(const pbtrf::VoiceTc& v) {
+        pbtc::SourceTc c;
+        c.found = v.found; c.origin = v.origin; c.hasRate = v.hasRate; c.startFrames = v.startFrames; c.fpsNum = v.fpsNum;
+        c.fpsDen = v.fpsDen; c.base = v.base; c.drop = v.drop; c.startSamples = v.startSamples; c.sampleRate = v.sampleRate;
+        return c;
+    }
+    // ---- the turns, the Word file ----
+    // The transcript of `S` as the tab and the Word file show it: its pieces, their speakers (its voices, by overlap), the
+    // user's names, the stamps (the file's source timecode when known, else file-relative -- FX F1: stampTc).
+    std::vector<pbtrs::Turn> turnsOf(const CueSet& S, uint64_t* unmatched = nullptr, uint64_t* total = nullptr) const {
+        const std::vector<pbtrs::Piece> P = pbtrs::piecesOf(S.cues);
+        std::vector<uint32_t> spk;
+        if (S.hasVoices && S.voices.on) spk = pbtrs::speakersOf(P, S.voices.segs, unmatched, total);
+        else spk.assign(P.size(), 0);
+        const std::map<uint32_t, std::string> names(S.voices.names.begin(), S.voices.names.end());
+        return pbtrs::buildTurns(P, spk, names, stampTc(S));
+    }
+    // The transcript's Word file BY ITS IDENTITY: "none" (never written), "gone" (deleted, moved), "edited" (changed since
+    // SuVtitle wrote it: never overwritten), "same" (as SuVtitle wrote it -- docxState tells "current" from "older").
+    // FX (F2, the user's rule 02/11: ONE Word file per media AND sound track): "other" = this sound track's Word file holds ANOTHER
+    // analysis' transcript of it (another pair or model) -- this one has none of its own, or SuVtitle wrote its file for another
+    // analysis since (a Save there). Never written by itself; its tab says so -- never "changed outside SuVtitle": SuVtitle wrote it.
+    // FX2 (03/11/2026, docs/PROGRESS_FX2.md): the ONE reading the tab (docxState) AND the playing file's row (tdocOf) make of it,
+    // so the two never disagree -- never the fingerprint (a row never rebuilds the turns). A reading back to normal (neither
+    // "other" nor "gone") forgets what a row learned of that analysis' Word file while it played (docxSeen_).
+    std::string docxIdentity(const CueSet& S) {
+        const std::string id = docxIdentityOf(S);
+        if (id != "other" && id != "gone") docxSeen_.erase(S.key);
+        return id;
+    }
+    std::string docxIdentityOf(const CueSet& S) {
+        const pbtrf::VoiceRec& V = S.voices;
+        if (!S.hasVoices) return "none";
+        if (V.docxPath.empty()) return heldByOther(S, std::wstring()) ? "other" : "none";
+        uint64_t size = 0, mtime = 0;
+        if (!host_.identity(w16(V.docxPath), size, mtime)) return "gone";
+        if (size != V.docxSize || mtime != V.docxMtime) return heldByOther(S, w16(V.docxPath)) ? "other" : "edited";
+        return "same";
+    }
+    // The transcript's Word file: its identity (docxIdentity), and one as SuVtitle wrote it told by what it holds -- "older" (ours,
+    // holding an older transcript) or "current".
+    std::string docxState(const CueSet& S, const std::vector<pbtrs::Turn>* turns = nullptr) {
+        const std::string id = docxIdentity(S);
+        if (id != "same") return id;
+        return pbtrs::fingerprint(turns ? *turns : turnsOf(S)) == S.voices.docxSig ? "current" : "older";
+    }
+    // FX2-A (03/11/2026, docs/PROGRESS_FX2.md): THE PLAYING FILE'S WORD FILE, WATCHED ONCE A SECOND (tick) -- deleted, moved,
+    // re-created or edited in Word while the film is open and nothing else is posted: the tab and the row read it again,
+    // together (transcriptNow + the playing item marked: docxIdentity at their posts -- the ITEM, not markKey(S.key): after a
+    // pair or model change while it plays, its shown transcript keeps the old key, which names no row). One stat a tick, of THAT
+    // file only (its disk is awake: the file plays) -- its RAW identity, kept with the analysis key and the path it was read for:
+    // a new key or path is only kept, a change for the same ones is posted. The registry is read by those posts only
+    // (heldByOther), never once a second; a row not playing still reads no disk. The core's own writes (writeDocx, G2,
+    // transcriptSaved) change that identity too: the next tick posts ONCE more, the same content (harmless, rare -- G2's own,
+    // written in tick before this, rides the same flush).
+    // FX2-B (03/11/2026, docs/PROGRESS_FX2.md): ITS GUARDS -- the stat runs on the UI thread, so: never while the window is hidden
+    // (the reading kept: a change made meanwhile is posted at the first tick it shows); never for a file on the NETWORK, the
+    // media's or the Word file's own (a share that drops blocks a stat up to the SMB timeout -- decided where the paths are set,
+    // the tick only reads the answers); and ONE read that took kDocxWatchSlowMs or more stops the watch of that Word file
+    // (analysis key + path) until the next load -- at worst one block, as a tab post before FX2-A. These files keep the
+    // pre-FX2-A rule: their row and their tab follow at their next post.
+    void watchDocx() {
+        if (!loaded_ || !s_.set || !s_.set->hasVoices || s_.set->voices.docxPath.empty()) { docxWatch_ = DocxWatch{}; return; }
+        if (!shown_) return;
+        const CueSet& S = *s_.set;
+        if (s_.mediaRemote || S.docxRemote) return;
+        if (s_.watchSlowKey == S.key && s_.watchSlowPath == S.voices.docxPath) return;
+        DocxWatch w;
+        w.key = S.key;
+        w.path = S.voices.docxPath;
+        const uint64_t t0 = host_.nowMs();
+        w.there = host_.identity(w16(w.path), w.size, w.mtime);
+        if (host_.nowMs() - t0 >= kDocxWatchSlowMs) { s_.watchSlowKey = w.key; s_.watchSlowPath = w.path; }
+        const bool changed = w.key == docxWatch_.key && w.path == docxWatch_.path
+            && (w.there != docxWatch_.there || w.size != docxWatch_.size || w.mtime != docxWatch_.mtime);
+        docxWatch_ = w;
+        if (!changed) return;
+        markItem(s_.itemId);
+        transcriptNow();
+    }
+    // FX (F2): the registry says that Word file -- or, with no path, this set's sound track's -- holds ANOTHER analysis' transcript
+    bool heldByOther(const CueSet& S, const std::wstring& path) {
+        const std::string k = host_.docxWriter(S, path);
+        return !k.empty() && k != S.key;
+    }
+    static const wchar_t* otherSentence() {
+        return L"The Word file of this sound track holds another transcript of it (another language pair or model): it is kept.";
+    }
+    // FX (F6): this analysis has no up-to-date Word file NEXT TO its media -- in another folder (why ""), or none / not updated
+    // (why): its row says it (tdocWhy_), and a file of "Transcribe all" counts in the batch's ONE notice (tdocMiss_)
+    void docxNotNext(const CueSet& S, const std::wstring& why) {
+        if (why.empty()) tdocWhy_.erase(S.key);
+        else tdocWhy_[S.key] = why;
+        if (inTBatch(S.key)) tdocMiss_.insert(S.key);
+        markKey(S.key);
+    }
+    void postTdocNotice() {
+        const size_t n = tdocMiss_.size();
+        tdocMiss_.clear();
+        notice(n == 1 ? std::wstring(L"Transcribe all: 1 file has no up-to-date Word file next to it -- its row in the Queue tab says why.")
+                      : L"Transcribe all: " + std::to_wstring(n) + L" files have no up-to-date Word file next to them -- their rows in "
+                        L"the Queue tab say why.", true);   // (FX2: news, not a failure -- `info`)
+    }
+    pbtrs::TranscriptOut transcriptOutOf(const CueSet& S) {
+        pbtrs::TranscriptOut t;
+        t.name = S.name;
+        t.durMs = S.totalMs;
+        t.turns = turnsOf(S);
+        t.speakers = pbtrs::namedSpeakers(t.turns);
+        t.namesOn = S.hasVoices && S.voices.on;
+        t.why = S.hasVoices && !S.voices.on ? S.voices.why : std::string();
+        t.langs = pbtrs::languagesHeard(S.cues);
+        t.tc = stampTc(S);                                   // (FX F1: the stamps' timecode -- the header says it)
+        t.sig = pbtrs::fingerprint(t.turns);
+        const std::string st = docxState(S, &t.turns);
+        if (st == "current" || st == "older") t.prefer = w16(S.voices.docxPath);
+        return t;
+    }
+    // The Word file, written NOW (the transcript's completion, Re-transcribe, Transcribe all): next to the media -- the one
+    // written before replaced in place while it is still ours -- and remembered in the voices record (identity + contents).
+    // FX (02/11): F2 -- another analysis of this sound track holds its Word file: NOTHING is written by itself (the tab says so
+    // through `other`, the row through `tdoc`); F1 -- the record keeps the timecode the stamps were made with; F4 -- a refusal of
+    // the file written before (`t.prefer`: held by another program, read-only -- the host's sentence) is said with "older"
+    // (docxErr), the record still naming that file next to the media (the next change, a Save, Transcribe all retry); F6 -- the
+    // row's word on its Word file, and Transcribe all's count.
+    void writeDocx(CueSet& S) {
+        if (docxState(S) == "other") { docxNotNext(S, otherSentence()); return; }
+        pbtrs::TranscriptOut t = transcriptOutOf(S);
+        if (t.turns.empty()) { S.tnote = L"No speech was found in this file."; docxNotNext(S, S.tnote); return; }
+        std::wstring note;
+        uint64_t size = 0, mtime = 0;
+        const std::wstring path = host_.writeTranscript(S, t, note, size, mtime);
+        if (path.empty()) {
+            const std::wstring why = note.empty() ? std::wstring(L"The Word file could not be written.") : note;
+            if (!t.prefer.empty()) S.docxErr = why;          // (F4: the Word file written before refused -- said with "older")
+            else S.tnote = why;
+            docxNotNext(S, why);
+            return;
+        }
+        S.tnote = note;                                      // (where it went, when not the usual name: said in the tab)
+        S.docxErr.clear();                                   // (U2b G2: written -- an earlier failure to update it is over)
+        S.voices.docxPath = u8(path); S.voices.docxSize = size; S.voices.docxMtime = mtime; S.voices.docxSig = t.sig;
+        S.voices.docxTc = voiceTcOf(t.tc);                   // (F1: the timecode its stamps were made with)
+        docxPathSet(S);                                      // (FX2-B: written on the network? -- a redirected Documents)
+        host_.writeVoices(S.key, S.voices);
+        vdocx_[S.key] = S.voices.docxPath;                   // (F6: the row's Word file)
+        docxSeen_.erase(S.key);                              // (FX2: a gone one written again -- maybe under the same name)
+        if (pbtrf::samePath(u8(pbtrf::dirOf(path)), S.folder)) { tdocWhy_.erase(S.key); tdocMiss_.erase(S.key); markKey(S.key); }
+        else docxNotNext(S, std::wstring());                 // (F6: in another folder -- Documents\SuVtitle Transcripts)
+    }
+    // "Transcribe all"'s rule (and a press on a transcript already complete): the Word file when MISSING or OLDER (ours);
+    // one the user edited since is left alone.
+    void docxIfNeeded(CueSet& S) {
+        if (!S.hasVoices) return;
+        const std::string st = docxState(S);
+        if (st == "none" || st == "gone" || st == "older") writeDocx(S);
+        else if (st == "other") docxNotNext(S, otherSentence());   // FX (F2): another analysis' Word file: never written, said
+    }
+    // ---- U2b (G2, the user's answer 02/11: "a rename updates the Word file by itself") ----
+    // A RENAME (and a subtitle EDIT: the same rule) of a COMPLETE transcript: its Word file follows it -- only when SuVtitle wrote
+    // that file and nobody changed it since (docxState "older": ours, its identity as written) -- REWRITTEN IN PLACE
+    // (Host::rewriteTranscript: never a new name, never another folder). A burst is ONE write: kDocxRenameMs after the LAST change
+    // (tick), and at once when the file goes (endSession, a re-analysis / re-track replacing the set, shutdown, persist): the last
+    // rename is never lost. "edited" / gone / never written -> never touched (the tab says so; Save .docx... writes a new one).
+    void docxSoon(const std::shared_ptr<CueSet>& S) {
+        if (!S || !S->complete || !S->hasVoices) return;
+        if (docxDue_ && docxDue_ != S) flushDocxDue();      // (another set's burst: written first)
+        docxDue_ = S;
+        docxDueAt_ = host_.nowMs() + kDocxRenameMs;
+    }
+    void flushDocxDue() {
+        if (!docxDue_) return;
+        std::shared_ptr<CueSet> S = docxDue_;
+        docxDue_.reset();
+        rewriteDocxNow(*S);
+    }
+    void rewriteDocxNow(CueSet& S) {
+        if (!S.complete || !S.hasVoices) return;
+        const std::string st = docxState(S);
+        if (st != "older") {                                 // current: nothing to do; edited / gone / none: never touched
+            if (st == "current") S.docxErr.clear();
+            transcriptNow();
+            return;
+        }
+        pbtrs::TranscriptOut t = transcriptOutOf(S);         // (older: `prefer` = the file written for it, still ours --
+        if (t.turns.empty()) return;                         //  "older" is the ONE guard here: U1's double-guard rule)
+        std::wstring why;
+        uint64_t size = 0, mtime = 0;
+        if (host_.rewriteTranscript(S, t, why, size, mtime)) {
+            S.voices.docxSize = size; S.voices.docxMtime = mtime; S.voices.docxSig = t.sig;   // (the same path: in place)
+            S.voices.docxTc = voiceTcOf(t.tc);               // (FX F1: the timecode of what was written)
+            S.docxErr.clear();
+            host_.writeVoices(S.key, S.voices);
+            tdocWhy_.erase(S.key);                           // (FX F6: its row has nothing to excuse any more)
+        } else {
+            S.docxErr = why;                                 // "open in another program": the next change, or a Save, retries
+            if (!why.empty()) tdocWhy_[S.key] = why;         // (FX F6: its row says it too)
+        }
+        markKey(S.key);
+        transcriptNow();
+    }
+    // ---- the voice pass ----
+    // The playing file's voice pass: its transcript wished, its analysis complete (the set shown), no voices yet -- or
+    // Re-transcribe -- and the engine free of its analysis (one slot: after it, never with it).
+    void ensureCurrentVoice() {
+        if (!loaded_ || s_.vwire || s_.wire || !s_.set || !s_.set->complete) return;
+        if (!transcribeWantedNow() || s_.tUserCancelled || s_.tFailed) return;
+        if (live_ || !helper_) return;
+        ensureVoices(*s_.set);
+        if (s_.set->hasVoices && !s_.tForce) return;
+        for (Job& j : jobs_) if (j.pre) cancelJob(j);        // the engine goes to the playing file (a batch's job resumes later)
+        s_.tForce = false;
+        s_.vwire = startVoiceJob(s_.set, false);
+        stateDirty_ = true;
+        transcriptNow();
+    }
+    // FVOICE for a complete set: its pieces (a dialogue cue's lines split, the known changes marked: TrTranscript.h). 0 = no
+    // pass was needed or possible -- no speech, or more pieces than one pass takes: the transcript then stands WITHOUT names
+    // (its record says why) and its Word file is written at once.
+    uint64_t startVoiceJob(const std::shared_ptr<CueSet>& set, bool pre) {
+        const std::vector<pbtrs::Piece> P = pbtrs::piecesOf(set->cues);
+        std::string spans, changes;
+        std::vector<int> sent;
+        pbtrs::voiceFields(P, spans, changes, sent);
+        std::vector<tp::MsRange> r;
+        tp::parseRanges(spans, r);
+        if (r.empty() || r.size() > tp::kVoiceSpanMax) {
+            pbtrf::VoiceRec v = voicesBase(*set);
+            v.why = r.empty() ? "no speech was found" : "this file has more lines than the voice pass takes ("
+                                                        + std::to_string(tp::kVoiceSpanMax) + ")";
+            v.names = set->voices.names;
+            set->voices = v;
+            set->hasVoices = set->voicesRead = true;
+            host_.writeVoices(set->key, set->voices);
+            if (!r.empty()) writeDocx(*set);
+            else docxNotNext(*set, L"No speech was found in this file.");   // (FX F6: its row says why there is no Word file)
+            vsummaries_[set->key] = 2;
+            markKey(set->key);
+            return 0;
+        }
+        Job j;
+        j.wire = next();
+        j.set = set;
+        j.pre = pre;
+        j.voice = true;
+        j.vspans = r;
+        j.phase = "voices";
+        j.vtotal = set->totalMs;
+        tp::WireVoice w;
+        w.jobId = j.wire;
+        w.path = u8(set->path);
+        // the sound track: startJob's rule ("" = the first one, a track of a list mpv gave always named) -- written apart, so
+        // that startJob's own line stays the only one of its text (cmut.py's WH sentinel aims at it)
+        const bool namedTrack = set->audio.ord > 0 || (set->audio.trackId != 0 && mpvListed(set->mediaKey));
+        w.audio = namedTrack ? tp::packAudioSel(set->audio) : std::string();
+        w.spans = spans;
+        w.changes = changes;
+        host_.sendVoice(w);
+        jobs_.push_back(j);
+        markKey(set->key);
+        return j.wire;
+    }
+    // Re-transcribe: each name the user gave goes to the NEW speaker that covers the named one's time best (two names on one
+    // new speaker: the larger overlap wins); a name whose speaker is not heard any more is dropped.
+    static void carryNames(const pbtrf::VoiceRec& old, pbtrf::VoiceRec& neu) {
+        if (old.names.empty()) return;
+        std::map<uint32_t, std::map<uint32_t, uint64_t>> ov;            // old speaker -> new speaker -> overlap (ms)
+        size_t b = 0;
+        for (const auto& o : old.segs) {
+            if (!o.spk) continue;
+            while (b < neu.segs.size() && neu.segs[b].e <= o.s) ++b;
+            for (size_t k = b; k < neu.segs.size() && neu.segs[k].s < o.e; ++k) {
+                const pbtrf::VoiceSeg& n = neu.segs[k];
+                const uint64_t lo = std::max(o.s, n.s), hi = std::min(o.e, n.e);
+                if (n.spk && hi > lo) ov[o.spk][n.spk] += hi - lo;
+            }
+        }
+        std::map<uint32_t, std::pair<std::string, uint64_t>> to;        // new speaker -> (name, the overlap that gave it)
+        for (const auto& nm : old.names) {
+            const auto f = ov.find(nm.first);
+            if (f == ov.end()) continue;
+            uint32_t best = 0;
+            uint64_t bo = 0;
+            for (const auto& x : f->second) if (x.second > bo) { bo = x.second; best = x.first; }
+            if (!best) continue;
+            auto& slot = to[best];
+            if (bo > slot.second) slot = { nm.second, bo };
+        }
+        neu.names.clear();
+        for (const auto& x : to) neu.names.push_back({ x.first, x.second.first });
+    }
+    // A voice pass ended (FDONE, real or synthesized). Ok with its FSPK: the voices record (its pieces and their labels, the
+    // names carried over), then the Word file. Its file leaves "Transcribe all" when done or failed.
+    void voiceDone(Job& j, const tp::WireFileDone& d) {
+        CueSet& S = *j.set;
+        const bool current = loaded_ && s_.vwire == j.wire;
+        const bool liveErr = j.liveHit || live_;              // (SUVTITLE LIVE: the gate's refusal fails nothing)
+        bool failed = d.result == "error" && !liveErr;
+        std::wstring err = w16(d.err);
+        if (d.result == "ok" && !j.spkGot) { failed = true; err = L"The voice pass gave no result."; }
+        if (current) s_.vwire = 0;
+        if (d.result == "ok" && j.spkGot) {
+            pbtrf::VoiceRec v = voicesBase(S);
+            v.on = j.spk.speakers > 0;
+            if (v.on) v.model = j.spk.model;
+            else v.why = j.spk.model.empty() ? std::string("the voices could not be told apart") : j.spk.model;
+            v.speakers = j.spk.speakers;
+            for (size_t i = 0; i < j.vspans.size(); ++i)
+                v.segs.push_back(pbtrf::VoiceSeg{ j.vspans[i].s, j.vspans[i].e, v.on ? j.spk.labels[i] : 0u });
+            if (S.hasVoices && S.voices.on && v.on) carryNames(S.voices, v);
+            // the Word file written for the previous transcript stays this one's: replaced in place just below (still ours)
+            v.docxPath = S.voices.docxPath; v.docxSize = S.voices.docxSize; v.docxMtime = S.voices.docxMtime;
+            v.docxSig = S.voices.docxSig;
+            v.docxTc = S.voices.docxTc;                      // (FX F1: what that file's stamps were made with, until rewritten)
+            S.voices = v;
+            ++S.vrev;                                        // (FX F8: the speakers are numbered again -- a name typed before is stale)
+            S.hasVoices = S.voicesRead = true;
+            host_.writeVoices(S.key, S.voices);
+            writeDocx(S);
+            vsummaries_[S.key] = v.on ? 1 : 2;
+        }
+        if (current) {
+            if (failed) { s_.tFailed = true; s_.terr = err.empty() ? std::wstring(L"The voices could not be recognised.") : err; }
+            stateDirty_ = true;
+            transcriptNow();
+        }
+        if (d.result == "ok" || failed) tbatchFinished(S.key, failed);
+        markKey(S.key);
+        schedule();
+        flush();
+    }
+    int vpct(const Job& j) const {
+        return j.vtotal ? static_cast<int>(std::min<uint64_t>(100, j.vdone * 100 / j.vtotal)) : 0;
+    }
+    int analysisPct(const CueSet& S) const {
+        const uint64_t t = S.totalMs;
+        if (S.complete) return 100;
+        return t ? static_cast<int>(std::min<uint64_t>(100, tp::rangesTotal(S.ranges) * 100 / t)) : 0;
+    }
+    // The playing file's transcript in one word (the Transcribe slot's tphase, tpct = the work's %):
+    //   off      nothing asked (the tab shows its text, if the file was analysed)   waiting  wished: its analysis (pct) or the
+    //   engine first   live     wished, held by the live mode   voices   its voice pass runs   done / nonames  complete, the
+    //   speakers named / not (why)   error    wished and failed   cancelled  Transcribe's Cancel
+    std::string tphaseOf(int* pct = nullptr) const {
+        if (pct) *pct = 0;
+        if (!loaded_ || !s_.set) return "off";
+        const CueSet& S = *s_.set;
+        if (s_.vwire) {
+            for (const Job& j : jobs_) if (j.wire == s_.vwire && pct) *pct = vpct(j);
+            return "voices";
+        }
+        const bool tw = transcribeWantedNow();
+        if (S.hasVoices && S.complete && !(tw && s_.tForce)) return S.voices.on ? "done" : "nonames";
+        if (s_.tUserCancelled) return "cancelled";
+        if (s_.tFailed || (tw && s_.failed)) return "error";
+        if (tw && live_) return "live";
+        if (tw) { if (pct) *pct = analysisPct(S); return "waiting"; }
+        return "off";
+    }
+    // The Transcript tab's state: idle | empty (no text, nothing asked) | nospeech | text (analysed, never transcribed) |
+    // partial (an analysis stopped part-way) | analysing (its text grows) | waiting | voices | done | nonames | failed | live |
+    // cancelled
+    std::string tabStateOf(int& pct) const {
+        pct = 0;
+        if (!loaded_ || !s_.set) return "idle";
+        const CueSet& S = *s_.set;
+        const std::string ph = tphaseOf(&pct);
+        if (S.complete && S.cues.empty()) return "nospeech";
+        if (ph == "voices" || ph == "done" || ph == "nonames" || ph == "live" || ph == "cancelled") return ph;
+        if (ph == "error") return "failed";
+        if (s_.wire) { pct = analysisPct(S); return "analysing"; }
+        if (ph == "waiting") return "waiting";
+        if (S.cues.empty()) return "empty";
+        if (S.complete) return "text";
+        pct = analysisPct(S);
+        return "partial";
+    }
+    // A queued file's TRANSCRIPT badge: "" (nothing to say) | queued | analysing (its analysis, pct) | voices (pct) | done |
+    // nonames | error | cancelled -- the translation's badge (badge) is unchanged beside it.
+    void tbadge(const Item& it, std::string& state, int& pct) {
+        state.clear();
+        pct = 0;
+        if (it.missing) return;
+        const std::string k = keyOf(it);
+        for (const Job& j : jobs_) if (j.voice && j.set->key == k && !j.cancelSent) { state = "voices"; pct = vpct(j); return; }
+        if (loaded_ && s_.itemId == it.id && s_.set) {
+            const std::string ph = tphaseOf(&pct);
+            if (ph == "waiting" || ph == "live") state = s_.wire ? "analysing" : "queued";
+            else if (ph != "off") state = ph;
+            else if (tbatchCancelled_.count(it.id)) state = "cancelled";
+            else if (s_.set->hasVoices && !s_.set->complete) state = s_.set->voices.on ? "done" : "nonames";
+            return;
+        }
+        if (tfailedKeys_.count(k)) { state = "error"; return; }
+        const int v = voicesSummary(it);
+        if (tbatchQ_.count(it.id)) {
+            for (const Job& j : jobs_)
+                if (!j.voice && j.set->key == k && !j.cancelSent) { state = "analysing"; pct = analysisPct(*j.set); return; }
+            state = "queued";
+            return;
+        }
+        if (v == 1) { state = "done"; return; }
+        if (v == 2) { state = "nonames"; return; }
+        if (tbatchCancelled_.count(it.id)) state = "cancelled";
+    }
+    // Has this file a transcript (its voices record, peeked: the first kSummaryPeekMax files whose analysis is complete)? 0
+    // none / 1 named / 2 no names. Remembered per key (refreshSummaries forgets).
+    int voicesSummary(const Item& it) {
+        const std::string k = keyOf(it);
+        const auto f = vsummaries_.find(k);
+        if (f != vsummaries_.end()) return f->second;
+        int v = 0;
+        if (indexOf(it.id) < kSummaryPeekMax) {
+            const pbtrf::Summary& sm = summaryFor(it);
+            pbtrf::VoiceRec r;
+            if (sm.ok && sm.complete && host_.peekVoices(k, r) && pbtrf::samePath(r.path, it.path) && r.size == it.size
+                && r.mtime == it.mtime) {
+                v = r.on ? 1 : 2;
+                vdocx_[k] = r.docxPath;                      // (FX F6: the row's Word file, as its record names it)
+            }
+        }
+        return vsummaries_[k] = v;
+    }
+    // FX (F6, the review 02/11): what a ROW says of its transcript's Word file -- "" = nothing to say (no transcript; or its Word
+    // file is next to the media: only then may the badge's tooltip say "next to it"); else the row's line: the folder it is in
+    // ("Word file in Documents\SuVtitle Transcripts"), or why there is none / why it is not up to date (this run's sentence:
+    // tdocWhy_), or "No Word file". F2: the playing file whose sound track's Word file is another analysis' says so.
+    // FX2 (03/11/2026, docs/PROGRESS_FX2.md): the PLAYING file's row reads its Word file as the tab does (docxIdentity -- never the
+    // fingerprint): another analysis' transcript in it (n7: it was asked only for a record with no Word file) says otherSentence;
+    // gone (A4: deleted or moved -- the tab drops its name) says "No Word file", over this run's reason and over the folder.
+    // Remembered for the row once the file stops playing (docxSeen_); a row not playing never reads the media's disk -- only the
+    // record's peek, as before, so a row never seen playing this run says what it said before FX2.
+    std::wstring tdocOf(const Item& it) {
+        if (it.missing) return std::wstring();
+        const std::string k = keyOf(it);
+        std::string path;
+        if (loaded_ && s_.itemId == it.id && s_.set) {
+            const CueSet& S = *s_.set;
+            if (!S.hasVoices) return std::wstring();
+            path = S.voices.docxPath;
+            const std::string id = docxIdentity(S);
+            if (id == "other" || id == "gone") { docxSeen_[S.key] = id; return seenWords(id); }
+        } else {
+            if (!voicesSummary(it)) return std::wstring();
+            const auto m = docxSeen_.find(k);                // FX2: what it said while it played (no disk read: kept)
+            if (m != docxSeen_.end()) return seenWords(m->second);
+            const auto f = vdocx_.find(k);
+            if (f != vdocx_.end()) path = f->second;
+        }
+        const auto w = tdocWhy_.find(k);
+        const std::wstring why = w != tdocWhy_.end() ? w->second : std::wstring();
+        if (path.empty()) return why.empty() ? std::wstring(L"No Word file") : why;
+        const std::wstring dir = pbtrf::dirOf(w16(path));
+        if (pbtrf::samePath(u8(dir), it.folder)) return why;   // next to it ("" -- or why it could not be updated)
+        return L"Word file in " + shortFolder(dir);
+    }
+    // FX2: a row's words for what the playing file's reading said of its Word file -- another analysis' transcript in it (n7), or
+    // gone (A4: deleted, moved -- F6's "No Word file", over this run's reason and over the folder it was in)
+    static std::wstring seenWords(const std::string& id) {
+        return id == "gone" ? std::wstring(L"No Word file") : id == "other" ? std::wstring(otherSentence()) : std::wstring();
+    }
+    // A folder by its last two names ("Documents\SuVtitle Transcripts"); a root's child whole ("D:\Out")
+    static std::wstring shortFolder(const std::wstring& dir) {
+        std::wstring d = dir;
+        while (!d.empty() && (d.back() == L'\\' || d.back() == L'/')) d.pop_back();
+        const size_t a = d.find_last_of(L"\\/");
+        if (a == std::wstring::npos || a == 0) return d;
+        const size_t b = d.find_last_of(L"\\/", a - 1);
+        return b == std::wstring::npos ? d : d.substr(b + 1);
+    }
+    // translatorTranscript: the Transcript tab's whole content (the turns rebuilt each time: names, merges, stamps follow).
+    void postTranscriptNow() {
+        transcriptDirty_ = transcriptUrgent_ = false;
+        transcriptPostedAt_ = host_.nowMs();
+        if (windowBusy()) return;                            // replayed on the page's `ready`
+        CueSet* S = loaded_ ? s_.set.get() : nullptr;
+        int pct = 0;
+        const std::string state = tabStateOf(pct);
+        uint64_t un = 0, tot = 0;
+        const std::vector<pbtrs::Turn> turns = S ? turnsOf(*S, &un, &tot) : std::vector<pbtrs::Turn>();
+        JsonW j;
+        j.obj();
+        j.kv(L"type", L"translatorTranscript");
+        j.kv(L"jobId", static_cast<long long>(s_.gen));
+        j.kv(L"vrev", static_cast<long long>(S ? S->vrev : 0));   // FX (F8): its speakers' numbering -- a rename names one of these
+        j.kv(L"state", w16(state));
+        j.kv(L"pct", pct);
+        j.kv(L"speakers", static_cast<long long>(S && S->hasVoices ? S->voices.speakers : 0));
+        j.key(L"names").arr();
+        if (S && S->hasVoices)
+            for (const auto& n : S->voices.names) { j.obj(); j.kv(L"id", static_cast<long long>(n.first)); j.kv(L"label", w16(n.second)); j.end(); }
+        j.end();
+        std::wstring why;
+        if (state == "failed") why = s_.tFailed ? s_.terr : s_.err;
+        else if (S && S->hasVoices && !S->voices.on) why = w16(S->voices.why);
+        j.kv(L"why", why);
+        j.key(L"langs").arr();
+        if (S) for (const auto& l : pbtrs::languagesHeard(S->cues)) j.str(w16(l));
+        j.end();
+        j.kv(L"complete", S ? (S->complete && S->hasVoices) : false);
+        j.kv(L"unmatched", tot ? static_cast<int>(un * 100 / tot) : 0);
+        j.kv(L"suggest", tot && S && S->hasVoices && S->voices.on && static_cast<int>(un * 100 / tot) > kUnmatchedSuggestPct);
+        const pbtc::SourceTc tc = S ? stampTc(*S) : pbtc::SourceTc{};   // (FX F1: the stamps' timecode)
+        j.kv(L"tc", w16(pbtc::describeTc(tc)));
+        j.kv(L"tcSource", tc.found);
+        const std::string dst = S ? docxStateConst(*S, turns) : std::string("none");
+        j.kv(L"file", S && (dst == "current" || dst == "older" || dst == "edited") ? pbtrf::leafOf(w16(S->voices.docxPath)) : std::wstring());
+        // (U2b G2: a rewrite on its way -- a rename's burst -- is not "older": it is being brought up to date; a FAILED one is,
+        //  and says why: docxErr; a file changed outside SuVtitle is never touched: `edited`)
+        j.kv(L"older", dst == "older" && !(docxDue_ && docxDue_.get() == S));
+        j.kv(L"docxErr", S && dst == "older" ? S->docxErr : std::wstring());
+        j.kv(L"edited", dst == "edited");
+        j.kv(L"other", dst == "other");                      // FX (F2): this sound track's Word file holds another analysis'
+        j.kv(L"note", S ? S->tnote : std::wstring());
+        j.kv(L"durMs", static_cast<long long>(S ? S->totalMs : 0));
+        j.key(L"turns").arr();
+        for (size_t i = 0; i < turns.size() && i < kTurnsPostMax; ++i) {
+            const pbtrs::Turn& t = turns[i];
+            j.obj();
+            j.kv(L"s", static_cast<long long>(t.s));
+            j.kv(L"e", static_cast<long long>(t.e));
+            j.kv(L"spk", static_cast<long long>(t.spk));
+            j.kv(L"name", w16(t.name));
+            j.kv(L"tc", w16(t.stamp));
+            j.kv(L"text", w16(t.text));
+            j.end();
+        }
+        j.end();
+        j.kv(L"cut", turns.size() > kTurnsPostMax);
+        j.end();
+        host_.postWindow(j.take());
+    }
+    // docxState for a post (the turns already built)
+    std::string docxStateConst(const CueSet& S, const std::vector<pbtrs::Turn>& turns) { return docxState(S, &turns); }
 
     // ---- items ----------------------------------------------------------------------------------------------
     Item itemOf(const std::wstring& path, uint64_t size, uint64_t mtime, uint64_t durMs) {
@@ -1333,6 +2767,7 @@ private:
             stateDirty_ = true;
         }
         cancelPreFor(it);
+        forgetBatch(it.id);                                // (U1: a file taken out of the queue leaves "Translate all")
         const uint64_t curId = (cur_ != npos && cur_ != idx) ? items_[cur_].id : 0;
         items_.erase(items_.begin() + static_cast<std::ptrdiff_t>(idx));
         order_.erase(std::remove(order_.begin(), order_.end(), it.id), order_.end());
@@ -1392,11 +2827,12 @@ private:
         s->mediaKey = pbtrf::mediaKey(path, size, mtime);
         s->langA = langA_; s->langB = langB_; s->mode = mode_; s->quality = quality_;
         s->audio = audio;
-        s->key = pbtrf::cacheKey(path, size, mtime, langA_, langB_, mode_, quality_, audio.ord);
+        s->asrPath = asrPick_.path; s->mtPath = mtPick_.path; s->models = modelsTag_;   // U2
+        s->key = pbtrf::cacheKey(path, size, mtime, langA_, langB_, mode_, quality_, audio.ord, modelsTag_);
         return s;
     }
     std::string keyOf(const Item& it) const {
-        return pbtrf::cacheKey(it.path, it.size, it.mtime, langA_, langB_, mode_, quality_, audioFor(it).ord);
+        return pbtrf::cacheKey(it.path, it.size, it.mtime, langA_, langB_, mode_, quality_, audioFor(it).ord, modelsTag_);
     }
 
     // ---- WH: the sound track ---------------------------------------------------------------------------------
@@ -1409,7 +2845,7 @@ private:
         const AudioPick* pick = pk == picks_.end() ? nullptr : &pk->second;
         const auto p = probes_.find(mk);
         if (p != probes_.end() && p->second.state == "ready" && p->second.info) {
-            const int o = initialAudioOrd(*p->second.info, pick);
+            const int o = chooseOrd(p->second, pick);
             return o < 0 ? tp::AudioSel{} : tp::AudioSel{ static_cast<uint32_t>(o), p->second.info->audio[static_cast<size_t>(o)].track };
         }
         // read and NOT a container we know (or unreadable): the page can enforce nothing -- the default track plays and
@@ -1428,6 +2864,19 @@ private:
         return tp::AudioSel{};
     }
     static bool probeWorthy(const std::wstring& path) { return pbmedia::probeWorthyExt(pbtrf::extOf(pbtrf::leafOf(path))); }
+    // D3's rule (initialAudioOrd) -- and for a list MPV gave (1.1.0 fix round, L6), with no pick of the viewer's, the track
+    // mpv chose by itself at its first opening (autoOrd): every opening of the file in the run plays what the first one did
+    static int chooseOrd(const ProbeEntry& p, const AudioPick* pick) {
+        const pbmedia::Info& t = *p.info;
+        const bool picked = pick && pick->ord < t.audio.size() && (pick->trackId == 0 || t.audio[pick->ord].track == pick->trackId);
+        if (!picked && p.autoOrd >= 0 && static_cast<size_t>(p.autoOrd) < t.audio.size()) return p.autoOrd;
+        return initialAudioOrd(t, pick);
+    }
+    // The media's track list is one MPV gave (adopted: container "mpv"), not MediaTracks'
+    bool mpvListed(const std::string& mk) const {
+        const auto p = probes_.find(mk);
+        return p != probes_.end() && p->second.state == "ready" && p->second.info && p->second.info->container == "mpv";
+    }
     // An mp4/mov (ISO-BMFF) file whose probe lists 2+ sound tracks: where a record made before WH may be another track's
     // (TrFileStore.h unknownTrackMiss). Unknown (no probe, or not answered yet) = no: as before WH.
     bool multiTrackIsoBmff(const std::string& mk) const {
@@ -1465,6 +2914,13 @@ private:
         s_.tracks = p.state == "ready" ? p.info : nullptr;
         s_.probeWait = false;
         s_.embedded.clear();
+        // 1.1.0 (fix round, L6): MediaTracks could not read it ("none" / "error") and mpv listed its sound tracks already:
+        // mpv's list is the item's then (adoptMpvTracks: the viewer's pick, else mpv's own choice), and the job starts
+        if (!s_.tracks && s_.mpvTracks && !s_.mpvTracks->audio.empty()) {
+            adoptMpvTracks();
+            ensureCurrentJob(s_.lastPosMs);
+            return;
+        }
         if (s_.tracks) for (const auto& st : s_.tracks->subs) s_.embedded.push_back(Session::Emb{ next(), st.track });
         const auto pk = picks_.find(s_.mediaKey);
         int o = s_.tracks ? initialAudioOrd(*s_.tracks, pk == picks_.end() ? nullptr : &pk->second) : -1;
@@ -1478,6 +2934,75 @@ private:
         if (s_.set && want.trackId && s_.set->audio.trackId != want.trackId && !s_.wire) s_.set->audio.trackId = want.trackId;
         ensureCurrentJob(s_.lastPosMs);
     }
+    // 1.1.0 (fix round, L6): mpv's list becomes the item's (see offerMpvTracks). Offered again (MPEG-TS: a stream that
+    // appears later): the list is replaced, the track chosen is kept. The choice, the first time: the viewer's pick for this
+    // file (player-audio.txt: persisted like a Matroska file's -- setAudio stores mpv's track id with it), else the track
+    // mpv chose itself (aid=auto: the opening named none -- WAITED for, mpv's list can come before its choice), else D3.
+    void adoptMpvTracks() {
+        if (!loaded_ || !s_.mpvTracks || s_.mpvTracks->audio.empty()) return;
+        if (s_.tracksState == "probing") return;                            // MediaTracks is reading it: its answer first
+        if (s_.tracksState == "ready" && s_.tracks && !s_.tracksFromMpv) return;   // a MediaTracks list: NEVER overridden
+        const pbmedia::Info& T = *s_.mpvTracks;
+        const size_t n = T.audio.size();
+        const bool first = !(s_.tracksFromMpv && s_.tracks && s_.audioOrd >= 0);
+        const auto pk = picks_.find(s_.mediaKey);
+        const AudioPick* pick = pk == picks_.end() ? nullptr : &pk->second;
+        const bool picked = pick && pick->ord < n && (pick->trackId == 0 || T.audio[pick->ord].track == pick->trackId);
+        const bool mpvChose = s_.mpvOrd >= 0 && static_cast<size_t>(s_.mpvOrd) < n;
+        // (the first time with no pick: mpv's OWN choice first -- adopting before it would put D3's track over it)
+        if (first && !picked && !mpvChose && !s_.mpvFinal) return;
+        s_.tracks = s_.mpvTracks;
+        s_.tracksState = "ready";
+        s_.tracksFromMpv = true;
+        // remembered for this media during the run (probes_: never over a probe still running): its next opening knows the
+        // list at once -- mpv is asked for the track chosen, the analysis keys on it, the pre-analysis too
+        ProbeEntry& pe = probes_[s_.mediaKey];
+        if (pe.state != "probing") {
+            pe.state = "ready"; pe.info = s_.mpvTracks; pe.req = 0; pe.seq = ++probeSeq_;
+            if (first && mpvChose && !picked) pe.autoOrd = s_.mpvOrd;
+        }
+        trimProbes();
+        int o;
+        if (!first && static_cast<size_t>(s_.audioOrd) < n) o = s_.audioOrd;                 // offered again: kept
+        else if (picked) o = static_cast<int>(pick->ord);
+        else if (mpvChose) o = s_.mpvOrd;                                                      // what aid=auto picked
+        else o = initialAudioOrd(T, nullptr);
+        s_.audioOrd = o;
+        stateDirty_ = true;
+        markItem(s_.itemId);
+        if (!first || !s_.set) return;
+        // THE ANALYSIS. A set named after a track (the viewer's pick, provisional) moves if it is another one. The opening's
+        // set knew no list: "" -- the engine's mpv decodes what aid=auto picks (TrMpvAudio.h), mpvOrd, once its job runs.
+        // It STAYS when that is the track chosen (the director's rule: an analysis running on aid=auto's pick is never
+        // restarted) and is NAMED now (a job sent again asks for it by its id, never aid=auto again). It moves when it is
+        // another track: the viewer's pick -- or mpv's own choice when it is not the first and the job ran before mpv chose
+        // (the wait for its list ran out): its cues are then said to be that track's (the AUD line: never loaded as the
+        // first track's -- loadCacheInto's guard) and the track's own set comes in.
+        // (U1: "translating" = the file is WANTED; one that is not moves to the track chosen only if that track has an
+        //  analysis to show -- followsSound -- and nothing starts: the rule above is untouched, a running job is renamed.)
+        tp::AudioSel& a = s_.set->audio;
+        const pbmedia::AudioTrack& t = T.audio[static_cast<size_t>(o)];
+        if (a.trackId != 0) {
+            if (a.ord != t.ord && followsSound(heardSel())) retrack(heardSel());
+            return;
+        }
+        const int decodes = s_.wire ? s_.mpvOrd : -1;
+        if (decodes >= 0 && static_cast<uint32_t>(decodes) != a.ord) {
+            a = tp::AudioSel{ static_cast<uint32_t>(decodes), T.audio[static_cast<size_t>(decodes)].track };
+            retrack(heardSel());
+            return;
+        }
+        if (a.ord == t.ord) { a.trackId = t.track; return; }
+        if (followsSound(heardSel())) retrack(heardSel());
+    }
+    // The job held for mpv's list (a container MediaTracks does not read, that mpv plays) starts: the list is adopted, or
+    // mpv lists no sound track, or its choice is final, or it let the item go. (Else the kProbeWaitMs timer starts it.)
+    void mpvWaitDone() {
+        if (!loaded_ || !s_.probeWait || probeWorthy(s_.path)) return;
+        if (!s_.tracksFromMpv && s_.mpvTracks && !s_.mpvFinal) return;   // a list, mpv's own choice still to come
+        s_.probeWait = false;
+        ensureCurrentJob(s_.lastPosMs);
+    }
     // A NEW GENERATION on another sound track of the same item (D5): the set going away writes what it owes (an edit, its
     // files), its job is cancelled (its FDONE saves its partial), and the track's own set comes in -- a pre-analysis'
     // job adopted, a cancelled job's vouched part, its cache record, or nothing yet; then its job (when translating).
@@ -1485,15 +3010,18 @@ private:
     // where the user has it (review of WE, C5). `fresh` = the set shown was a pre-WH record the probe now distrusts: none of
     // its cues come back (not through the cancelled job's set either) -- analysed from nothing.
     void retrack(const tp::AudioSel& want, bool fresh = false) {
+        flushDocxDue();                                      // (U2b G2: the set going away first writes its renamed Word file)
         if (s_.set) {
             if (s_.set->editDirty) saveEdits(*s_.set);
             else if (s_.set->srtDirty) writeSrts(*s_.set);
         }
         if (s_.wire) { if (Job* j = job(s_.wire)) cancelJob(*j); s_.wire = 0; }
+        if (s_.vwire) { if (Job* vj = job(s_.vwire)) cancelJob(*vj); s_.vwire = 0; }   // U3: the other track's voice pass
         auto set = makeSet(s_.path, s_.name, s_.folder, s_.size, s_.mtime, want);
         if (Job* pj = jobForKey(set->key)) { set = pj->set; pj->pre = false; s_.wire = pj->wire; }
+        else if (Job* vj = voiceJobForKey(set->key)) { set = vj->set; vj->pre = false; s_.vwire = vj->wire; }   // (U3)
         else if (fresh) { /* nothing: a new analysis */ }
-        else if (const CueSet* held = heldSet(set->key)) set = vouchedCopy(*held);
+        else if (const CueSet* held = heldSet(set->key); held && held->audio.ord == want.ord) set = vouchedCopy(*held);
         else loadCacheInto(*set);
         set->audio = want;
         s_.set = set;
@@ -1504,6 +3032,8 @@ private:
             s_.autoplay = s_.resumed = false;
             s_.startMs = s_.lastPosMs;
         }
+        ensureVoices(*s_.set);                               // U3: this track's transcript, if it has one
+        transcriptNow();
         if (!s_.wire) ensureCurrentJob(s_.lastPosMs);
         stateDirty_ = queueDirty_ = true;
         markItem(s_.itemId);
@@ -1723,7 +3253,7 @@ private:
         auto best = siblingRank(S.complete, S.edited, pbtrf::coverage(S.complete, merged(S.confirmed, S.ranges)));
         std::string bestKey;
         std::vector<std::string> keys;
-        for (const auto& k : pbtrf::siblingKeys(S.path, S.size, S.mtime, lang, { S.langA, S.langB }, S.audio.ord)) keys.push_back(k.key);
+        for (const auto& k : pbtrf::siblingKeys(S.path, S.size, S.mtime, lang, { S.langA, S.langB }, S.audio.ord, S.models)) keys.push_back(k.key);
         const std::string writer = host_.srtWriter(S, lang);
         const bool writerExtra = !writer.empty() && std::find(keys.begin(), keys.end(), writer) == keys.end();
         if (writerExtra) keys.push_back(writer);
@@ -1918,7 +3448,9 @@ private:
         }
     }
 
-    bool loadItem(size_t index, bool autoplay, long long startOverride) {
+    // U1: a file LOADED is read (its cache shown) and analysed only if wanted -- `want` (open's analyseFirst), or queued by
+    // "Translate all"; otherwise nothing starts (the viewer's Translate does it: analyse).
+    bool loadItem(size_t index, bool autoplay, long long startOverride, bool want = false) {
         if (index >= items_.size()) return false;
         Item& it = items_[index];
         uint64_t size = 0, mtime = 0;
@@ -1939,9 +3471,11 @@ private:
         n.path = it.path; n.folder = it.folder; n.name = it.name;
         n.size = size; n.mtime = mtime;
         n.mediaKey = pbtrf::mediaKey(it.path, size, mtime);
+        n.mediaRemote = host_.onNetwork(it.path);            // (FX2-B: a file on a share is never watched once a second)
         n.host = L"f" + w16(pbtrf::folderKey(it.folder)) + kMediaHostSuffix;
         n.url = L"https://" + n.host + L"/" + w16(pbtrf::pctEncode(u8(it.name))) + L"?v=" + w16(n.mediaKey);
         n.autoplay = autoplay;
+        n.wanted = want;                                     // U1: asked for with the opening (else: Translate, the batch)
         const auto re = resume_.find(resumeKey(it.path, size, mtime));
         n.startMs = startOverride >= 0 ? static_cast<uint64_t>(startOverride)
                   : resumeStart(re == resume_.end() ? nullptr : &re->second, it.durMs);
@@ -1954,25 +3488,38 @@ private:
         // the one mistake the wire refuses to make (TrPipe.h WH block). The set loaded meanwhile is the PROVISIONAL
         // track's -- the user's choice for this file, else the first -- so a cached result shows at once as before.
         const bool worthy = probeWorthy(it.path);
-        const auto pr = worthy ? probes_.find(n.mediaKey) : probes_.end();
+        // (1.1.0 fix round, L6: a container MediaTracks does not read whose list MPV gave earlier in this run is KNOWN too:
+        //  its "ready" entry IS that adopted list -- the opening asks mpv for the track chosen, the analysis keys on it)
+        const auto pr0 = probes_.find(n.mediaKey);
+        const bool adoptedBefore = !worthy && pr0 != probes_.end() && pr0->second.state == "ready" && pr0->second.info;
+        const auto pr = worthy || adoptedBefore ? pr0 : probes_.end();
         const bool known = pr != probes_.end() && pr->second.state != "probing" && !pr->second.state.empty();
-        n.tracksState = !worthy ? "none" : known ? pr->second.state : "probing";
+        n.tracksState = !worthy && !adoptedBefore ? "none" : known ? pr->second.state : "probing";
         n.probeWait = worthy && !known;
+        n.tracksFromMpv = adoptedBefore;
         n.probeAt = host_.nowMs();
-        // the cue set: a pre-analysis of THIS file, pair and track is ADOPTED (no model reload); else the
-        // cache; else nothing yet
+        // the cue set: a batch job ("Translate all", U1) of THIS file, pair and track is ADOPTED (no model reload); else
+        // the cache -- SHOWN as it is, complete or partial, whether or not anything is analysed; else nothing yet
         const std::string key = keyOf(it);
         Job* pj = jobForKey(key);
+        Job* vj = pj ? nullptr : voiceJobForKey(key);
         if (pj) { n.set = pj->set; n.wire = pj->wire; pj->pre = false; }
+        else if (vj) { n.set = vj->set; n.vwire = vj->wire; vj->pre = false; }     // U3: "Transcribe all"'s voice pass goes on
         else { n.set = makeSet(it.path, it.name, it.folder, size, mtime, audioFor(it)); loadCacheInto(*n.set); }
         s_ = std::move(n);
+        ensureVoices(*s_.set);                               // U3: its transcript, if it has one (shown with no press)
+        transcriptNow();
         loaded_ = true;
         if (known) {                                             // (the same choice as audioFor: no re-track here)
             s_.tracks = pr->second.state == "ready" ? pr->second.info : nullptr;
             if (s_.tracks) for (const auto& st : s_.tracks->subs) s_.embedded.push_back(Session::Emb{ next(), st.track });
             const auto pk = picks_.find(s_.mediaKey);
-            s_.audioOrd = s_.tracks ? initialAudioOrd(*s_.tracks, pk == picks_.end() ? nullptr : &pk->second) : -1;
+            s_.audioOrd = s_.tracks ? chooseOrd(pr->second, pk == picks_.end() ? nullptr : &pk->second) : -1;
         }
+        // 1.1.0 (fix round, L6): a container MediaTracks does not read, that MPV plays: the job WAITS for mpv's track list and
+        // its choice (at most kProbeWaitMs, like a probe: mpv knows both within a fraction of a second) and then starts on the
+        // track chosen, named -- not on "" (aid=auto's pick, maybe not the first) only to move a moment later
+        if (!worthy && !adoptedBefore && host_.mpvPlays()) s_.probeWait = true;
         if (s_.wire) {
             Job* j = job(s_.wire);
             if (j && shouldFocus(j->set->ranges, j->set->totalMs, s_.startMs, 0, PosReason::Play) && s_.startMs > 0) {
@@ -1986,31 +3533,55 @@ private:
         markItem(it.id);
         if (!reloading) { postStateNow(); postCuesNow(); }   // a reloading page gets it all on its `ready`
         else stateDirty_ = true;                             // the main view (the card) still wants it
-        if (s_.probeWait) requestProbe(s_.mediaKey, s_.path); // (last: its answer may come back at once)
+        if (s_.probeWait && worthy) requestProbe(s_.mediaKey, s_.path);   // (last: its answer may come back at once)
+        askTimecode(s_.mediaKey, s_.path);                   // U3: its source timecode, for the stamps (a worker; at once)
         schedule();
         return true;
     }
-    // The current item goes: its job is cancelled (its FDONE saves the partial), its proxy deleted.
+    // The current item goes: its job is cancelled (its FDONE saves the partial), its proxy deleted. U1: unless "Translate
+    // all" still wants that file -- its job then goes on as the batch's (a job for a file that is not playing; the next
+    // item, if it is wanted, takes the engine from it: ensureCurrentJob). A press was for THIS file while it played: its
+    // job stops (only the batch analyses files that are not playing).
     void endSession() {
         if (!loaded_) return;
+        flushDocxDue();                                      // U2b (G2): a renamed transcript's Word file at once -- never lost
         // WG: an item switched away from (or closed) leaves its files and its edits up to date
         if (s_.set && s_.set->editDirty) saveEdits(*s_.set);
         else if (s_.set && s_.set->srtDirty) writeSrts(*s_.set);
-        if (s_.wire) { if (Job* j = job(s_.wire)) cancelJob(*j); }
+        if (s_.wire) {
+            if (Job* j = job(s_.wire)) {
+                if ((batchQ_.count(s_.itemId) || tbatchQ_.count(s_.itemId)) && !j->cancelSent) j->pre = true;
+                else cancelJob(*j);
+            }
+        }
+        if (s_.vwire) {                                      // U3: its voice pass -- the batch's, or this file's press only
+            if (Job* vj = job(s_.vwire)) {
+                if (tbatchQ_.count(s_.itemId) && !vj->cancelSent) vj->pre = true;
+                else cancelJob(*vj);
+            }
+        }
         endProxy();
         cancelSubExtract();                                  // WH: an embedded track still being read is for this item only
         s_.extSubChunks.clear();
     }
     void ensureCurrentJob(uint64_t focus) {
-        if (!loaded_ || s_.wire || !s_.set || s_.set->complete || !translate_) return;
-        if (s_.userCancelled || s_.failed) return;
+        if (!loaded_ || s_.wire || !s_.set || s_.set->complete) return;
+        if (!analysisWanted()) return;                       // U1: never by itself -- Translate, or "Translate all" (U3: or
+                                                             // the transcript's wish: Transcribe, "Transcribe all")
+        // (U2b, U1's double-guard rule: `s_.userCancelled ||` went from here -- it could never be true behind the line above.
+        //  Every cancel that sets it also ends the wishes (cancel: wanted = false; transcriptCancel / cancelAll: both), and every
+        //  path that wishes again clears it (analyse -> runAnalysis, analyseAll, transcribe, transcribeAll, the batch's redo,
+        //  retrack, a new Session) or meets a COMPLETE set (returned above). Proof: docs/PROGRESS_U2b.md, DECISIONS. Its sentinel
+        //  is aimed at cancel()'s `s_.wanted = false;`, the one guard left.)
+        if (s_.failed) return;
         if (s_.probeWait) return;                            // WH: which sound track is not known yet (<= kProbeWaitMs)
+        if (live_) return;                                   // SUVTITLE LIVE: held while the live mode listens (setLive)
         if (!helper_) {
             if (s_.err.empty()) { s_.err = L"The SuVtitle engine is not running: files cannot be analysed."; stateDirty_ = true; }
             return;
         }
         if (s_.err == L"The SuVtitle engine is not running: files cannot be analysed.") s_.err.clear();
-        for (Job& j : jobs_) if (j.pre) cancelJob(j);     // the helper goes to the current item
+        for (Job& j : jobs_) if (j.pre) cancelJob(j);     // the helper goes to the current item (a batch job resumes later)
         // A set that kept cues it cannot vouch for (its last job died) shows them no more: the page
         // gets a new generation with exactly what the new job will not redo.
         const bool regen = trimToConfirmed(*s_.set);
@@ -2039,11 +3610,18 @@ private:
         w.langA = set->langA; w.langB = set->langB; w.mode = set->mode; w.quality = set->quality;
         w.have = tp::packRanges(merged(set->confirmed));
         w.focusMs = focus;
-        // WH: the sound track -- "" for the first one, so the wire and every cache record are exactly what they were
-        w.audio = set->audio.ord > 0 ? tp::packAudioSel(set->audio) : std::string();
+        w.asrModel = set->asrPath;      // U2: the models this set is made with ("" = the default: the pre-U2 line)
+        w.mtModel = set->mtPath;
+        // WH: the sound track -- "" for the first one, so the wire and every cache record are exactly what they were. 1.1.0
+        // (fix round, L6): except a track of a list MPV gave -- for the engine's mpv "" is aid=auto's pick (TrMpvAudio.h),
+        // which may not be the first: a track chosen there is always named
+        w.audio = set->audio.ord > 0 || (set->audio.trackId != 0 && mpvListed(set->mediaKey)) ? tp::packAudioSel(set->audio)
+                                                                                               : std::string();
         set->savedAt = host_.nowMs();
         host_.sendFile(w);
         jobs_.push_back(j);
+        noteModelsInUse();                                   // U2b: an imported model this job names is in use now
+        for (uint64_t id : batchItemsOf(*set)) redoStarted(id);   // FX (F5): a redo granted to its file has STARTED
         markKey(set->key);
         return j.wire;
     }
@@ -2056,8 +3634,12 @@ private:
         for (Job& j : jobs_) if (j.wire == wire) return &j;
         return nullptr;
     }
-    Job* jobForKey(const std::string& key) {
-        for (Job& j : jobs_) if (j.set->key == key && !j.cancelSent) return &j;
+    Job* jobForKey(const std::string& key) {                 // the ANALYSIS job of this key (U3: never a voice pass)
+        for (Job& j : jobs_) if (j.set->key == key && !j.cancelSent && !j.voice) return &j;
+        return nullptr;
+    }
+    Job* voiceJobForKey(const std::string& key) {            // U3: the voice pass running on this key's analysis
+        for (Job& j : jobs_) if (j.set->key == key && !j.cancelSent && j.voice) return &j;
         return nullptr;
     }
     bool isCurrent(const Job& j) const { return loaded_ && s_.wire == j.wire; }
@@ -2085,55 +3667,73 @@ private:
             if (r->startMs == pv->first) { r->endMs = k.startMs; break; }
     }
 
-    // ---- pre-analysis (D14) ----------------------------------------------------------------------------------------
+    // ---- "Translate all" (U1 -- it replaced the pre-analysis of the next items, D14) ------------------------------------
     void cancelPre() { for (Job& j : jobs_) if (j.pre) cancelJob(j); }
     void cancelPreFor(const Item& it) {
         const std::string k = keyOf(it);
         for (Job& j : jobs_) if (j.pre && j.set->key == k) cancelJob(j);
     }
-    // At most ONE job runs: the current item's first. Then -- translation on, the window shown on its
-    // File tab, the current item complete -- the next kPreAhead items in play order, one at a time.
+    void unqueue(uint64_t id) { if (batchQ_.erase(id)) markItem(id); }
+    // At most ONE job runs: the playing file's first -- when it is WANTED (U1). Then "Translate all": the FIRST file it
+    // still wants in the LIST's order (the playing one is ensureCurrentJob's), one at a time; a file done, failed or
+    // missing leaves it. Nothing else ever starts: no file is analysed ahead because it comes next (U1).
     void schedule() {
-        if (!translate_ || !helper_) { cancelPre(); return; }
-        ensureCurrentJob(loaded_ ? s_.lastPosMs : 0);
-        for (const Job& j : jobs_) if (!j.pre && !j.cancelSent) return;   // the current item's job runs
-        // only while something is being WATCHED: shown, on the File tab, the current item complete
-        if (!shown_ || view_ != "file" || !loaded_ || !s_.set || !s_.set->complete) { cancelPre(); return; }
-        // the candidates
-        std::vector<size_t> cands;
-        const bool wrap = repeat_ == Repeat::All;
-        if (repeat_ != Repeat::One && cur_ != npos) {
-            size_t nx = step(cur_, +1, wrap);
-            for (size_t guard = 0; nx != npos && nx != cur_ && cands.size() < kPreAhead && guard < items_.size(); ++guard) {
-                cands.push_back(nx);
-                nx = step(nx, +1, wrap);
+        if (!helper_ || live_) { cancelPre(); return; }   // (SUVTITLE LIVE: the gate, setLive)
+        if (loaded_ && s_.set && s_.set->complete) {
+            redoStarted(s_.itemId);                                       // (FX F5: a redo met by the default's analysis: ended)
+            unqueue(s_.itemId);                                           // the playing file, done
+            // U3: ...and its transcript done: its Word file up to date (its stamps known first), it leaves "Transcribe all"
+            if (tbatchQ_.count(s_.itemId) && s_.set->hasVoices && !s_.vwire && !s_.tForce && tcSettled(s_.mediaKey)) {
+                docxIfNeeded(*s_.set);
+                tunqueue(s_.itemId);
             }
         }
-        std::set<std::string> wantKeys;
-        for (size_t i : cands) wantKeys.insert(keyOf(items_[i]));
-        for (Job& j : jobs_) if (j.pre && !wantKeys.count(j.set->key)) cancelJob(j);   // no longer next
+        ensureCurrentJob(loaded_ ? s_.lastPosMs : 0);
+        ensureCurrentVoice();                                             // U3: then its voice pass (one slot: after it)
+        for (const Job& j : jobs_) if (!j.pre && !j.cancelSent) return;   // the current item's job runs (FILE or FVOICE)
+        // the playing file wants the engine and has it in a moment (its sound track is being read): nothing else meanwhile
+        if (analysisWanted() && s_.set && !s_.set->complete && !s_.userCancelled && !s_.failed && s_.probeWait) return;
+        // (a batch job whose file leaves the batch is cancelled where it leaves: Cancel, Cancel all, the file removed or
+        //  cleared from the queue, a press-only file left -- endSession; a file done or failed leaves it in onDone)
         for (const Job& j : jobs_) if (j.pre && !j.cancelSent) return;                 // one at a time
         if (jobs_.size() >= 2) return;              // two cancelled jobs still dying: let them go first
-        for (size_t i : cands) {
-            const Item& it = items_[i];
-            if (it.missing) continue;
-            // WH: a container's sound track must be known before it is analysed ahead -- its probe first (on a worker;
-            // its answer schedules again). One at a time, in play order: the next item is never overtaken.
+        if (batchQ_.empty() && tbatchQ_.empty()) return;
+        const uint64_t curId = loaded_ ? s_.itemId : 0;
+        for (const Item& it : items_) {
+            const bool tr = batchQ_.count(it.id) > 0, tx = tbatchQ_.count(it.id) > 0;   // U3: in either batch
+            if ((!tr && !tx) || it.id == curId) continue;
+            if (it.missing) { unqueue(it.id); tunqueue(it.id); continue; }
+            // WH: a container's sound track must be known before it is analysed -- its probe first (on a worker; its
+            // answer schedules again). One at a time, in the list's order: the next file is never overtaken.
             if (probeWorthy(it.path)) {
                 const std::string mk = pbtrf::mediaKey(it.path, it.size, it.mtime);
                 const auto p = probes_.find(mk);
                 if (p == probes_.end() || p->second.state.empty()) { requestProbe(mk, it.path); return; }
                 if (p->second.state == "probing") return;
             }
-            const std::string k = keyOf(it);
-            if (failedKeys_.count(k)) continue;
+            // (a file that failed left the batch in onDone -- batchFinished: Translate all asks it again, nothing else)
             const pbtrf::Summary& sm = summaryFor(it);
-            if (sm.ok && sm.complete) continue;
-            auto set = makeSet(it.path, it.name, it.folder, it.size, it.mtime, audioFor(it));
-            loadCacheInto(*set, false);
-            if (set->complete) continue;
-            startJob(set, 0, true);
-            return;
+            std::shared_ptr<CueSet> set;
+            if (!(sm.ok && sm.complete)) {
+                set = makeSet(it.path, it.name, it.folder, it.size, it.mtime, audioFor(it));
+                loadCacheInto(*set, false);
+                if (!set->complete) { startJob(set, 0, true); return; }       // its analysis, for either batch
+            }
+            redoStarted(it.id);                                           // (FX F5: a redo met by the default's analysis: ended)
+            if (tr) unqueue(it.id);
+            if (!tx) continue;
+            // U3: "Transcribe all" -- the file's analysis is complete: its voice pass if it has none, else its Word file if
+            // missing or older (ours); its stamps' timecode first (asked on a worker, kTcWaitMs at most)
+            if (!set) {
+                set = makeSet(it.path, it.name, it.folder, it.size, it.mtime, audioFor(it));
+                loadCacheInto(*set, false);
+                if (!set->complete) { startJob(set, 0, true); return; }       // (a summary that said more than its record)
+            }
+            ensureVoices(*set);
+            if (!tcSettled(set->mediaKey)) { askTimecode(set->mediaKey, it.path); return; }   // (its answer schedules again)
+            if (!set->hasVoices && startVoiceJob(set, true)) return;
+            docxIfNeeded(*set);
+            tunqueue(it.id);
         }
     }
 
@@ -2166,8 +3766,11 @@ private:
         if (loaded_ && !mapped_.count(lowerW(s_.folder)) && !s_.url.empty()) {
             // This folder cannot be served (an odd UNC share, a vanished drive): no URL -- and the
             // sound is asked for at once (v1, review of WC: a page with nothing to load waits forever).
+            // 1.1.0 (fix round, L2): NOT while mpv plays the item (it reads the file itself; the copy is the <video>'s, and
+            // forcing the first sound track for it would undo the viewer's pick in mpv): an item that falls back with no
+            // URL asks for it then (the page's translatorFilePlayFailed -> playFailed).
             s_.url.clear();
-            requestProxy();
+            if (!host_.mpvPlays()) requestProxy();
         }
     }
     // True when the page is being RELOADED to see the current item's folder (MEASURED, STEP0 M1: a
@@ -2222,7 +3825,7 @@ private:
     void proxyToFirstTrack() {
         if (!s_.tracks || s_.tracks->audio.empty()) return;    // (no track list: -1, nothing to say)
         if (s_.audioOrd != 0) { s_.audioOrd = 0; stateDirty_ = true; }
-        if (translate_ && s_.set && s_.set->audio.ord != 0) retrack(heardSel());
+        if (s_.set && s_.set->audio.ord != 0 && followsSound(heardSel())) retrack(heardSel());   // (U1: as setAudio)
     }
     void endProxy() {
         if (s_.proxyReq && s_.proxyState == "working") host_.sendCancel(s_.proxyReq);
@@ -2246,7 +3849,7 @@ private:
     }
     void saveQueueNow() {
         QueueFile q;
-        q.translate = translate_; q.repeat = repeat_; q.shuffle = shuffle_;
+        q.repeat = repeat_; q.shuffle = shuffle_;
         q.cur = cur_ == npos ? -1 : static_cast<long long>(cur_);
         for (const auto& it : items_) { QueueFile::It x; x.path = it.path; x.size = it.size; x.mtime = it.mtime; x.durMs = it.durMs; q.items.push_back(x); }
         if (shuffle_) for (size_t i : playOrder()) q.order.push_back(i);
@@ -2275,9 +3878,14 @@ private:
     }
     void refreshSummaries() {
         summaries_.clear();
+        vsummaries_.clear();                                 // (U3: the transcripts' peeks follow the keys)
+        vdocx_.clear();                                      // (FX F6: their Word files with them)
         for (size_t i = 0; i < items_.size() && i < kSummaryPeekMax; ++i) summaryFor(items_[i]);
         queueDirty_ = true;
     }
+    // A file's badge in the queue: none | missing | analysing (pct) | ready (complete -- "done") | partial (pct) | error (the
+    // analysis failed) | U1: queued ("Translate all" still has it to do; pct = what it has) | cancelled (its analysis was
+    // cancelled: Cancel, Cancel all -- until it is asked again).
     void badge(const Item& it, std::string& state, int& pct) {
         state = "none";
         pct = 0;
@@ -2287,19 +3895,23 @@ private:
             return total ? static_cast<int>(std::min<uint64_t>(100, tp::rangesTotal(r) * 100 / total)) : 0;
         };
         for (const Job& j : jobs_)
-            if (j.set->key == k && !j.cancelSent) { state = "analysing"; pct = pctOf(j.set->ranges, j.set->totalMs); return; }
+            if (!j.voice && j.set->key == k && !j.cancelSent) { state = "analysing"; pct = pctOf(j.set->ranges, j.set->totalMs); return; }
         if (loaded_ && s_.itemId == it.id && s_.set) {
             if (s_.set->complete) { state = "ready"; pct = 100; return; }
             if (!s_.set->confirmed.empty()) { state = "partial"; pct = pctOf(s_.set->confirmed, s_.set->totalMs); }
             if (s_.failed) state = "error";
+            else if (batchQ_.count(it.id)) state = "queued";
+            else if (batchCancelled_.count(it.id)) state = "cancelled";
             return;
         }
         if (failedKeys_.count(k)) { state = "error"; return; }
         if (indexOf(it.id) < kSummaryPeekMax || summaries_.count(k)) {
             const pbtrf::Summary& s = summaryFor(it);
-            if (s.ok && s.complete) { state = "ready"; pct = 100; }
-            else if (s.ok && !s.ranges.empty()) { state = "partial"; pct = pctOf(s.ranges, s.totalMs); }
+            if (s.ok && s.complete) { state = "ready"; pct = 100; return; }
+            if (s.ok && !s.ranges.empty()) { state = "partial"; pct = pctOf(s.ranges, s.totalMs); }
         }
+        if (batchQ_.count(it.id)) state = "queued";
+        else if (batchCancelled_.count(it.id)) state = "cancelled";
     }
     void markItem(uint64_t id) { if (id) itemDirty_.insert(id); }
     void markKey(const std::string& key) {
@@ -2309,14 +3921,23 @@ private:
     // ---- the posts ------------------------------------------------------------------------------------------------------
     std::string phaseOf() const {
         if (!loaded_) return "idle";
+        // SUVTITLE LIVE: the analysis is HELD while the live mode listens -- said as such, never as loading (the page
+        // would wait for subtitles that are not coming: "play when ready") nor as an error. A job the gate cancelled
+        // may still be dying (its FDONE on its way): it is already this. (U1: for a file WANTED -- one nobody asked for is
+        // "off" whatever Live does.)
+        // U1: "off" = loaded, nothing asked for it (no press, not in "Translate all"): its cache -- complete, partial or
+        // none -- is shown and nothing runs; the strip offers Translate.
+        const bool want = analysisWanted();                // (U3: either wish)
+        if (live_ && want && s_.set && !s_.set->complete && !s_.userCancelled && !s_.failed) return "live";
         if (s_.wire) {
             for (const Job& j : jobs_) if (j.wire == s_.wire) return j.phase;
             return "loading";
         }
         if (s_.set && s_.set->complete) return "done";
         if (s_.cancelling || s_.userCancelled) return "cancelled";
-        if (s_.failed || !s_.err.empty()) return translate_ ? "error" : "off";
-        return translate_ ? "loading" : "off";
+        if (s_.failed) return "error";                     // (U1: asked for, and failed -- said until asked again)
+        if (!s_.err.empty()) return want ? "error" : "off";
+        return want ? "loading" : "off";
     }
     void postStateNow() {
         stateDirty_ = false;
@@ -2352,6 +3973,8 @@ private:
         j.kv(L"langB", w16(S ? S->langB : langB_));
         j.kv(L"mode", w16(S ? S->mode : mode_));
         j.kv(L"quality", w16(S ? S->quality : quality_));
+        j.kv(L"modelsStale", S ? S->models != modelsTag_ : false);   // U2: made with other models than the ones chosen now
+        j.kv(L"redo", s_.redo);                       // U2b: a batch redoes this file with the default model -- why ("" = not)
         j.kv(L"cached", S ? (S->fromCache && S->complete) : false);
         j.kv(L"count", static_cast<long long>(S ? S->cues.size() : 0));
         j.kv(L"srtPath", S ? S->srtPath : std::wstring());
@@ -2370,7 +3993,14 @@ private:
         j.kv(L"oldEngine", S ? pbtrf::olderEngine(S->engine) : false);
         j.kv(L"err", s_.err);
         j.kv(L"cancelling", s_.cancelling);
-        j.kv(L"translate", translate_);
+        j.kv(L"translate", wantedNow());              // U1: THIS file is being analysed or asked to be (press / batch)
+        {   // U3: the TRANSCRIPT's wish (Transcribe pressed, or "Transcribe all"), its phase and its % (tphaseOf)
+            int tpct = 0;
+            const std::string tph = tphaseOf(&tpct);
+            j.kv(L"transcribe", transcribeWantedNow());
+            j.kv(L"tphase", w16(tph));
+            j.kv(L"tpct", tpct);
+        }
         j.kv(L"autoplay", s_.autoplay);
         j.kv(L"startMs", static_cast<long long>(fresh ? s_.startMs : s_.lastPosMs));
         j.kv(L"resumed", s_.resumed);
@@ -2494,6 +4124,14 @@ private:
             j.kv(L"pct", pct);
             j.kv(L"durMs", static_cast<long long>(it.durMs));
             j.kv(L"resumeMs", static_cast<long long>(re == resume_.end() ? 0 : resumeStart(&re->second, it.durMs)));
+            std::string tst;                                   // U3: the transcript's badge
+            int tpc = 0;
+            tbadge(it, tst, tpc);
+            j.kv(L"tstate", w16(tst));
+            j.kv(L"tpct", tpc);
+            j.kv(L"redo", redoRan_.count(it.id) > 0);          // U2b: a batch redid it with the default model (FX F5: STARTED)
+            j.kv(L"batch", batchQ_.count(it.id) > 0 || tbatchQ_.count(it.id) > 0);   // FX (F7): what Cancel all acts on
+            j.kv(L"tdoc", tdocOf(it));                         // FX (F6): where its Word file is, or why there is none
             j.end();
         }
         j.end();
@@ -2501,7 +4139,7 @@ private:
         j.kv(L"loaded", loaded_);
         j.kv(L"repeat", w16(repeatName(repeat_)));
         j.kv(L"shuffle", shuffle_);
-        j.kv(L"translate", translate_);
+        // (U1: no `translate` any more -- there is no global switch; each item's badge says what is being done for it)
         j.end();
         host_.postWindow(j.take());
         itemDirty_.clear();                        // the whole list carried every badge
@@ -2514,7 +4152,13 @@ private:
         int pct = 0;
         badge(items_[i], st, pct);
         JsonW j;
-        j.obj().kv(L"type", L"playerItem").kv(L"id", static_cast<long long>(id)).kv(L"state", w16(st)).kv(L"pct", pct).end();
+        std::string tst;                                       // U3: the transcript's badge
+        int tpc = 0;
+        tbadge(items_[i], tst, tpc);
+        j.obj().kv(L"type", L"playerItem").kv(L"id", static_cast<long long>(id)).kv(L"state", w16(st)).kv(L"pct", pct)
+               .kv(L"tstate", w16(tst)).kv(L"tpct", tpc).kv(L"redo", redoRan_.count(id) > 0)   // (U2b: redo; FX F5: STARTED)
+               .kv(L"batch", batchQ_.count(id) > 0 || tbatchQ_.count(id) > 0)                // (FX F7)
+               .kv(L"tdoc", tdocOf(items_[i])).end();                                       // (FX F6)
         host_.postWindow(j.take());
     }
     void postCmd(const char* op, uint64_t ms) {

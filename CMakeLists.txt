@@ -18,7 +18,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(SuVtitle
-    VERSION 1.0.0
+    VERSION 1.1.0
     DESCRIPTION "SuVtitle - subtitle player with offline transcription and translation"
     LANGUAGES C CXX)
 

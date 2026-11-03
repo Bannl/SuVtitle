@@ -18,6 +18,25 @@
 // ok=0 "superseded"); any other src gets a small file at out + ok=1.
 // Every message received is appended to fake_rx.log (one line, tabs shown as |), after a
 // "START <pid>" line per incarnation -- that log is how the smoke proves what was SENT.
+//
+// SUVTITLE LIVE (1.1.0, L2 2026-10-25): the LIVE half too, scripted by the STRIP's LABEL and the live CTL:
+//   LIVE 1 <strips>  STATE live=1 (+ the live pair it was given), then INPUT <key> open per strip; a strip labelled
+//                    "crash" makes the process die ~100 ms later (a capture driver taking the engine down: RV2-5),
+//                    one labelled "levels" makes it write 500 LEVELS back to back (the newest = -12.5 dBFS)
+//   LIVE 0           STATE live=0
+//   SRCLIST          SRC x3 (in, out, app) + SRCEND, a new gen each time; the SECOND list of an incarnation is SHORT
+//                    (SRCEND says 4: the manager must ask again), and so is every list from the FOURTH on (a list that
+//                    stays short: the manager asks again twice, then delivers it as it is)
+//   CTL scope=live   STATE echo of the live pair; with clear=1 and langA "dr": 300 LINE (segId 1..300) then the
+//                    process exits AT ONCE -- AudioPB 1.1.0's rv5_drain helper (RV5-1), on the live CTL
+// FIX ROUND (2026-10-26): a LIVE 1 with a strip labelled "refuse" is REFUSED the engine's way (one STATE whose err says
+// why, the live state unchanged: no INPUT); with the file "srcdie.flag" next to the exe, a SRCLIST makes the process die
+// (an engine that crashes while it enumerates: every incarnation, while the flag is there).
+// U3 (2026-11-02, the TRANSCRIPTION): FVOICE, in the FILE job's slot (a FILE or an FVOICE cancels the held job, either
+// kind), scripted by its PATH:
+//   voice3      FPROG voices, ONE FSPK (one label per piece: 1, 2, 1, ...; 2 speakers, model "campplus"), FDONE ok <n>
+//   voicehold   FPROG voices, then waits: FCANCEL -> FDONE cancelled; a newer FILE / FVOICE -> cancelled (no FSPK)
+//   voicecrash  FPROG voices, then the process dies (no FDONE: the tray must make one up)
 // =============================================================================
 #include "../../../common/TrPipe.h"
 
@@ -152,6 +171,28 @@ int wmain(int argc, wchar_t** argv) {
             } else {
                 done(pipe, f.jobId, "error", 0, "unknown test file");
             }
+        } else if (t[0] == "FVOICE") {                      // U3: the voice pass (the FILE job's slot)
+            tp::WireVoice v;
+            if (!tp::unpackVoice(t, v)) continue;
+            if (heldJob) { done(pipe, heldJob, "cancelled", 0); heldJob = 0; }   // the slot is shared: either kind cancels
+            std::vector<tp::MsRange> spans;
+            tp::parseRanges(v.spans, spans);
+            prog(pipe, v.jobId, "voices", 0, 9000);
+            if (v.path == "voice3") {
+                tp::WireSpk s;
+                s.jobId = v.jobId; s.model = "campplus";
+                for (size_t i = 0; i < spans.size(); ++i) s.labels.push_back(1u + (uint32_t)(i % 2));
+                s.speakers = spans.size() >= 2 ? 2u : 1u;
+                send(pipe, tp::packSpk(s));
+                done(pipe, v.jobId, "ok", (uint32_t)spans.size());
+            } else if (v.path == "voicehold") {
+                heldJob = v.jobId;
+            } else if (v.path == "voicecrash") {
+                ::Sleep(50);
+                ::ExitProcess(4);
+            } else {
+                done(pipe, v.jobId, "error", 0, "unknown test file");
+            }
         } else if (t[0] == "FCANCEL") {
             uint64_t id = 0;
             if (!tp::unpackFileCancel(t, id)) continue;
@@ -166,7 +207,71 @@ int wmain(int argc, wchar_t** argv) {
             const std::wstring out(p.out.begin(), p.out.end());   // the smoke's paths are ASCII
             if (_wfopen_s(&o, out.c_str(), L"wb") == 0 && o) { std::fputs("RIFF", o); std::fclose(o); }
             proxyDone(pipe, p.jobId, true, p.out, "");
+        // ---- SUVTITLE LIVE (1.1.0) ----------------------------------------------------------------------------------
+        } else if (t[0] == "LIVE") {
+            tp::WireLive l;
+            if (!tp::unpackLive(t, l)) continue;            // the real engine answers STATE err; the smoke never sends one
+            bool refuse = false;
+            for (const auto& in : l.inputs) refuse = refuse || in.label == "refuse";
+            if (refuse) {                                   // (fix round) the engine's refusal: one STATE with err, live unchanged
+                tp::WireState r = st;
+                r.err = "The live translation could not open these inputs.";
+                send(pipe, tp::packState(r));
+                continue;
+            }
+            st.live = l.on;
+            send(pipe, tp::packState(st));
+            if (!l.on) continue;
+            for (const auto& in : l.inputs) {
+                tp::WireInput wi;
+                wi.key = in.key; wi.state = "open";
+                send(pipe, tp::packInput(wi));
+            }
+            for (const auto& in : l.inputs) {
+                if (in.label == "crash") { ::Sleep(100); ::ExitProcess(9); }
+                if (in.label == "levels") {
+                    for (int i = 0; i < 500; ++i) {
+                        tp::WireLevels lv;
+                        lv.peaks.push_back({ in.key, i == 499 ? -12.5f : -60.0f + static_cast<float>(i % 40) });
+                        send(pipe, tp::packLevels(lv));
+                    }
+                }
+            }
+        } else if (t[0] == "SRCLIST") {
+            {   // (fix round) an engine that crashes while it enumerates -- while the smoke's flag file is there
+                const std::wstring flag = g_log.substr(0, g_log.find_last_of(L"\\/") + 1) + L"srcdie.flag";
+                if (::GetFileAttributesW(flag.c_str()) != INVALID_FILE_ATTRIBUTES) { ::Sleep(50); ::ExitProcess(8); }
+            }
+            static uint32_t gen = 0, lists = 0;
+            ++gen; ++lists;
+            const char* const rows[3][4] = { { "in", "in:{0.0.1.00000000}.{mic}", "Microphone (USB)", "default,comm" },
+                                             { "out", "out:{0.0.0.00000000}.{spk}", "Speakers", "default" },
+                                             { "app", "app:zoom.exe", "Zoom Meetings", "" } };
+            for (const auto& r : rows) {
+                tp::WireSrc s;
+                s.gen = gen; s.kind = r[0]; s.key = r[1]; s.label = r[2]; s.state = "ok"; s.rate = 48000; s.ch = 2; s.flags = r[3];
+                send(pipe, tp::packSrc(s));
+            }
+            tp::WireSrcEnd e;
+            e.gen = gen; e.n = (lists == 2 || lists >= 4) ? 4u : 3u;   // the 2nd list of this incarnation is SHORT (asked again); so is every list from the 4th on (a list that STAYS short: the bound)
+            send(pipe, tp::packSrcEnd(e));
+        } else if (t[0] == "CTL") {
+            tp::WireCtl c;
+            if (!tp::unpackCtl(t, c) || !tp::ctlIsLive(c)) continue;
+            if (c.clear && c.langA == "dr") {               // AudioPB 1.1.0's rv5_drain: its last words, then gone
+                for (int i = 1; i <= 300; ++i) {
+                    tp::WireLine l;
+                    l.tEpochMs = 1000 + (uint64_t)i; l.lang = "en"; l.dstLang = "fr";
+                    l.src = "live " + std::to_string(i); l.dst = "direct " + std::to_string(i);
+                    l.segId = (uint64_t)i; l.seq = 1; l.closes = true;
+                    send(pipe, tp::packLine(l));
+                }
+                ::ExitProcess(0);
+            }
+            if (!c.mode.empty()) st.liveMode = c.mode;
+            if (!c.langA.empty() && !c.langB.empty()) { st.liveLangA = c.langA; st.liveLangB = c.langB; }
+            send(pipe, tp::packState(st));                  // the echo of the live pair (the engine's STATE wins)
         }
-        // CTL and anything else: logged above, nothing to answer.
+        // anything else: logged above, nothing to answer.
     }
 }

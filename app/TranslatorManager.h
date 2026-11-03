@@ -11,6 +11,24 @@
 // = the next one at once); RV2-2 stop() interrupts a start in progress (quitEv_ in every wait of it, the kill handle
 // published right after CreateProcess); RV2-5 an engine that dies within 30 s of its HELLO counts as a failed start
 // (the same "keeps failing to start" sentence at the third in a row, and a growing wait). See TranslatorManager.cpp.
+// SUVTITLE LIVE (1.1.0, 2026-10-25 -- docs/LIVE_PLAN.md section 4.3; the live half is AudioPB 1.1.0's, commit 50f79d6,
+// whose LINE/PART/END queue, cap and drainLastWords this file already had): the WANTED live state (setLive -> LIVE) and
+// the LIVE pair (setLiveMode / setLivePair -> CTL scope=live, which also carries the Clear) are re-emitted after a
+// respawn like the player's pair -- never a FILE; SRCLIST (requestSources, re-asked after a respawn); the picker's list
+// assembled here (SRC ... SRCEND -> ONE Msg::Kind::Sources, a short count asked again); INPUT on the ordered queue,
+// never capped; LEVELS in a latest-wins slot, never queued (pollLevels); and RV2-5 extended to the live path: a death
+// within 30 s of a LIVE 1 is a failed start, and the THIRD in a row drops the wanted LIVE (pollLiveDropped) -- a capture
+// driver that kills the engine must not keep it in a respawn loop (the player needs it too).
+// FIX ROUND (2026-10-26, docs/REVIEW_RV-LB.md + LIVE_PLAN.md "ADDENDUM FIX ROUND"): RVB-5 a REFUSED LIVE drops the wish
+// (pollLiveRefused); RVB-6 each message says which engine incarnation said it (Msg::gen); RVB-7 the list's ask only while
+// the picker wants it (stopSources) and dropped after three deaths right after a SRCLIST; RVB-8 deaths LATER in a listen
+// counted in a sliding window (back-off, then the wish dropped); RVB-13 only the user's NEW wish forgives the live
+// deaths, and RV2-5's 30 s clock restarts only when the DEVICES change (not for a trim or a name).
+// U3 (2026-11-02, the TRANSCRIPTION -- docs/PROGRESS_U3.md section 9; proofs in tests/cpp/trmgr/trmgr_smoke.cpp [V1]-[V5]):
+// startVoice (FVOICE, the transcript's voice pass) shares the FILE job's rules -- ONE engine job slot, so an unsent FILE or
+// FVOICE is superseded by the next of either kind (FDONE cancelled), cancelFile cancels it, exactly one FDONE per start,
+// never re-sent after a respawn (a death answers it: "...stopped while recognising the voices."); FSPK arrives as
+// Msg::Kind::FileSpk on the same ordered queue (before its FDONE, never capped).
 // --- the original header follows; read "the tray" as SuVtitle.exe and "the helper" as SuVtitleEngine.exe ---
 //
 // The tray's supervisor for AudioPBTranslator.exe. FxBusManager's little brother:
@@ -58,6 +76,12 @@ public:
     using Cue       = pbt::trpipe::WireCue;
     using FileDone  = pbt::trpipe::WireFileDone;
     using ProxyDone = pbt::trpipe::WireProxyDone;
+    using Spk       = pbt::trpipe::WireSpk;     // U3: the voice pass' names (FSPK)
+    // SUVTITLE LIVE (1.1.0): the live path's own messages (TrPipe.h, "SUVTITLE LIVE").
+    using LiveIn = pbt::trpipe::WireLiveInput;
+    using Src    = pbt::trpipe::WireSrc;
+    using Input  = pbt::trpipe::WireInput;
+    using Levels = pbt::trpipe::WireLevels;
 
     // One thing the helper said. Finished lines, LIVE lines and the END of an utterance
     // share ONE queue, and that is a correctness requirement rather than tidiness: a
@@ -77,8 +101,13 @@ public:
     // they are NEVER dropped by the cap below. A live line is superseded by design and the oldest
     // is the cheapest thing to lose when the UI thread is wedged; a cue is a subtitle of a FILE,
     // and losing one leaves a hole in the .srt that no later message will ever fill.
+    //
+    // SUVTITLE LIVE (1.1.0) added two kinds, NEVER capped either: Sources (the picker's whole list, assembled here
+    // from SRC ... SRCEND) and Input (one input's state CHANGE -- a lost "absent" would leave a lamp lying). LEVELS is
+    // NOT a kind: a meter wants the newest value, never a backlog (pollLevels).
     struct Msg {
-        enum class Kind { Line, Partial, End, FileProg, FileCue, FileDone, ProxyDone };
+        // U3: FileSpk appended (a voice pass' names, once, just before its FDONE ok -- never capped either).
+        enum class Kind { Line, Partial, End, FileProg, FileCue, FileDone, ProxyDone, Sources, Input, FileSpk };
         Kind      kind = Kind::Line;
         Line      line;      // Kind::Line
         Partial   part;      // Kind::Partial
@@ -87,6 +116,15 @@ public:
         Cue       cue;       // Kind::FileCue
         FileDone  fdone;     // Kind::FileDone  (real, or SYNTHESIZED -- see startFile)
         ProxyDone pdone;     // Kind::ProxyDone (ditto)
+        Spk       spk;       // Kind::FileSpk (U3)
+        // SUVTITLE LIVE: Kind::Sources = one complete list (`srcGen` = the engine's gen: it restarts with each engine
+        // incarnation, so a reader must take the newest MESSAGE, never compare gens across them); Kind::Input = one state.
+        uint32_t         srcGen = 0;
+        std::vector<Src> srcs;
+        Input            input;
+        // SUVTITLE LIVE (fix round, RVB-6): the engine INCARNATION that said it (1 = the first spawn of this manager, +1 at
+        // each respawn). Every engine names its voice clusters from S1 again: the bridge keys a voice by its incarnation too.
+        uint32_t         gen = 0;
         // WE (player v2): true when this FDONE/FPROXYDONE was MADE UP here (the helper died, never
         // got the command, was never there) rather than said by the helper. The player's partial
         // cache depends on it: the helper's own last word vouches for what it reported before it,
@@ -145,8 +183,14 @@ public:
     //
     // EXACTLY ONE FDONE per startFile() and ONE FPROXYDONE per requestProxy(), real or
     // synthesized -- which is the only thing the bridge needs to know to never wait forever.
-    void startFile(const pbt::trpipe::WireFile& f);     // an UNSENT older FILE is dropped: FDONE cancelled
-    // A FILE's id or an FPROXY's (one counter, so an id names one of them): unsent -> dropped and
+    void startFile(const pbt::trpipe::WireFile& f);     // an UNSENT older FILE (or FVOICE) is dropped: FDONE cancelled
+    // U3: the transcript's VOICE PASS on a finished analysis (TrPipe.h FVOICE). The engine runs it in the FILE job's
+    // slot, so it follows startFile's rules to the letter: an UNSENT older FILE or FVOICE is dropped (FDONE cancelled),
+    // a FILE started after it drops it while unsent, cancelFile(id) cancels it, a manager that is not running answers
+    // it at once, a death answers it, it is never re-sent. Its answer: FPROG phase "voices", ONE FSPK (Kind::FileSpk)
+    // when it ends well, then exactly one FDONE.
+    void startVoice(const pbt::trpipe::WireVoice& v);
+    // A FILE's, an FVOICE's or an FPROXY's id (one counter, so an id names one of them): unsent -> dropped and
     // answered "cancelled" here; sent -> FCANCEL, and the helper answers.
     void cancelFile(uint64_t id);
     // An UNSENT older FPROXY is dropped with FPROXYDONE err="superseded" -- the same answer the
@@ -163,6 +207,45 @@ public:
     std::string preset() const;
     std::string langA()  const;
     std::string langB()  const;
+
+    // ---- SUVTITLE LIVE (1.1.0) ---------------------------------------------------------------------------------
+    // The WANTED live state: listening on these strips, or not. `inputs` must already be a set the engine accepts
+    // (the bridge checks it with the engine's own parser: AppConfig.h liveSetNormal); on = false clears them. Written
+    // as LIVE after the lap's CTLs and BEFORE its file commands (a LIVE 0 always reaches the engine before the FILE
+    // that resumes the player's analysis), and RE-SENT after a respawn while wanted -- the pair's contract, never the
+    // FILE's. An unchanged wish sends nothing. A new wish to listen also forgives the engine its earlier live deaths
+    // (see pollLiveDropped): it is the user's gesture to try again.
+    void setLive(bool on, const std::vector<LiveIn>& inputs);
+    bool liveWanted() const;
+    // The LIVE pair and direction (TrPipe.h CTL scope=live): the player's setMode/setPair contract, for the other pair
+    // -- "" = the engine's own engine.txt decides; both halves of the pair travel together; re-pushed after a respawn
+    // once chosen. The Clear (askClear) rides THIS CTL: it acts on the live path, the only one with a queue.
+    void setLiveMode(const std::string& mode);
+    void setLivePair(const std::string& a, const std::string& b);
+    std::string liveMode()  const;
+    std::string liveLangA() const;
+    std::string liveLangB() const;
+    // SRCLIST: "send me the source list". Answered by ONE Msg::Kind::Sources (assembled here); the engine pushes a new
+    // list by itself on every change from then on -- per incarnation, so the ask is RE-SENT after a respawn.
+    // Fix round (RVB-7): ...WHILE THE PICKER WANTS IT. stopSources() = the picker closed (or the Live window, or its page
+    // reloaded): no later incarnation is asked. And an engine that dies within kSrcDeathMs of a SRCLIST three times in a
+    // row (a driver that crashes the enumeration) drops the ask, said once -- requestSources() (the user opening the
+    // picker again) forgives.
+    void requestSources();
+    void stopSources();
+    // LEVELS: true + the newest one when the engine sent any since the last call (latest wins, nothing queued).
+    bool pollLevels(Levels& out);
+    // RV2-5, the live path: true ONCE when the manager has just DROPPED the wanted LIVE -- the engine died within 30 s
+    // of a LIVE 1 three times in a row (a capture driver that kills it, most likely): listening is off, the engine
+    // respawns without it, the warning says why. The bridge turns its own listening state off.
+    // Fix round (RVB-8): ...or it died while LISTENING, later than 30 s after the LIVE 1, kLiveLateMax times within
+    // kLiveLateWindowMs (a capture / diarization crash that needs a long utterance) -- the second such death also waits
+    // kLiveLateBackoffMs before the respawn (the models are not reloaded in a tight loop).
+    bool pollLiveDropped();
+    // Fix round (RVB-5): true ONCE + the engine's sentence when it REFUSED the wanted LIVE (TrPipe.h: one STATE whose
+    // err says why, the live state unchanged -- a test input outside a test engine, a capture that would not start):
+    // the wish is dropped here (never re-sent to a respawned engine), the bridge turns its listening off and shows why.
+    bool pollLiveRefused(std::string& why);
 
     // ---- the WAKE (wave W1) ------------------------------------------------
     // Called by the WORKER thread, with no lock held, immediately after anything the UI
@@ -195,12 +278,14 @@ private:
     // correlation id (FPROXY) -- kept apart from the wire string so cancelFile() can find an
     // unsent FILE without parsing anything.
     struct FileCmd {
-        enum class Kind { File, Cancel, Proxy, Focus };
+        enum class Kind { File, Cancel, Proxy, Focus, Voice };   // U3: Voice (FVOICE) -- a job like File
         Kind        kind = Kind::File;
         uint64_t    id = 0;
         std::string wire;
         pbt::trpipe::WireFile file;    // Kind::File: kept so an FFOCUS can patch it while unsent
     };
+    // The CAPPED kinds: the live lines (superseded by design). SUVTITLE LIVE: Sources and Input are live-PATH messages
+    // but not lines -- a list or a state change lost to the cap would never be said again -- so they are not here.
     static bool isLiveKind(Msg::Kind k) {
         return k == Msg::Kind::Line || k == Msg::Kind::Partial || k == Msg::Kind::End;
     }
@@ -231,6 +316,20 @@ private:
     std::string             mode_, preset_, langA_, langB_;
     bool                    ctlPending_ = false;   // nothing to push until the user chooses
     bool                    clearPending_ = false;
+    // SUVTITLE LIVE (1.1.0). The LIVE pair: the rule of mode_/langA_/langB_ above, for the CTL scope=live.
+    std::string             liveMode_, liveLangA_, liveLangB_;
+    bool                    liveCtlPending_ = false;
+    pbt::trpipe::WireLive   live_;                 // the WANTED live state (on + strips)
+    bool                    livePending_ = false;  // live_ not written yet (to this incarnation)
+    bool                    srcWanted_ = false;    // a list was asked for once: re-asked of every new incarnation
+    bool                    srcListPending_ = false;
+    Levels                  levels_;               // the newest LEVELS (latest wins)
+    bool                    levelsDirty_ = false;
+    int                     liveFailStreak_ = 0;   // deaths within 30 s of a LIVE 1, in a row (RV2-5, the live path)
+    bool                    liveDropped_ = false;  // pollLiveDropped's one-shot
+    std::deque<uint64_t>    liveLateDeaths_;       // fix round (RVB-8): deaths while listening, > 30 s after the LIVE 1
+    std::string             liveRefused_;          // fix round (RVB-5): pollLiveRefused's one-shot ("" = none)
+    int                     srcFailStreak_ = 0;    // fix round (RVB-7): deaths right after a SRCLIST, in a row
     State                   state_;
     bool                    stateDirty_ = false;
     std::deque<Msg>         msgs_;

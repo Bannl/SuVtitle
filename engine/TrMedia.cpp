@@ -6,6 +6,7 @@
 // characters changed (house rule: ASCII-only C++).
 // =============================================================================
 #include "TrMedia.h"
+#include "TrMpvAudio.h"        // 1.1.0 (N3): libmpv, the player's own decoder (TrMedia.h, "THE DECODER")
 
 #include <mfapi.h>
 #include <mfidl.h>
@@ -32,6 +33,13 @@ namespace {
 
 // The DLL the presence check looks for; the selftest renames it to prove the refusal.
 std::wstring g_mfDllForTest;
+
+// N3: the decoder a Mono16k reader tries first (TrMedia.h). Media Foundation unless the engine says otherwise.
+std::atomic<int> g_analysisDecoder{(int)AnalysisDecoder::MediaFoundation};
+// N3: a seek through libmpv starts its session this much BEFORE the target and drops it: the decoder's warm-up (an
+// AAC / AC-3 frame's overlap, an MP3 bit reservoir, Opus' pre-roll -- all under 0.3 s), as kSeekPrerollSec does for
+// Media Foundation; ~1 s of audio costs 2-5 ms to decode.
+constexpr double kMpvPrerollSec = 1.0;
 
 constexpr uint32_t kRate16k = 16000;
 // A gap in a stream's timestamps smaller than this is jitter (measured: < 12 ms in every
@@ -720,11 +728,65 @@ struct MediaReader::Impl {
         return false;
     }
 
+    // ---- 1.1.0 (N3): LIBMPV, the player's decoder (TrMedia.h "THE DECODER", TrMpvAudio.h) ------------------------------
+    // One session delivers the stream from where it was opened; THE SAME pos / leadZeros / pendF / srcEof as the Media
+    // Foundation path carry the timeline, so readFloat / discardTo / eof() serve both. A session's first sample lies at
+    // the player's time-pos firstPts: before the frame asked, the difference is dropped (mpTrim); after it, it is silence
+    // owed (leadZeros) -- the lead of an edit list, of a late audio track, of a start time.
+    std::unique_ptr<MpvPcm> mp;          // set = this reader decodes through libmpv
+    int      mpOrd = -1;                 // the sound track asked, in container order (-1 = mpv's own choice); kept by every seek
+    uint64_t mpTrim = 0;                 // session samples still to drop before the next one handed out
+    std::vector<float> mpScratch;
+
+    bool pullMpv(std::string& err) {
+        mpScratch.clear();
+        if (!mp->read(mpScratch, kRate16k, err)) return false;          // ~1 s (the job reads 4 s at a time)
+        size_t from = 0;
+        if (mpTrim) {
+            from = (size_t)std::min<uint64_t>(mpTrim, mpScratch.size());
+            mpTrim -= from;
+            if (inSeek) seekDecoded += (uint64_t)from * std::max<uint32_t>(1, info.nativeRate) / kRate16k;
+        }
+        pendF.insert(pendF.end(), mpScratch.begin() + (std::ptrdiff_t)from, mpScratch.end());
+        if (mp->eof()) srcEof = true;
+        return true;
+    }
+
+    // (Re)open the session so that frame `target` is the next one handed out: opened kMpvPrerollSec before it (exact
+    // start, TrMpvAudio.h), its landing put right from its first sample's time-pos, the warm-up dropped HERE (where the
+    // seek's `abort` is polled), not in the next read. false = an error (`err`) -- or aborted (the reader is then broken).
+    bool mpStart(uint64_t target, std::string& err) {
+        const double tSec = (double)target / kRate16k;
+        const double s = target ? std::max(0.0, tSec - kMpvPrerollSec) : 0.0;
+        pendF.clear();
+        leadZeros = 0;
+        mpTrim = 0;
+        srcEof = false;
+        pos = target;
+        if (!mp) mp.reset(new MpvPcm());
+        static const std::function<bool()> kNever;
+        if (!mp->open(path, s, mpOrd, err, abortFn ? *abortFn : kNever)) {
+            if (mp->lastFail() == MpvPcm::Fail::Aborted) { aborted = true; broken = true; err.clear(); }
+            return false;
+        }
+        const MpvPcm::Facts& fx = mp->facts();
+        if (fx.endedAtOnce) { srcEof = true; return true; }             // no sound from there on: the reader is at its end
+        const int64_t first = (int64_t)std::llround(fx.firstPts * (double)kRate16k);
+        if (first > (int64_t)target) leadZeros = (uint64_t)(first - (int64_t)target);
+        else mpTrim = (uint64_t)((int64_t)target - first);
+        while (mpTrim && !srcEof) {
+            if (pollAbort()) return false;
+            if (!pullMpv(err)) return false;
+        }
+        return true;
+    }
+
     ~Impl() { closeAll(); }
     void closeAll() {
         release(rd);
         if (f != INVALID_HANDLE_VALUE) { ::CloseHandle(f); f = INVALID_HANDLE_VALUE; }
         delete rs; rs = nullptr;
+        mp.reset();                      // N3: the libmpv session (its pipe first, then mpv: TrMpvAudio.cpp)
     }
 
     const Fold& foldFor(uint32_t inCh, uint32_t mask) {
@@ -1086,6 +1148,7 @@ struct MediaReader::Impl {
     }
 
     bool pull(std::string& err) {
+        if (mp) return pullMpv(err);
         if (f != INVALID_HANDLE_VALUE) return pullAiff(err);
         return out == Out::Mono16k ? pullMf16(err) : pullMf(err);
     }
@@ -1842,7 +1905,66 @@ bool MediaReader::open(const std::wstring& path, Out out, std::string& err) {
     return open(path, out, AudioTrack(), err);
 }
 
+void setAnalysisDecoder(AnalysisDecoder dec) { g_analysisDecoder.store((int)dec); }
+AnalysisDecoder analysisDecoder() { return (AnalysisDecoder)g_analysisDecoder.load(); }
+
 bool MediaReader::open(const std::wstring& path, Out out, const AudioTrack& track, std::string& err) {
+    close();
+    err.clear();
+    // ---- N3: LIBMPV FIRST, when the engine asked for it (TrMedia.h "THE DECODER") -------------------------------------
+    // Before Media Foundation is even started: a Windows N PC without the Media Feature Pack analyses through libmpv.
+    // A FILE-level failure (or no libmpv at all) falls back to Media Foundation; a TRACK-level one is final.
+    std::string mpvWhy, mpvErr;
+    if (out == Out::Mono16k && analysisDecoder() == AnalysisDecoder::MpvFirst) {
+        Impl& d = *d_;
+        d.out = out;
+        d.path = path;
+        d.track = track;
+        d.rate = kRate16k;
+        d.ch = 1;
+        d.mpOrd = track.chosen ? (int)std::min<uint32_t>(track.ord, 0x7FFFFFFF) : -1;
+        if (d.mpStart(0, err)) {
+            const MpvPcm::Facts& f = d.mp->facts();
+            MediaInfo& mi = d.info;
+            mi.durationMs     = f.durationSec > 0.0 ? (uint64_t)std::llround(f.durationSec * 1000.0) : 0;
+            mi.hasVideo       = f.hasVideo;
+            mi.nativeRate     = f.rate;
+            mi.nativeChannels = f.channels;
+            mi.codec          = f.codec;
+            mi.leadSec        = f.firstPts > 0.0 ? f.firstPts : 0.0;   // where the player's clock meets the first sample
+            mi.trimSec        = 0.0;
+            mi.seekMode       = "mpv";
+            mi.audioStreams   = (uint32_t)std::max(0, f.audioTracks);
+            mi.streamIndex    = f.aid > 0 ? (uint32_t)f.aid : 0;
+            mi.trackOrd       = f.ord;
+            mi.trackId        = f.srcId;
+            mi.trackLang      = f.lang;
+            mi.trackName      = f.title;
+            mi.trackHow       = f.defaultPick ? "mpv-default" : "mpv";
+            mi.decoder        = "mpv";
+            return true;
+        }
+        const MpvPcm::Fail k = d.mp ? d.mp->lastFail() : MpvPcm::Fail::File;
+        if (k == MpvPcm::Fail::Track) { close(); return false; }      // final: the player has no other decoder either
+        if (k == MpvPcm::Fail::NoLibrary) mpvWhy = err;
+        else mpvErr = err;
+        close();
+        err.clear();
+    }
+    // Media Foundation decides -- and when it cannot read the file either, libmpv's sentence is the one (the player's word)
+    if (!openMf(path, out, track, err)) {
+        if (!mpvErr.empty()) err = mpvErr;
+        return false;
+    }
+    d_->info.decoder = d_->info.aiff ? "aiff" : "mf";
+    d_->info.decoderNote = !mpvErr.empty() ? "libmpv could not open the file: " + mpvErr
+                         : !mpvWhy.empty() ? "libmpv unavailable: " + mpvWhy : std::string();
+    return true;
+}
+
+// The Media Foundation / AIFF reader -- the whole pre-N3 open(), unchanged; a decoded seek going backwards re-opens HERE
+// (never through open(): a reader stays on the decoder it started with, so its timeline never changes mid-file).
+bool MediaReader::openMf(const std::wstring& path, Out out, const AudioTrack& track, std::string& err) {
     close();
     Impl& d = *d_;
     d.out = out;
@@ -2032,7 +2154,7 @@ bool MediaReader::readFloat(std::vector<float>& outv, size_t maxFrames, std::str
     Impl& d = *d_;
     if (d.out != Out::Mono16k) { err = "internal: readFloat on a PCM16 reader"; return false; }
     if (d.broken) { err = "internal: a read after an aborted seek (seek again first)"; return false; }
-    if (!d.rd && d.f == INVALID_HANDLE_VALUE) { err = "internal: a read from a reader that is not open"; return false; }
+    if (!d.rd && d.f == INVALID_HANDLE_VALUE && !d.mp) { err = "internal: a read from a reader that is not open"; return false; }
     while (d.pendF.size() < maxFrames && !d.srcEof) {
         if (!d.pull(err)) return false;
     }
@@ -2076,7 +2198,7 @@ bool MediaReader::readPcm16(std::vector<int16_t>& outv, size_t maxFrames, std::s
 bool MediaReader::seek(uint64_t frame, std::string& err, const std::function<bool()>& abort) {
     err.clear();
     if (d_->out != Out::Mono16k) { err = "internal: seek on a PCM16 reader"; return false; }
-    if (!d_->rd && d_->f == INVALID_HANDLE_VALUE) { err = "internal: seek on a reader that is not open"; return false; }
+    if (!d_->rd && d_->f == INVALID_HANDLE_VALUE && !d_->mp) { err = "internal: seek on a reader that is not open"; return false; }
     // While a seek runs, the Impl polls `abort` and counts what it decodes; a re-open replaces the
     // Impl, so this is set on whichever one is current, and cleared on the way out.
     auto arm = [&](Impl& d) { d.abortFn = &abort; d.inSeek = true; d.aborted = false; };
@@ -2087,6 +2209,29 @@ bool MediaReader::seek(uint64_t frame, std::string& err, const std::function<boo
         if (d.aborted) { err.clear(); return false; }
         return ok;
     };
+    // N3: LIBMPV -- what is decoded or a little ahead is read to (as below); anything else is a NEW session opened exactly
+    // there (TrMpvAudio.h: the player's timeline, within half a 16 kHz sample), whatever the container.
+    if (d_->mp) {
+        Impl& d = *d_;
+        arm(d);
+        d.seekDecoded = 0;
+        if (!d.broken) {
+            if (frame == d.pos) { d.seekHow = "none"; return done(true); }
+            if (frame > d.pos && frame - d.pos <= d.leadZeros + d.pendF.size()) {
+                d.seekHow = "pending";
+                return done(d.discardTo(frame, err));
+            }
+            if (frame > d.pos && frame - d.pos <= (uint64_t)(kSeekForwardSec * kRate16k)) {
+                d.seekHow = "forward";
+                return done(d.discardTo(frame, err));
+            }
+        }
+        d.broken = false;
+        d.seekHow = frame < (uint64_t)(kSeekNearStartSec * kRate16k) ? "start" : "mpv";
+        const bool ok = d.mpStart(frame, err);
+        if (ok && d.srcEof && d.pendF.empty() && !d.leadZeros) d.seekHow = "end";
+        return done(ok);
+    }
     uint64_t decodedBefore = 0;                // what a re-open threw away still counts as this seek's cost
     if (!d_->broken) {
         Impl& d = *d_;
@@ -2122,7 +2267,10 @@ bool MediaReader::seek(uint64_t frame, std::string& err, const std::function<boo
     const bool demoted = d_->demoted;
     const std::wstring path = d_->path;
     const AudioTrack track = d_->track;
-    if (!open(path, Out::Mono16k, track, err)) return false;
+    const std::string decoder = d_->info.decoder, decoderNote = d_->info.decoderNote;
+    if (!openMf(path, Out::Mono16k, track, err)) return false;          // (N3: the same decoder, never open()'s choice)
+    d_->info.decoder = decoder;
+    d_->info.decoderNote = decoderNote;
     if (demoted) { d_->demoted = true; d_->info.seekMode = "decode"; }
     arm(*d_);
     d_->seekDecoded = decodedBefore;

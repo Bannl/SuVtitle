@@ -398,7 +398,8 @@ module.exports = function rv4Checks(ctx) {
       R("    if (s.src === \"ext\" && s.embedded && embPending() && wantEmbId === s.id) return;",
         "    if (s.src === \"ext\" && wantExt === s.id && !(ext && ext.id === s.id && ext.got >= ext.parts)) return;"), sidecarNeverPending);
     judge("RV4-3: a failed sidecar's request kept (the panel marks it chosen)",
-      R("      else if (!msg.info && wantExt && wantExt !== wantEmbId) { wantExt = 0; if (!el.ccPanel.hidden) paintCc(); }\n", ""), failedSidecarNotChosen);
+      // (P-CTX 25/10: the repaint is repaintCc() now -- the CC panel and the right-click menu, whichever is open)
+      R("      else if (!msg.info && wantExt && wantExt !== wantEmbId) { wantExt = 0; repaintCc(); }\n", ""), failedSidecarNotChosen);
     // RV4-5
     judge("RV4-5: the queue's names raw", R("      name.textContent = cleanName(it.name);      // RV4-5", "      name.textContent = it.name;"), queueClean);
     judge("RV4-5: the sound card's name raw", R("    const bigName = cleanName(F.name);         // RV4-5", "    const bigName = F.name;"), cardClean);

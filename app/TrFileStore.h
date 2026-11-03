@@ -34,6 +34,11 @@
 //     (en->fr and de->fr) are two cache keys that both target the same film.fr.srt.
 //   * The URL path encoding for the WebView's virtual host, and the house's AV-safe write
 //     (temp file + rename with Bitdefender's retry window -- PB.md section 8).
+//   * FX (1.1.0, 02/11/2026, the adversarial review's fix round -- docs/PROGRESS_FIX.md): the AV-safe write says WHERE it failed
+//     (WriteFail: the folder refused the .tmp, or the target refused to be replaced -- targetRefusal: held / read-only / other);
+//     the voices record keeps the timecode its Word file's stamps were made with (DOCXTC, VoiceTc); ONE Word file per media AND
+//     sound track (the user's rule: "(track N)" names, registryOwnsFor = SuVtitle wrote it for this media, this track and this
+//     analysis; registryTrackDocx = which analysis' transcript the track's Word file holds).
 //
 // UI THREAD ONLY where it touches the disk; the pure functions are thread-agnostic.
 // =============================================================================
@@ -163,14 +168,34 @@ inline std::string hex16(uint64_t v) {
 // WH (2026-10-11, D6): ...and the SOUND TRACK analysed (TrPipe.h AudioSel.ord) -- "\ta<ord>" appended for ord > 0
 // ONLY: every record made before WH analysed the first sound track (F5: Media Foundation's FIRST_AUDIO_STREAM), so
 // ord 0 keeps the key it always had and none of them is lost.
+// U2 (2026-11-02, the user's own models): ...and the MODELS, when one is not the default -- "\tm<models>" appended for a
+// non-empty `models` ONLY (modelsTag: "" when both are SuVtitle's own), so every analysis made before U2, and every one made
+// with the defaults since, keeps its key byte for byte: none is analysed again, none is orphaned. An analysis made with an
+// imported model can never be taken for the default's (nor for another imported model's, nor for the same file once the
+// user replaced it: its size or write time moved).
 inline std::string cacheKey(const std::wstring& path, uint64_t size, uint64_t mtime,
                             const std::string& langA, const std::string& langB,
-                            const std::string& mode, const std::string& quality, uint32_t audioOrd = 0) {
+                            const std::string& mode, const std::string& quality, uint32_t audioOrd = 0,
+                            const std::string& models = std::string()) {
     std::string k = toUtf8(lowerW(path));
     k += "\t" + std::to_string(size) + "\t" + std::to_string(mtime);
     k += "\t" + langA + "\t" + langB + "\t" + mode + "\t" + quality;
     if (audioOrd > 0) k += "\ta" + std::to_string(audioOrd);
+    if (!models.empty()) k += "\tm" + models;
     return hex16(fnv1a64(k));
+}
+// U2: an imported model's IDENTITY in a key -- its file name (lower-cased: Windows names), its size and its write time:
+// the same file is the same model wherever the user keeps it; a model replaced at the same path is another one.
+inline std::string modelIdent(const std::wstring& path, uint64_t size, uint64_t mtime) {
+    std::wstring leaf = path;
+    const size_t cut = leaf.find_last_of(L"\\/");
+    if (cut != std::wstring::npos) leaf = leaf.substr(cut + 1);
+    return toUtf8(lowerW(leaf)) + "/" + std::to_string(size) + "/" + std::to_string(mtime);
+}
+// The key's model part: "" when BOTH are the defaults (the pre-U2 key); else which is imported, and which file.
+inline std::string modelsTag(const std::string& asrIdent, const std::string& mtIdent) {
+    if (asrIdent.empty() && mtIdent.empty()) return std::string();
+    return "asr=" + asrIdent + ";mt=" + mtIdent;
 }
 // The MEDIA's own identity (the file, not the job): what names its virtual host and its audio
 // proxy. One identity = one URL, across tray runs too -- a counter restarting at 1 every run
@@ -573,9 +598,12 @@ inline const char* const* knownLangCodes() {
 // use, should it be another).
 // WH: `audioOrd` = the sound track of the set asking -- its siblings analysed THE SAME track (the 144 keys stay 144:
 // another track's analysis comes in through the registry's writer key instead -- see registryWriter).
+// U2: `models` = the set's model tag (cacheKey) -- its siblings were made with the SAME models (an analysis of another
+// model comes in through the registry's writer key, like another track's).
 struct KeyOf { std::string key, langA, langB, mode, quality; };
 inline std::vector<KeyOf> siblingKeys(const std::wstring& path, uint64_t size, uint64_t mtime, const std::string& lang,
-                                      const std::vector<std::string>& extra = {}, uint32_t audioOrd = 0) {
+                                      const std::vector<std::string>& extra = {}, uint32_t audioOrd = 0,
+                                      const std::string& models = std::string()) {
     std::vector<std::string> codes;
     for (const char* const* p = knownLangCodes(); *p; ++p) codes.push_back(*p);
     for (const auto& x : extra) {
@@ -594,7 +622,7 @@ inline std::vector<KeyOf> siblingKeys(const std::wstring& path, uint64_t size, u
                 for (const char* q : quals) {
                     KeyOf k;
                     k.langA = a; k.langB = b; k.mode = m; k.quality = q;
-                    k.key = cacheKey(path, size, mtime, a, b, m, q, audioOrd);
+                    k.key = cacheKey(path, size, mtime, a, b, m, q, audioOrd, models);
                     out.push_back(k);
                 }
         }
@@ -829,17 +857,25 @@ inline uint64_t stampHandle(HANDLE h) {
 // id (optional): the identity of what was written (see WrittenId); valid only on success.
 // False = nothing usable was written (the folder refused the .tmp, the target appeared, or both
 // writes failed).
+// FX (02/11/2026, the review's F4 -- the integrator's MECHANICAL criterion): `fail` (optional) says WHERE it failed. Folder = the
+// .tmp could not be created or written IN the folder (a read-only card, a share, an ACL, a full disk): the ONLY "the folder
+// refuses". Target = the .tmp WAS written beside the file, but neither the rename (retried, Bitdefender's window) nor the
+// in-place write could replace the file itself -- held by another program, read-only, or denied: targetRefusal says which.
+// Appeared = the target appeared under a write that must not replace (replace == false).
+enum class WriteFail { None, Folder, Target, Appeared };
 inline bool writeFileAvSafe(const std::wstring& path, const std::string& bytes, bool replace = true,
-                            WrittenId* id = nullptr) {
+                            WrittenId* id = nullptr, WriteFail* fail = nullptr) {
     if (id) *id = WrittenId{};
+    if (fail) *fail = WriteFail::None;
+    auto failed = [&](WriteFail f) { if (fail) *fail = f; return false; };
     const std::wstring tmp = path + L".tmp";
     HANDLE h = ::CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
+    if (h == INVALID_HANDLE_VALUE) return failed(WriteFail::Folder);
     DWORD wr = 0;
     const BOOL ok = bytes.empty() ? TRUE : ::WriteFile(h, bytes.data(), (DWORD)bytes.size(), &wr, nullptr);
     const uint64_t stamp = (ok && wr == (DWORD)bytes.size()) ? stampHandle(h) : 0;
     ::CloseHandle(h);
-    if (!ok || wr != (DWORD)bytes.size()) { ::DeleteFileW(tmp.c_str()); return false; }
+    if (!ok || wr != (DWORD)bytes.size()) { ::DeleteFileW(tmp.c_str()); return failed(WriteFail::Folder); }
     auto done = [&](uint64_t t) {
         if (id) { id->size = (uint64_t)bytes.size(); id->mtime = t; id->valid = t != 0; }
         return true;
@@ -849,19 +885,37 @@ inline bool writeFileAvSafe(const std::wstring& path, const std::string& bytes, 
         const DWORD e = ::GetLastError();
         if (!replace && (e == ERROR_ALREADY_EXISTS || e == ERROR_FILE_EXISTS)) {   // it appeared: not ours
             ::DeleteFileW(tmp.c_str());
-            return false;
+            return failed(WriteFail::Appeared);
         }
         ::Sleep(20);
     }
     ::DeleteFileW(tmp.c_str());
     HANDLE hd = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                               replace ? CREATE_ALWAYS : CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hd == INVALID_HANDLE_VALUE) return false;
+    if (hd == INVALID_HANDLE_VALUE) {
+        const DWORD e = ::GetLastError();
+        return failed(!replace && (e == ERROR_FILE_EXISTS || e == ERROR_ALREADY_EXISTS) ? WriteFail::Appeared : WriteFail::Target);
+    }
     DWORD wr2 = 0;
     const BOOL ok2 = bytes.empty() ? TRUE : ::WriteFile(hd, bytes.data(), (DWORD)bytes.size(), &wr2, nullptr);
     const uint64_t stamp2 = (ok2 && wr2 == (DWORD)bytes.size()) ? stampHandle(hd) : 0;
     ::CloseHandle(hd);
-    return (ok2 && wr2 == (DWORD)bytes.size()) ? done(stamp2) : false;
+    return (ok2 && wr2 == (DWORD)bytes.size()) ? done(stamp2) : failed(WriteFail::Target);
+}
+// FX (F4): why an EXISTING file refused to be replaced although its folder took the .tmp (WriteFail::Target) -- Held: another
+// program has it open without sharing WRITE (a sharing / lock violation when it is opened for writing with every share mode:
+// Word opens a .docx with FILE_SHARE_READ only); ReadOnly: its read-only attribute; Other: anything else (an ACL on the file, a
+// race). Opening for writing without writing changes nothing in the file.
+enum class TargetRefusal { Held, ReadOnly, Other };
+inline TargetRefusal targetRefusal(const std::wstring& path) {
+    HANDLE h = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) { ::CloseHandle(h); return TargetRefusal::Other; }
+    const DWORD e = ::GetLastError();
+    if (e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION) return TargetRefusal::Held;
+    const DWORD a = ::GetFileAttributesW(path.c_str());
+    if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_READONLY)) return TargetRefusal::ReadOnly;
+    return TargetRefusal::Other;
 }
 
 // %LOCALAPPDATA%\SuVtitle\Files (created; AudioPB's was %LOCALAPPDATA%\AudioPB\Translator files -- copied over once
@@ -899,6 +953,226 @@ inline size_t keepNewest(const std::wstring& dir, const wchar_t* pattern, size_t
     for (size_t i = 0; i + keep < v.size(); ++i)
         if (::DeleteFileW(v[i].second.c_str())) ++gone;
     return gone;
+}
+
+// ---------------------------------------------------------------------------
+// U3 (2026-11-02, the TRANSCRIPTION -- docs/PROGRESS_U3.md section 8): THE VOICES RECORD, <cache>\<key>.voices -- what a
+// transcript keeps beside its analysis' record (key = THAT record's key: the file, the pair, the track, U2's model tag). The
+// analysis record (.cues) is never touched: a separate file on purpose, so a fault in this one can never cost an analysis.
+//   "# SuVtitle voices v1" / SRC <path> <size> <mtime> / AUD <ord> <trackId> / DIAR <on|off> <model, or why> <speakers>
+//   / NAME <spk> <label> (the renames) / DOCX <path> <size> <mtime> <fingerprint> (the Word file written for it) / SEG <s> <e> <spk>
+//   (a piece the voice pass named, ms) ... / END <n>
+// The head lines come first (a 4 KB peek feeds the queue's badges). STRICT: anything malformed is a MISS (the voice pass
+// runs again when asked), never an error the user sees.
+// FX (02/11/2026, the review's F1): + DOCXTC <origin> <hasRate> <startFrames> <fpsNum> <fpsDen> <base> <drop> <startSamples>
+// <sampleRate>, right after DOCX, only when that Word file's stamps are SOURCE timecodes (absent = file-relative stamps: every
+// record written before reads as it did). The stamps are then compared -- and rewritten -- on the basis the file was written
+// with, whatever the probe of this run says or has not said yet (TrPlayer.h stampTc).
+// ---------------------------------------------------------------------------
+struct VoiceSeg { uint64_t s = 0, e = 0; uint32_t spk = 0; };           // a piece the voice pass named (spk 0 = none)
+inline constexpr size_t kSpeakerNameMax = 64;                             // bytes of UTF-8 (the Live strips' label cap)
+// FX (F1): the SOURCE timecode a Word file's stamps were made with -- SourceTimecode.h's SourceTc field for field (TrPlayer.h
+// converts; that header is not included here: this one compiles alone in the filestore smoke and the mutation targets).
+// found = false: file-relative stamps.
+struct VoiceTc {
+    bool        found = false;
+    std::string origin;                      // "bwf" | "bwf+ixml" | "mov" | "mxf"
+    bool        hasRate = false;             // a frame rate: startFrames, fpsNum / fpsDen, base, drop
+    uint64_t    startFrames = 0;
+    uint32_t    fpsNum = 0, fpsDen = 1, base = 0;
+    bool        drop = false;
+    uint64_t    startSamples = 0;            // no rate (a BWF without iXML): samples since midnight at sampleRate
+    uint32_t    sampleRate = 0;
+};
+inline bool voiceTcOrigin(const std::string& o) { return o == "bwf" || o == "bwf+ixml" || o == "mov" || o == "mxf"; }
+struct VoiceRec {
+    std::string path;                        // UTF-8, as transcribed (checked on read, like a record's SRC)
+    uint64_t    size = 0, mtime = 0;
+    uint32_t    audioOrd = 0, audioTrack = 0;
+    bool        on = false;                  // the speakers were recognised (else `why` says why there are no names)
+    std::string model, why;
+    uint32_t    speakers = 0;
+    std::vector<std::pair<uint32_t, std::string>> names;   // the user's renames, ascending speaker numbers
+    std::string docxPath;                    // the Word file written for this transcript ("" = none) ...
+    uint64_t    docxSize = 0, docxMtime = 0; // ... its identity as written ...
+    uint64_t    docxSig = 0;                 // ... and the fingerprint of the transcript it holds ("older" = it differs)
+    VoiceTc     docxTc;                      // ... and the timecode its stamps were made with (FX F1; found = false: file-relative)
+    std::vector<VoiceSeg> segs;              // start order
+};
+inline const char* voicesHeader() { return "# SuVtitle voices v1"; }
+
+inline std::string packVoices(const VoiceRec& v) {
+    std::string o = std::string(voicesHeader()) + "\n";
+    o += "SRC\t" + tp::esc(v.path) + "\t" + std::to_string(v.size) + "\t" + std::to_string(v.mtime) + "\n";
+    o += "AUD\t" + std::to_string(v.audioOrd) + "\t" + std::to_string(v.audioTrack) + "\n";
+    o += std::string("DIAR\t") + (v.on ? "on" : "off") + "\t" + tp::esc(v.on ? v.model : v.why) + "\t" + std::to_string(v.speakers) + "\n";
+    for (const auto& n : v.names) o += "NAME\t" + std::to_string(n.first) + "\t" + tp::esc(n.second) + "\n";
+    if (!v.docxPath.empty())
+        o += "DOCX\t" + tp::esc(v.docxPath) + "\t" + std::to_string(v.docxSize) + "\t" + std::to_string(v.docxMtime)
+           + "\t" + std::to_string(v.docxSig) + "\n";
+    if (!v.docxPath.empty() && v.docxTc.found) {                  // FX (F1): the Word file's stamps are SOURCE timecodes
+        const VoiceTc& c = v.docxTc;
+        o += "DOCXTC\t" + tp::esc(c.origin) + "\t" + (c.hasRate ? "1" : "0") + "\t" + std::to_string(c.startFrames)
+           + "\t" + std::to_string(c.fpsNum) + "\t" + std::to_string(c.fpsDen) + "\t" + std::to_string(c.base)
+           + "\t" + (c.drop ? "1" : "0") + "\t" + std::to_string(c.startSamples) + "\t" + std::to_string(c.sampleRate) + "\n";
+    }
+    for (const auto& s : v.segs) o += "SEG\t" + std::to_string(s.s) + "\t" + std::to_string(s.e) + "\t" + std::to_string(s.spk) + "\n";
+    o += "END\t" + std::to_string(v.segs.size()) + "\n";
+    return o;
+}
+
+// A number made of 1-20 digits that fits 64 bits (a fingerprint takes all 20), else false (strict: the record is a miss).
+inline bool digitsU64(const std::string& s, uint64_t& v) {
+    v = 0;
+    if (s.empty() || s.size() > 20) return false;
+    for (char c : s) {
+        if (c < '0' || c > '9') return false;
+        const uint64_t d = (uint64_t)(c - '0');
+        if (v > (UINT64_MAX - d) / 10) return false;         // past 18446744073709551615
+        v = v * 10 + d;
+    }
+    return true;
+}
+// `headOnly`: stop at the first SEG (the peek): no END needed then.
+inline bool parseVoicesText(const std::string& text, VoiceRec& v, bool headOnly = false) {
+    v = VoiceRec{};
+    bool first = true, haveSrc = false, haveDiar = false, haveEnd = false;
+    uint64_t endCount = 0, lastS = 0;
+    size_t at = 0;
+    while (at < text.size()) {
+        const size_t nl = text.find('\n', at);
+        std::string line = text.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+        at = (nl == std::string::npos) ? text.size() : nl + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (first) { if (line != voicesHeader()) return false; first = false; continue; }
+        if (line.empty()) continue;
+        if (haveEnd) return false;
+        const std::vector<std::string> t = tp::split(line);
+        uint64_t a = 0, b = 0, c = 0, d = 0;
+        if (t[0] == "SRC" && t.size() == 4) {
+            if (!digitsU64(t[2], a) || !digitsU64(t[3], b)) return false;
+            v.path = tp::unesc(t[1]); v.size = a; v.mtime = b; haveSrc = true;
+        } else if (t[0] == "AUD" && t.size() == 3) {
+            if (!digitsU64(t[1], a) || !digitsU64(t[2], b) || a > 0xFFFFFFFFull || b > 0xFFFFFFFFull) return false;
+            v.audioOrd = (uint32_t)a; v.audioTrack = (uint32_t)b;
+        } else if (t[0] == "DIAR" && t.size() == 4) {
+            if ((t[1] != "on" && t[1] != "off") || !digitsU64(t[3], a) || a > tp::kVoiceSpeakersMax) return false;
+            v.on = t[1] == "on";
+            (v.on ? v.model : v.why) = tp::unesc(t[2]);
+            v.speakers = (uint32_t)a;
+            if (v.on != (v.speakers > 0)) return false;
+            haveDiar = true;
+        } else if (t[0] == "NAME" && t.size() == 3) {
+            const std::string name = tp::unesc(t[2]);
+            if (!digitsU64(t[1], a) || a == 0 || a > tp::kVoiceSpeakersMax || name.empty() || name.size() > kSpeakerNameMax) return false;
+            if (!v.names.empty() && v.names.back().first >= a) return false;
+            v.names.push_back({ (uint32_t)a, name });
+        } else if (t[0] == "DOCX" && t.size() == 5) {
+            if (!digitsU64(t[2], a) || !digitsU64(t[3], b) || !digitsU64(t[4], c)) return false;
+            v.docxPath = tp::unesc(t[1]); v.docxSize = a; v.docxMtime = b; v.docxSig = c;
+            if (v.docxPath.empty()) return false;
+        } else if (t[0] == "DOCXTC" && t.size() == 10) {
+            // FX (F1): only after its DOCX; the origin one SourceTimecode.h writes, every other field a number; its own sanity rules
+            // (a rate: fpsNum >= fpsDen > 0 and a base; drop-frame only with a rate on a base of 30 or 60; no rate: a sample rate)
+            VoiceTc tc;
+            uint64_t hr = 0, sf = 0, fn = 0, fd = 0, ba = 0, dr = 0, ss = 0, sr = 0;
+            tc.origin = tp::unesc(t[1]);
+            if (v.docxPath.empty() || !voiceTcOrigin(tc.origin) || !digitsU64(t[2], hr) || hr > 1 || !digitsU64(t[3], sf)
+                || !digitsU64(t[4], fn) || !digitsU64(t[5], fd) || !digitsU64(t[6], ba) || !digitsU64(t[7], dr) || dr > 1
+                || !digitsU64(t[8], ss) || !digitsU64(t[9], sr) || fn > 0xFFFFFFFFull || fd > 0xFFFFFFFFull || ba > 1000 || sr > 0xFFFFFFFFull)
+                return false;
+            tc.found = true; tc.hasRate = hr == 1; tc.startFrames = sf; tc.fpsNum = (uint32_t)fn; tc.fpsDen = (uint32_t)fd;
+            tc.base = (uint32_t)ba; tc.drop = dr == 1; tc.startSamples = ss; tc.sampleRate = (uint32_t)sr;
+            if (tc.hasRate && (tc.fpsDen == 0 || tc.fpsNum < tc.fpsDen || tc.base == 0)) return false;
+            if (tc.drop && (!tc.hasRate || (tc.base != 30 && tc.base != 60))) return false;
+            if (!tc.hasRate && tc.sampleRate == 0) return false;
+            v.docxTc = tc;
+        } else if (t[0] == "SEG" && t.size() == 4) {
+            if (headOnly) return haveSrc && haveDiar;
+            if (!digitsU64(t[1], a) || !digitsU64(t[2], b) || !digitsU64(t[3], d) || b <= a || d > v.speakers) return false;
+            if (!v.segs.empty() && a < lastS) return false;
+            lastS = a;
+            v.segs.push_back({ a, b, (uint32_t)d });
+            if (v.segs.size() > tp::kVoiceSpanMax) return false;
+        } else if (t[0] == "END" && t.size() == 2) {
+            if (!digitsU64(t[1], endCount)) return false;
+            haveEnd = true;
+        } else {
+            return false;                                    // strict: a line this version does not know is a miss
+        }
+    }
+    if (first || !haveSrc || !haveDiar) return false;
+    if (headOnly) return true;
+    return haveEnd && endCount == v.segs.size();
+}
+inline bool peekVoices(const std::wstring& path, VoiceRec& v) {
+    std::string head;
+    if (!readFileHead(path, head)) return false;
+    const size_t nl = head.rfind('\n');                      // a line the head cut in two is not read
+    if (nl != std::string::npos) head.resize(nl + 1);
+    return parseVoicesText(head, v, true);
+}
+
+// THE TRANSCRIPT'S WORD FILE, its NAME as a pure decision (the .srt rule's twin): "<stem> - transcript.docx", then
+// "<stem> - transcript (SuVtitle).docx", then "(SuVtitle 2)".."(SuVtitle 9)"; the first ABSENT or OURS FOR THIS MEDIA wins.
+// <stem> = the base, or "<base>.<ext>" when another media with the same base sits in the folder. "" = no usable name (the
+// caller says so: it never overwrites a file that is not this media's, nor one the user edited since SuVtitle wrote it).
+// FX (02/11/2026, F2 -- the user's rule: ONE Word file per media AND sound track): the first sound track (ord 0, the first the
+// track menu lists) keeps those names; track N (N = ord + 1, the number the track menu shows -- also for a list mpv gave)
+// "<stem> - transcript (track N).docx", then its own "(track N) (SuVtitle)", "(track N) (SuVtitle 2..9)". "Ours" is now the
+// caller's registryOwnsFor: written by SuVtitle for this media, this track AND this analysis.
+inline std::vector<std::wstring> transcriptCandidates(const std::wstring& dir, const std::wstring& base, const std::wstring& ext,
+                                                      bool sibling, uint32_t ord = 0) {
+    const std::wstring stem = sibling && !ext.empty() ? base + L"." + ext : base;   // (the .srt rule's stem)
+    const std::wstring name = stem + L" - transcript" + (ord > 0 ? L" (track " + std::to_wstring(ord + 1) + L")" : std::wstring());
+    std::vector<std::wstring> v;
+    v.push_back(joinPath(dir, name + L".docx"));
+    v.push_back(joinPath(dir, name + L" (SuVtitle).docx"));
+    for (int n = 2; n <= 9; ++n) v.push_back(joinPath(dir, name + L" (SuVtitle " + std::to_wstring(n) + L").docx"));
+    return v;
+}
+inline std::wstring chooseTranscriptPath(const std::wstring& dir, const std::wstring& base, const std::wstring& ext, bool sibling,
+                                         const std::function<bool(const std::wstring&)>& exists,
+                                         const std::function<bool(const std::wstring&)>& ownsForThisMedia, uint32_t ord = 0) {
+    for (const auto& p : transcriptCandidates(dir, base, ext, sibling, ord))
+        if (!exists(p) || ownsForThisMedia(p)) return p;
+    return std::wstring();
+}
+// The registry's kind for a transcript file (srt-written.txt's `lang` field: no language code can be it).
+inline const char* transcriptRegKind() { return "transcript"; }
+// FX (F2, the user's rule 02/11): OURS FOR THIS ANALYSIS -- SuVtitle wrote a transcript at this path for this media, THIS sound
+// track and THIS analysis (its cache key: the pair, the quality, the models; the key carries the track too), and the file is
+// still exactly what was written. An entry with NO key (an older registry, an export) owns nothing: never replaced by itself.
+inline bool registryOwnsFor(const std::vector<RegEntry>& e, const std::wstring& path, uint64_t size, uint64_t mtime,
+                            const std::wstring& media, const std::string& key, uint32_t ord) {
+    if (key.empty()) return false;
+    const std::string k = toUtf8(lowerW(path)), m = toUtf8(lowerW(media));
+    for (const auto& r : e)
+        if (r.path == k && r.size == size && r.mtime == mtime && r.media == m && r.key == key && r.ord == ord) return true;
+    return false;
+}
+// FX (F2): WHICH analysis' transcript this media's sound track has as its Word file now -- the newest transcript entry SuVtitle
+// wrote for this media and track (with a key) whose file is still there: its writer's key ("" = none) and its path. Another
+// analysis of the same track (another pair or model) finds it and writes nothing by itself (TrPlayer.h docxState "other").
+inline std::string registryTrackDocx(const std::vector<RegEntry>& e, const std::wstring& media, uint32_t ord,
+                                     const std::function<bool(const std::wstring&)>& exists, std::wstring* path = nullptr) {
+    const std::string m = toUtf8(lowerW(media));
+    for (size_t i = e.size(); i-- > 0;) {
+        const RegEntry& r = e[i];
+        if (r.key.empty() || r.lang != transcriptRegKind() || r.media != m || r.ord != ord) continue;
+        const std::wstring p = fromUtf8(r.path);
+        if (!exists(p)) continue;
+        if (path) *path = p;
+        return r.key;
+    }
+    return std::string();
+}
+// FX (F2): the transcript entry for one Word file (the newest for that path), or none -- whose transcript a file holds now.
+inline const RegEntry* registryTranscriptEntry(const std::vector<RegEntry>& e, const std::wstring& path) {
+    const std::string k = toUtf8(lowerW(path));
+    for (size_t i = e.size(); i-- > 0;)
+        if (e[i].path == k) return e[i].lang == transcriptRegKind() && !e[i].key.empty() ? &e[i] : nullptr;
+    return nullptr;
 }
 
 }   // namespace pbtrf

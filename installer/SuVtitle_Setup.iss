@@ -6,43 +6,78 @@
 ; Windows application (a window and a taskbar button, no tray icon) that plays a video
 ; or audio file and transcribes / translates it OFFLINE into subtitles that stay ahead
 ; of the picture, with the full subtitle tooling (.srt / .vtt / .ass, the film's own
-; tracks, an editor, transcript export). It ships, beside the app, two local AI engines
-; driven as child processes by SuVtitleEngine.exe -- whisper.cpp (transcription) and
-; llama.cpp / Qwen (translation) -- and their models: about 5.6 GB. Everything runs on
-; 127.0.0.1; nothing is sent off the machine.
+; tracks, an editor, transcript export). Since 1.1.0 it also has a LIVE mode (its own
+; window, opened by the player's Live button or by the "SuVtitle Live" shortcut below):
+; live transcription + translation of an input, of an output or of one application. It
+; ships, beside the app, the local AI engines driven as child processes by SuVtitleEngine.exe
+; -- whisper.cpp (transcription), llama.cpp / Qwen (translation) -- and sherpa-onnx (which
+; tells the speakers of a live strip apart, loaded by the engine itself), and it needs their
+; models: about 5.9 GB. The AI runs on 127.0.0.1: nothing SuVtitle hears, shows or transcribes leaves the machine. What does
+; use the network: this (LIGHT) installer downloads the models, and the app asks www.nextale-audio.com once per start
+; whether a newer version is published (README, "Updates"; it can be turned off).
 ;
-; Models that ship (director's decision, 23/10/2026): ggml-large-v3-turbo.bin (transcription),
-; Qwen3-4B-Instruct-2507-Q5_K_M.gguf (translation) and qwen2.5-1.5b-instruct-q4_k_m.gguf
-; (translation fallback). A missing 4B is INVISIBLE at runtime -- the engine falls back to
-; the 1.5B without a word -- so the preconditions below refuse a bundle that lacks any of
-; them. NOT shipped: ggml-small / ggml-base (they belonged to the LIVE translator, which
-; stayed in AudioPB), sherpa-onnx and its speaker model (a file job tells no speakers
-; apart), ggml-large-v3.bin (quality "max" only; the engine says so when it is absent --
-; make_bundle.js --with-large-v3 puts it in).
+; TWO VARIANTS of this one script (the director's decision, 03/11/2026):
+;   * LIGHT -- the default, the installer NEXTALE distributes: ONE file, SuVtitle_v<version>_Setup.exe, with everything
+;     but the AI models. When the user clicks Install, [Code] (installer\models_download.iss, #included at the end; the
+;     test kit tests\installer\ runs the same file) downloads from Hugging Face, one at a time, every model that
+;     {app}\models lacks, from the URLs installer\models.json pins to a commit, each checked by its SHA-256, and puts each
+;     in place through a .part file and one rename, so a model is never left half-written under its final name. An
+;     UPDATE whose models are all in place (same file, same size) downloads nothing and needs no network; /VERIFYMODELS
+;     also checks their SHA-256 and downloads a damaged one again. Exit codes of its own: 7 (Inno's "cannot proceed": a
+;     silent install that could not get the models; nothing installed), 10 (installed, but a model could not be put in
+;     place), 11 (installed, but the permissions of a model could not be reset). Compiled from a LIGHT bundle
+;     (deploy\make_bundle.js, its default: no models\ in it).
+;   * FULL -- ISCC /DFull: the offline installer, the models embedded (the 1.1.0 test installer's design):
+;     SuVtitle_v<version>_Setup_Full.exe + SuVtitle_v<version>_Setup_Full-1.bin (about 6 GB, DiskSpanning: keep the two
+;     together). Compiled from a FULL bundle (make_bundle.js --full): each models.json file must be there with THAT size
+;     (read on disk) and its manifest row must give THAT SHA-256 and size, so the full installer never embeds other bytes
+;     than the light one downloads (`make_bundle.js --verify --out deploy\out\full` re-hashes the files themselves).
+;
+; The models -- installer\models.json is the ONE list (file, size, SHA-256, the pinned Hugging Face URL, license); the
+; director's decision, 23/10/2026 + 26/10/2026 for the live mode: ggml-large-v3-turbo.bin (transcription of films; the
+; final model of the live quality preset), ggml-small.bin and ggml-base.bin (the live presets balanced / light),
+; Qwen3-4B-Instruct-2507-Q5_K_M.gguf (translation), qwen2.5-1.5b-instruct-q4_k_m.gguf (translation fallback) and
+; 3dspeaker_campplus_zh_en_advanced.onnx (the speaker model). A missing 4B is INVISIBLE at runtime -- the engine falls
+; back to the 1.5B without a word -- and a missing live model or speaker runtime degrades the live mode just as quietly,
+; so the light installer fetches every one of them and the full one refuses a bundle that lacks one. NOT installed:
+; ggml-large-v3.bin (quality "max" only; the engine says so when it is absent -- make_bundle.js --full --with-large-v3
+; puts it in a full bundle).
 ;
 ; What gets installed ({app} = %ProgramFiles%\NEXTALE\SuVtitle):
-;   * SuVtitle.exe        - the window (Win32 + WebView2): player, queue, subtitles, editor
-;   * SuVtitleEngine.exe  - the AI helper SuVtitle.exe spawns and supervises
-;   * WebView2Loader.dll, web\ (the page SuVtitle.exe serves from <exe>\web)
+;   * SuVtitle.exe        - the window (Win32 + WebView2): player, Live window, queue, subtitles, editor
+;   * SuVtitleEngine.exe  - the AI helper SuVtitle.exe spawns and supervises (it also does the live capture)
+;   * WebView2Loader.dll, web\ (the pages SuVtitle.exe serves from <exe>\web), LICENSE, THIRD_PARTY_NOTICES.md
 ;   * engine\whisper\, engine\llama\ (the servers + ggml backends + the VC++ CRT, app-local)
-;   * models\
+;   * engine\sherpa\ (sherpa-onnx + ONNX Runtime + the VC++ CRT, app-local)
+;   * mpv\libmpv-2.dll (1.1.0: the native video engine -- it plays every file -- and the analysis' decoder; GPL build)
+;   * mpv\vkfallback\vulkan-1.dll + VulkanRT-License.txt (1.1.0: Khronos' Vulkan loader, LunarG VulkanRT, used ONLY on a PC
+;     whose graphics driver installed none: libmpv and whisper-server import vulkan-1.dll and would not even start)
+;   * models\ (light: downloaded at install time, the missing ones only; full: embedded)
+;   * Start menu: "SuVtitle", "SuVtitle Live" (SuVtitle.exe --live) and the uninstaller
 ;
-; SOURCE = the assembled, dumpbin-verified bundle (deploy\out\SuVtitle\), produced by
-; deploy\make_bundle.js. Build the Release, assemble, THEN compile this script:
-;   node deploy\make_bundle.js --payload <your AI payload folder>      (or set SUVTITLE_PAYLOAD; see make_bundle.js)
-;   ISCC.exe installer\SuVtitle_Setup.iss
+; SOURCE = the assembled, dumpbin-verified bundle, produced by deploy\make_bundle.js. Build the Release, assemble, THEN
+; compile this script:
+;   LIGHT  node deploy\make_bundle.js --payload <your AI payload folder> --mpv <dir> --vulkan-rt <dir>     (-> deploy\out\SuVtitle)
+;          ISCC.exe installer\SuVtitle_Setup.iss
+;   FULL   node deploy\make_bundle.js --full --out deploy\out\full --payload <...> --mpv <dir> --vulkan-rt <dir>
+;          ISCC.exe /DFull /DBundleDir=..\deploy\out\full\SuVtitle installer\SuVtitle_Setup.iss
+; (--payload can be left out when SUVTITLE_PAYLOAD is set; see make_bundle.js.) A light compile refuses a bundle that has
+; models, a full compile refuses one without them: a bundle is one or the other.
 ; ISCC.exe is Inno Setup 6's compiler: on PATH, or in the standard install folders -- all users:
 ; %ProgramFiles(x86)%\Inno Setup 6\ISCC.exe, current user: %LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe (call it by that full
 ; path when it is not on PATH). Call it from cmd or PowerShell, NOT Git Bash: it mangles the /Q-style switches.
-; Overridable: /DMyAppVersion=1.0.1   /DBundleDir=<absolute path of another bundle>
+; Overridable: /DMyAppVersion=1.1.1   /DBundleDir=<path of another bundle, absolute or relative to installer\>
+;              /DFull                 (the offline variant, see above)
 ;              /DAllowDebugBundle     (compile a bundle made from a Debug build: for tests only)
-;              /DSliceSize=2000000000 (cut the data into ~2 GB files; see DiskSpanning below)
-; The setup is far above 4.2 GB, so it ships as a ~2 MB Setup.exe stub + Setup-1.bin, the DATA (DiskSpanning);
-; keep them in the same folder. A full compile takes minutes (measured 23/10/2026: 227 s, LZMA2 over 5.4 GiB).
+;              /DSliceSize=2000000000 (FULL only: cut the data into ~2 GB files; see DiskSpanning below)
+; MEASURED 03/11/2026 (Inno 6.7.1, the 1.1.0 bundles, ISCC at idle priority): LIGHT 20-35 s -> one 64,082,329-byte
+; Setup.exe (0.29 GiB packed solid); FULL 340 s -> a 2,093,345-byte Setup_Full.exe + a 6,034,493,524-byte Setup_Full-1.bin.
 ;
-; The player registration ([Registry], HKLM) is GENERATED from the C++ lists by
-; installer\gen_iss_registry.js; `node installer\gen_iss_registry.js --check` fails when this
-; file drifts from the sources (that block, the version, the mutex, the payload layout ...).
+; The player registration ([Registry], HKLM) and the models block are GENERATED by installer\gen_iss_registry.js, from the
+; C++ lists and from installer\models.json; `node installer\gen_iss_registry.js --check` fails when this file drifts from
+; its sources (those blocks, the version, the mutex, the payload layout, the two variants -- it compiles both ...).
+; How the light installer BEHAVES (downloads, errors, exit codes, a model in use, another drive...) is tested by
+; `node tests\installer\run_installer_kit.js` (throwaway setups around models_download.iss and a loopback server).
 ;
 ; Install is machine-wide (HKLM, Program Files) -> ADMIN. Uninstall removes the machine keys
 ; itself and runs `SuVtitle.exe --unregister-player` AS THE ORIGINAL USER ([Code], ExecAsOriginalUser) for
@@ -54,7 +89,7 @@
 #ifndef MyAppVersion
   ; ONE number for the installer; app/resource.h, engine/EngineVersion.h and CMakeLists.txt carry the same
   ; (`gen_iss_registry.js --check` compares them). Overridable with /DMyAppVersion=...
-  #define MyAppVersion "1.0.0"
+  #define MyAppVersion "1.1.0"
 #endif
 #define MyAppPublisher "NEXTALE"
 #define MyAppURL "https://www.nextale-audio.com/"
@@ -64,6 +99,43 @@
 ; The application's single-instance mutex (app/main.cpp kMutexName): while it exists, Setup and Uninstall
 ; refuse to touch a running SuVtitle instead of failing on locked files.
 #define MyAppMutex "SuVtitle.SingleInstance"
+
+; >>> models (generated) >>>
+; GENERATED by installer\gen_iss_registry.js from installer\models.json, the ONE list of the AI models (file, size, SHA-256,
+;   the Hugging Face URL pinned to a commit, license): do not edit by hand -- `node installer\gen_iss_registry.js --write`
+;   rewrites it and `--check` fails when the two drift. LIGHT: [Code] downloads from these URLs what {app}\models lacks and
+;   Inno checks each SHA-256; FULL (/DFull): the bundle's manifest must list these files with these SHA-256 and sizes.
+#define ModelCount 6
+#define ModelsTotalBytes 6295224687
+#dim ModelFile[6]
+#dim ModelSize[6]
+#dim ModelSha256[6]
+#dim ModelUrl[6]
+#define ModelFile[0] "ggml-large-v3-turbo.bin"
+#define ModelSize[0] "1624555275"
+#define ModelSha256[0] "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
+#define ModelUrl[0] "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo.bin"
+#define ModelFile[1] "ggml-small.bin"
+#define ModelSize[1] "487601967"
+#define ModelSha256[1] "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"
+#define ModelUrl[1] "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small.bin"
+#define ModelFile[2] "ggml-base.bin"
+#define ModelSize[2] "147951465"
+#define ModelSha256[2] "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe"
+#define ModelUrl[2] "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.bin"
+#define ModelFile[3] "Qwen3-4B-Instruct-2507-Q5_K_M.gguf"
+#define ModelSize[3] "2889514080"
+#define ModelSha256[3] "5bde5e9d883622acb02bf77fe7dcbc56a8b9a9ad4be78a72ca23a532658b4ecb"
+#define ModelUrl[3] "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q5_K_M.gguf"
+#define ModelFile[4] "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+#define ModelSize[4] "1117320736"
+#define ModelSha256[4] "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e"
+#define ModelUrl[4] "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/91cad51170dc346986eccefdc2dd33a9da36ead9/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+#define ModelFile[5] "3dspeaker_campplus_zh_en_advanced.onnx"
+#define ModelSize[5] "28281164"
+#define ModelSha256[5] "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2"
+#define ModelUrl[5] "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/0743f301363dec56491a490f6d6cbc9d67f9a3bf/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+; <<< models (generated) <<<
 
 ; The assembled bundle root: relative to THIS .iss (installer\), or absolute (/DBundleDir=...).
 #ifndef BundleDir
@@ -94,14 +166,64 @@
 #if !FileExists(BundleAbs + "\app\engine\llama\llama-server.exe")
   #error Bundle incomplete (engine\llama\llama-server.exe missing). Re-run deploy\make_bundle.js.
 #endif
-#if !FileExists(BundleAbs + "\app\models\ggml-large-v3-turbo.bin")
-  #error Bundle payload incomplete (the transcription model ggml-large-v3-turbo.bin is missing - was make_bundle.js run with --skip-models?).
+#if !FileExists(BundleAbs + "\app\engine\sherpa\sherpa-onnx-c-api.dll")
+  #error Bundle incomplete (engine\sherpa\sherpa-onnx-c-api.dll missing -- the live mode would name voices by strip, silently). Re-run deploy\make_bundle.js.
 #endif
-#if !FileExists(BundleAbs + "\app\models\Qwen3-4B-Instruct-2507-Q5_K_M.gguf")
-  #error Bundle payload incomplete (Qwen3-4B translation model missing -- the engine would silently run the 1.5B). Re-run deploy\make_bundle.js.
+#if !FileExists(BundleAbs + "\app\engine\sherpa\onnxruntime.dll")
+  #error Bundle incomplete (engine\sherpa\onnxruntime.dll missing -- sherpa-onnx cannot load without it). Re-run deploy\make_bundle.js.
 #endif
-#if !FileExists(BundleAbs + "\app\models\qwen2.5-1.5b-instruct-q4_k_m.gguf")
-  #error Bundle payload incomplete (the 1.5B translation fallback is missing). Re-run deploy\make_bundle.js.
+#if !FileExists(BundleAbs + "\app\mpv\libmpv-2.dll")
+  #error Bundle incomplete (mpv\libmpv-2.dll missing -- the player would fall back to the page's own video for EVERY file, and the analysis to Media Foundation). Re-run deploy\make_bundle.js with --mpv.
+#endif
+#if !FileExists(BundleAbs + "\app\mpv\vkfallback\vulkan-1.dll")
+  #error Bundle incomplete (mpv\vkfallback\vulkan-1.dll missing -- a PC with no Vulkan loader could start neither libmpv nor whisper-server). Re-run deploy\make_bundle.js with --vulkan-rt.
+#endif
+#if !FileExists(BundleAbs + "\app\mpv\vkfallback\VulkanRT-License.txt")
+  #error Bundle incomplete (the Vulkan loader's licence, mpv\vkfallback\VulkanRT-License.txt, is missing). Re-run deploy\make_bundle.js with --vulkan-rt.
+#endif
+#ifdef Full
+  ; FULL: every model of installer\models.json (the generated block above) must be in the bundle, and be THAT file: the
+  ; bundle's manifest (make_bundle.js: the SHA-256 and the size of each file, re-checked by make_bundle.js --verify) must
+  ; list it with the SHA-256 and the size models.json pins. A missing 4B would be invisible at runtime (the engine falls
+  ; back to the 1.5B without a word), a missing live or speaker model would degrade the live mode just as quietly, and an
+  ; older or other model would make the full installer differ from the light one.
+  #pragma parseroption -p-
+  #define FullTab "\t"
+  #pragma parseroption -p+
+  #define FullI 0
+  #define MfHandle 0
+  #define MfWant ""
+  #define MfFound 0
+  #sub MfScanLine
+    #if FileRead(MfHandle) == MfWant
+      #expr MfFound = 1
+    #endif
+  #endsub
+  #sub FullCheckModel
+    #if !FileExists(BundleAbs + "\app\models\" + ModelFile[FullI])
+      #expr Error("Bundle payload incomplete: the model " + ModelFile[FullI] + " (installer\models.json) is not in the bundle's app\models. Assemble a FULL bundle: node deploy\make_bundle.js --full (see the header).")
+    #endif
+    ; the file itself, not only its manifest row (a file replaced after the assembly; --verify re-hashes them all)
+    #if Str(FileSize(BundleAbs + "\app\models\" + ModelFile[FullI])) != ModelSize[FullI]
+      #expr Error("The bundle's app\models\" + ModelFile[FullI] + " has " + Str(FileSize(BundleAbs + "\app\models\" + ModelFile[FullI])) + " bytes; installer\models.json pins " + ModelSize[FullI] + ". The bundle changed after its assembly: re-assemble it (make_bundle.js --full), or check it (make_bundle.js --verify).")
+    #endif
+    #expr MfWant = UpperCase(ModelSha256[FullI]) + FullTab + ModelSize[FullI] + FullTab + "app\models\" + ModelFile[FullI]
+    #expr MfFound = 0
+    #for {MfHandle = FileOpen(BundleAbs + "\manifest.txt"); MfHandle && !FileEof(MfHandle); ""} MfScanLine
+    #if MfHandle
+      #expr FileClose(MfHandle)
+    #endif
+    #if !MfFound
+      #expr Error("The bundle's " + ModelFile[FullI] + " is not the file installer\models.json pins (SHA-256 " + ModelSha256[FullI] + ", " + ModelSize[FullI] + " bytes): its manifest.txt lists other bytes. Re-assemble the full bundle (make_bundle.js --full) from a payload holding the models.json files.")
+    #endif
+  #endsub
+  #for {FullI = 0; FullI < ModelCount; FullI++} FullCheckModel
+#else
+  ; LIGHT: no model in the setup -- [Code] downloads them. A bundle WITH models is a full bundle: refused, so the light
+  ; installer can never grow back to 6 GB by accident.
+  #if DirExists(BundleAbs + "\app\models")
+    #error This bundle has an app\models folder: it is a FULL bundle. Compile it with /DFull, or assemble a light bundle (node deploy\make_bundle.js, without --full).
+  #endif
 #endif
 ; make_bundle.js stamps the build type it took the binaries from; only a Release is installable.
 #if !FileExists(BundleAbs + "\BUILD-Release.txt")
@@ -129,12 +251,23 @@ PrivilegesRequired=admin
 AppMutex={#MyAppMutex}
 SetupMutex=SuVtitleSetupMutex
 OutputDir=Output
+#ifdef Full
+OutputBaseFilename=SuVtitle_v{#MyAppVersion}_Setup_Full
+#else
 OutputBaseFilename=SuVtitle_v{#MyAppVersion}_Setup
+#endif
 SetupIconFile=..\app\suvtitle.ico
-; ~5.6 GB of mostly-incompressible model weights: max LZMA2, solid off (solid over incompressible blobs
+#ifdef Full
+; ~6 GB of mostly-incompressible model weights: max LZMA2, solid off (solid over incompressible blobs
 ; costs compile + extract time for almost no size gain).
 Compression=lzma2/max
 SolidCompression=no
+#else
+; ~0.3 GB of executables and DLLs, many of them near-copies (15 ggml-cpu-*.dll, the VC++ CRT next to each server): SOLID
+; (measured: 309 MB of bundle -> a 64 MB Setup.exe, far under the 315 MB a file may weigh on the release host).
+Compression=lzma2/max
+SolidCompression=yes
+#endif
 LZMANumBlockThreads=4
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -145,10 +278,11 @@ VersionInfoVersion={#MyAppVersion}
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoProductName={#MyAppName}
 VersionInfoDescription={#MyAppName} Setup
+#ifdef Full
 ; DISK SPANNING IS MANDATORY ABOVE 4.2 GB: Inno refuses a single Setup.exe larger than 4,200,000,000 bytes
 ; (Windows' own ceiling on one executable image). With DiskSpanning=yes the files go to a SEPARATE data file and
-; Setup.exe stays a ~2 MB stub: SuVtitle_v1.0.0_Setup.exe + SuVtitle_v1.0.0_Setup-1.bin. KEEP THEM IN THE SAME
-; FOLDER: the .exe is the stub, the .bin holds the files, and Setup cannot run without it (it asks for the missing 'disk').
+; Setup.exe stays a ~2 MB stub: SuVtitle_v<version>_Setup_Full.exe + SuVtitle_v<version>_Setup_Full-1.bin. KEEP THEM IN THE
+; SAME FOLDER: the .exe is the stub, the .bin holds the files, and Setup cannot run without it (it asks for the missing 'disk').
 ; MEASURED (Inno 6.7.1, 23/10/2026; AudioPB's 6.0 GB setups come out the same way): DiskSliceSize=max does NOT cut
 ; the data into 2.1 GB pieces -- it is ONE 5.4 GB -1.bin (5,405,135,311 bytes for the 5.40 GiB bundle). A host or a
 ; FAT32 stick that needs smaller files: compile with /DSliceSize=2000000000 (a number, 262144..2100000000) and
@@ -159,6 +293,12 @@ VersionInfoDescription={#MyAppName} Setup
 DiskSpanning=yes
 SlicesPerDisk=1
 DiskSliceSize={#SliceSize}
+#else
+; LIGHT: one Setup.exe, no -1.bin. The models it downloads are not [Files] entries, so Inno would not count them: the
+; directory page asks for their room too (a FRESH install downloads them all; the exact check, of the models really
+; missing, is the [Code] one before the download).
+ExtraDiskSpaceRequired={#ModelsTotalBytes}
+#endif
 ; The player's file associations (the [Registry] block): Explorer re-reads them at the end.
 ChangesAssociations=yes
 
@@ -170,20 +310,32 @@ Name: "french";  MessagesFile: "compiler:Languages\French.isl"
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"
 
 [InstallDelete]
-; An upgrade in place (same AppId): the engine and the page are rebuilt from the bundle, so a file the new
-; version no longer ships (a dropped DLL, an old page asset) must not survive. models\ is NOT touched here:
-; it is overwritten file by file (ignoreversion) and a model the user dropped in by hand stays.
+; An upgrade in place (same AppId): the engine, the page and the native video engine (mpv\, 1.1.0) are rebuilt from the
+; bundle, so a file the new version no longer ships (a dropped DLL, an old page asset) must not survive. models\ is NEVER
+; touched here: the light installer keeps every model that is in place with its size (an update downloads nothing) and
+; replaces only the others; the full one overwrites them file by file (ignoreversion); a model the user dropped in by
+; hand stays.
 Type: filesandordirs; Name: "{app}\engine"
 Type: filesandordirs; Name: "{app}\web"
+Type: filesandordirs; Name: "{app}\mpv"
+
+[Dirs]
+; When {tmp} is on another drive than {app}, the light installer moves each downloaded model to {app}\models\<file>.part
+; BEFORE the installation (models_download.iss), so it may create {app} itself. The uninstaller removes a folder it did
+; not create only with this flag (when the folder is empty, so a folder the user shares keeps its content).
+Name: "{app}"; Flags: uninsalwaysuninstall
 
 [Files]
-; Everything under the bundle's app\ - the exes, WebView2Loader.dll, web\, engine\{whisper,llama}\ and models\ -
-; recursively. One rule, no model listed by name: a file added to the bundle by make_bundle.js ships here
-; without touching this section.
+; Everything under the bundle's app\ - the exes, WebView2Loader.dll, the licences, web\, engine\{whisper,llama,sherpa}\, mpv\
+; and, in a FULL bundle only, models\ - recursively. One rule, no file listed by name: a file added to the bundle by
+; make_bundle.js ships here without touching this section. (A light bundle has no models\: the checks above refuse one that has.)
 Source: "{#BundleAbs}\app\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"
+; The LIVE mode's own entry (1.1.0): the same exe and the same icon, started with --live, which opens the Live window alone
+; (app/main.cpp, TrLaunch.h; an already running SuVtitle opens its Live window instead of starting a second app).
+Name: "{group}\{#MyAppName} Live"; Filename: "{app}\{#MyAppExe}"; Parameters: "--live"; IconFilename: "{app}\{#MyAppExe}"; Comment: "Live transcription and translation of an input, an output or one application"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: desktopicon
 
@@ -325,9 +477,9 @@ Filename: "{app}\{#MyAppExe}"; Description: "Launch {#MyAppName}"; Flags: nowait
 ; original user.)
 
 [UninstallDelete]
-; Files that are not in the uninstall log: a model the user dropped into models\ by hand (ggml-large-v3.bin),
-; anything the engine or the page left in its own folders. The install folder itself is NOT swept whole - the
-; user may have chosen a shared folder.
+; Files that are not in the uninstall log: the models the LIGHT installer downloaded (moved into models\ by [Code], so
+; Inno never logged them), a model the user dropped into models\ by hand (ggml-large-v3.bin), anything the engine or the
+; page left in its own folders. The install folder itself is NOT swept whole - the user may have chosen a shared folder.
 Type: filesandordirs; Name: "{app}\engine"
 Type: filesandordirs; Name: "{app}\models"
 Type: filesandordirs; Name: "{app}\web"
@@ -375,20 +527,18 @@ begin
     ExecAsOriginalUser(ExpandConstant('{app}\{#MyAppExe}'), '--unregister-player', '', SW_HIDE, ewWaitUntilTerminated, rc);
 end;
 
-// A GPU with a Vulkan loader is optional but strongly wanted: whisper-server hard-imports vulkan-1.dll (it will
-// not start without it, the CPU fallback included), so a truly GPU-less PC needs the loader. Inform on the
-// finished install; the engine still falls back to the CPU for the models when no GPU can run them.
-procedure CurStepChanged(CurStep: TSetupStep);
-begin
-  if CurStep = ssPostInstall then begin
-    if (not WizardSilent) and (not FileExists(ExpandConstant('{sys}\vulkan-1.dll'))) then
-      MsgBox('Note: vulkan-1.dll was not found on this PC.' + #13#10 + #13#10
-             + 'The transcription engine needs a Vulkan loader to start; it usually ships '
-             + 'with your graphics driver. If transcription does not start, install/update your GPU '
-             + 'driver (AMD, NVIDIA or Intel). Machines with a real GPU already have it.',
-             mbInformation, MB_OK);
-  end;
-end;
+// (1.1.0) No more "vulkan-1.dll was not found" note after the install: whisper-server and libmpv import vulkan-1.dll,
+// and the bundle now ships Khronos' loader in {app}\mpv\vkfallback\ -- used ONLY where System32 has none (libmpv: loaded by
+// full path before it, app\MpvPlayer.cpp and engine\TrMpvAudio.cpp; the servers: that folder appended to their PATH, which
+// Windows searches after System32). With no GPU driver behind it the loader lists no device: the picture plays through
+// Direct3D 11 (WARP when there is no GPU at all) and the models run on the CPU. Nothing for the user to install.
+
+#ifndef Full
+// The LIGHT installer's model download: installer\models_download.iss (what it does: its header). The installer test kit
+// (tests\installer\dltest.iss) #includes the same file, so the kit tests the code that ships. It reads the generated
+// models block at the top of this script.
+#include "models_download.iss"
+#endif
 
 // For tests: /DPreprocessedOut=<file> writes the script exactly as the compiler sees it after ISPP (every macro
 // expanded), so the effective [Registry] lines can be compared with the C++ (TrAssoc.h entries()) without installing.

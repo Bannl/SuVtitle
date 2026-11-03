@@ -31,6 +31,14 @@
 //
 // Pure enough to be proved: run() takes the four folders, tests/cpp/app_smoke.cpp drives it on scratch trees.
 // ASCII only (no /utf-8).
+//
+// SUVTITLE LIVE (1.1.0, 2026-10-25 -- docs/LIVE_PLAN.md section 4.3): seedLivePos. The live translator leaves AudioPB for
+// SuVtitle's Live window, and the user has PUT AudioPB's Translator window somewhere (its WINPOS line in AudioPB's
+// translator.txt -- the other screen, facing the person he talks to). The Live window opens THERE the first time: the
+// line is READ (never written: AudioPB's file), with WINPOS's own rules (AppConfig.h parseWinPos). Once only -- not by a
+// marker but by construction: main.cpp asks only while app.txt has no LIVEPOS, and the Live window writes its LIVEPOS as
+// soon as it exists. Nothing else of the live TUNING is imported (the user's translator.txt holds exactly 1.1.0's
+// defaults, measured 25/10); the live PAIR is the engine's to seed (engine.txt, L1a).
 // =============================================================================
 #pragma once
 
@@ -42,6 +50,7 @@
 #include <vector>
 
 #include "TrFileStore.h"   // pbtrf::ensureDir, joinPath, fileExists, writeFileAvSafe, toUtf8
+#include "AppConfig.h"     // SUVTITLE LIVE: pbapp::WinPos / parseWinPos (seedLivePos)
 
 namespace pbimport {
 
@@ -185,6 +194,16 @@ inline Result run(const Roots& r) {
         // never fatal: SuVtitle starts with what it has (an import cut short leaves no half file under a real name)
     }
     return res;
+}
+
+// SUVTITLE LIVE (1.1.0): where AudioPB's Translator window was (r.fromRoaming\translator.txt, its WINPOS line), READ
+// only and bounded (1 MB: a config file, never a reason to read a big one). False = no file, no usable line -- the Live
+// window then opens at its default place. Never writes anything, anywhere (the caller writes LIVEPOS in app.txt).
+inline bool seedLivePos(const Roots& r, pbapp::WinPos& p) {
+    if (r.fromRoaming.empty()) return false;
+    std::string text;
+    return pbtrf::readFileAll(pbtrf::joinPath(r.fromRoaming, L"translator.txt"), text, 1ULL << 20)
+        && pbapp::parseWinPos(text, p);
 }
 
 }   // namespace pbimport
